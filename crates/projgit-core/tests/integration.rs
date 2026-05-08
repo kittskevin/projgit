@@ -216,6 +216,52 @@ fn object_store_read_blob_returns_content() {
     assert_eq!(&bytes, b"# fixture repo\n");
 }
 
+#[test]
+fn object_store_commit_time_returns_committer_time() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head_hex) = build_fixture("os_commit_time");
+    let store = ObjectStore::open(&repo).unwrap();
+
+    let head = parse_oid(&head_hex);
+    let t = store.commit_time(head).unwrap();
+    let secs = t
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Cross-check against `git log -1 --format=%ct`.
+    let raw = git(&repo, &["log", "-1", "--format=%ct"]);
+    let expected: u64 = String::from_utf8(raw)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("committer epoch seconds");
+    assert_eq!(secs, expected);
+
+    // Wrong kind: a tree OID is not a commit.
+    let tree_oid = store.commit_tree(head).unwrap();
+    let err = store.commit_time(tree_oid).unwrap_err();
+    assert!(matches!(
+        err,
+        projgit_core::ObjectStoreError::UnexpectedKind {
+            expected: ObjectKind::Commit,
+            actual: ObjectKind::Tree,
+            ..
+        }
+    ));
+
+    // Missing OID: MissingObject.
+    let bogus = parse_oid("0000000000000000000000000000000000000001");
+    let err = store.commit_time(bogus).unwrap_err();
+    assert!(matches!(
+        err,
+        projgit_core::ObjectStoreError::MissingObject(_)
+    ));
+}
+
 // -----------------------------------------------------------------------------
 // TreeNavigator tests
 // -----------------------------------------------------------------------------

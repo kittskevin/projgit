@@ -19,6 +19,7 @@ use crate::error::ObjectStoreError;
 use bstr::BString;
 use gix::ObjectId;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// The kind of a git object, mirroring git's four object types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +159,43 @@ impl ObjectStore {
             });
         }
         Ok(out)
+    }
+
+    /// Return the committer timestamp of a commit as a [`SystemTime`].
+    ///
+    /// Uses *committer* time (not author time) because that's what
+    /// `git log` sorts by and what users mean by "when did this land".
+    /// Projections expose this as the `mtime` of every file they
+    /// surface; per-file mtime is not stored in git tree entries.
+    ///
+    /// Returns [`ObjectStoreError::UnexpectedKind`] if `oid` does not
+    /// name a commit, or [`ObjectStoreError::MissingObject`] if absent.
+    pub fn commit_time(&self, oid: ObjectId) -> Result<SystemTime, ObjectStoreError> {
+        let h = self.handle();
+        let obj = h
+            .try_find_object(oid)
+            .map_err(|e| ObjectStoreError::Backend(e.to_string()))?
+            .ok_or(ObjectStoreError::MissingObject(oid))?;
+        let actual = ObjectKind::from_gix(obj.kind);
+        if actual != ObjectKind::Commit {
+            return Err(ObjectStoreError::UnexpectedKind {
+                oid,
+                expected: ObjectKind::Commit,
+                actual,
+            });
+        }
+        // Decode the raw bytes directly; gix's high-level `Commit` API
+        // moves around between versions, but `CommitRef::from_bytes`
+        // is stable.
+        let commit_ref = gix::objs::CommitRef::from_bytes(&obj.data)
+            .map_err(|e| ObjectStoreError::Backend(e.to_string()))?;
+        let secs = commit_ref.committer.time.seconds;
+        let st = if secs >= 0 {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
+        } else {
+            SystemTime::UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+        };
+        Ok(st)
     }
 
     /// Resolve a commit OID to its top-level tree OID.
