@@ -185,6 +185,45 @@ impl<F: Fetcher> ProjectionFsProvider<F> {
         }
     }
 
+    /// Lightweight `readdir` companion: allocate the inode and pick
+    /// the [`FileType`] for `resolved`, **without** consulting the
+    /// object store.
+    ///
+    /// This deliberately avoids `ObjectStore::header` (the only thing
+    /// `snapshot_for` needs the store for, to fetch a blob's size)
+    /// because `readdir` does not need sizes — fuser only emits
+    /// `inode + kind + name` from a `DirEntry`. Hydrating every blob
+    /// just to list a directory would defeat the partial-clone story
+    /// for URL-backed mounts: a single `ls` would force a fetch of
+    /// every file's blob.
+    ///
+    /// The kernel guarantees a follow-up `lookup` for any entry the
+    /// user actually `stat`s; that's where [`Self::snapshot_for`]
+    /// runs and resolves the real size.
+    fn dir_entry_for(&self, resolved: &ResolvedEntry, full_path: &str) -> (u64, FileType) {
+        let path_bytes = full_path.as_bytes();
+        match resolved {
+            ResolvedEntry::Tree(entry) => {
+                let inode = self.allocator.for_tree_entry(entry.oid, path_bytes);
+                let kind = match entry.mode {
+                    EntryMode::RegularFile | EntryMode::ExecutableFile => FileType::RegularFile,
+                    EntryMode::Directory | EntryMode::Gitlink => FileType::Directory,
+                    EntryMode::Symlink => FileType::Symlink,
+                };
+                (inode, kind)
+            }
+            ResolvedEntry::Synthetic { entry, .. } => {
+                let inode = self.allocator.for_synthetic(path_bytes);
+                let kind = match entry {
+                    SyntheticEntry::File { .. } => FileType::RegularFile,
+                    SyntheticEntry::Directory { .. } => FileType::Directory,
+                    SyntheticEntry::Symlink { .. } => FileType::Symlink,
+                };
+                (inode, kind)
+            }
+        }
+    }
+
     /// Convert a [`ResolvedEntry`] into `(inode, AttrSnapshot, FileType, size, mode)`.
     /// Allocates an inode for the entry and returns the freshly-built
     /// snapshot so the caller can decide whether to also publish it
@@ -368,7 +407,13 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
             return Ok(Vec::new());
         }
 
-        // Determine the listing source up front, then publish snapshots.
+        // Determine the listing source up front. We deliberately do
+        // NOT publish AttrSnapshots from `readdir`: doing so would
+        // require resolving each file's blob size via `header()`,
+        // which on a partial clone hydrates every blob just to `ls`.
+        // The kernel guarantees a follow-up `lookup` for any entry
+        // the user actually `stat`s, and `lookup` populates the cache
+        // with real sizes/modes lazily.
         if inode == ROOT_INODE {
             let pairs = self
                 .projection
@@ -379,8 +424,7 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
                 // The `name` from `read_root` is already the entry's
                 // own component name; full path == name at the root.
                 let full = String::from_utf8_lossy(&name).into_owned();
-                let (child_inode, snap, kind, _, _) = self.snapshot_for(resolved, &full)?;
-                self.publish(child_inode, snap);
+                let (child_inode, kind) = self.dir_entry_for(&resolved, &full);
                 out.push(DirEntry {
                     inode: child_inode,
                     name,
@@ -411,9 +455,8 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
                         )
                     };
                     let name = entry.name.clone();
-                    let (child_inode, child_snap, kind, _, _) =
-                        self.snapshot_for_tree(entry, &full)?;
-                    self.publish(child_inode, child_snap);
+                    let resolved = ResolvedEntry::Tree(entry);
+                    let (child_inode, kind) = self.dir_entry_for(&resolved, &full);
                     out.push(DirEntry {
                         inode: child_inode,
                         name,
@@ -434,9 +477,11 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
                             String::from_utf8_lossy(name)
                         )
                     };
-                    let (child_inode, child_snap, kind, _, _) =
-                        self.snapshot_for_synthetic(entry.clone(), &full);
-                    self.publish(child_inode, child_snap);
+                    let resolved = ResolvedEntry::Synthetic {
+                        name: name.clone(),
+                        entry: entry.clone(),
+                    };
+                    let (child_inode, kind) = self.dir_entry_for(&resolved, &full);
                     out.push(DirEntry {
                         inode: child_inode,
                         name: name.clone(),
