@@ -1,7 +1,7 @@
 # projgit — Handoff
 
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-05-08, after Phase 3c spike commit `aba421e`.
+> Last updated: 2026-05-08, after Phase 3e landing.
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -31,8 +31,9 @@ and [`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
 ## Where we are right now
 
 ```
+  HEAD    feat(core): Phase 3e -- ProjectionFsProvider glue + commit_time   ← latest
 aba421e  spike(3c): WinFsp hello-world via bindgen FFI -- mount works,
-                    dispatch unresolved                        ← latest
+                    dispatch unresolved
 ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
 0c53505  feat(core): Phase 3a -- FsProvider trait, InodeAllocator
 ca93cea  chore(license): add MIT and Apache-2.0 licenses
@@ -54,6 +55,14 @@ ca93cea  chore(license): add MIT and Apache-2.0 licenses
   `mount(provider, mountpoint, config)`. Cfg-gated to Linux/macOS;
   empty crate on Windows. Verified via
   `cargo check -p projgit-fuse --target x86_64-unknown-linux-gnu`.
+- **Phase 3e — ProjectionFsProvider glue.** `ProjectionFsProvider<F>`
+  in `projgit-core::projection_fs` bridges `Projection` +
+  `HydratingObjectStore<F>` + `RootOverlay` to the `FsProvider` trait.
+  Generic over `Fetcher`; per-inode `AttrSnapshot` cache populated
+  lazily from `lookup`/`readdir`; gitlinks render as empty dirs;
+  symlinks resolve via blob hydration; `mtime` stamped from
+  `ObjectStore::commit_time` (new). 13 integration tests + 1
+  commit_time test. Pure logic, no platform code.
 - **License decision.** Project is dual-licensed **MIT OR Apache-2.0**.
   We hand-roll WinFsp FFI bindings (no GPL-3.0 `winfsp-rs`).
   See repo memory + [`docs/initial-plan.md` §10](initial-plan.md).
@@ -73,14 +82,28 @@ ca93cea  chore(license): add MIT and Apache-2.0 licenses
 - **Phase 3d — Production `projgit-winfsp`.** Builds on the 3c spike's
   lessons. Includes: `FspService*` lifecycle, the symlink classifier
   per [`docs/design/windows-symlinks.md`](design/windows-symlinks.md),
-  per-user volume ownership (Phase 0c finding 5).
-- **Phase 3e — Real `ProjectionFsProvider` glue.** Bridges
-  `Projection` + `HydratingObjectStore` to the `FsProvider` trait.
-  Without this, the FS backends can mount only `InMemoryFsProvider`
-  test data, not actual git data. ~200–300 LOC. Unblocks the first
-  end-to-end demo.
-- **Phase 4 — CLI + mount manager.**
-- **Phase 5 — Polish (caches, metrics, integration tests).**
+  per-user volume ownership (Phase 0c finding 5). Now also consumes
+  `ProjectionFsProvider` (3e) directly.
+- **Phase 4 — CLI + mount manager.** With 3e landed, this is the
+  shortest path to a Linux end-to-end demo: wire CLI →
+  `partial_clone` → `ProjectionFsProvider` → `projgit-fuse::mount`.
+- **Phase 5 — Polish (caches, metrics, integration tests).** Notably:
+  tree-listing LRU cache (currently `ProjectionFsProvider` re-reads
+  trees via `HydratingObjectStore::read_tree` on every `readdir`).
+
+### Phase 3e gotchas worth knowing for callers
+- `ProjectionFsProvider::new` resolves the projection's commit OID
+  up front and seeds `commit_time`. For `Projection::Ref` this means
+  ref tip is captured at construction; ref-refresh is post-MVP.
+- `getattr` on an inode the provider has never seen returns
+  `NotFound`. Callers must `lookup` first (matches FUSE/WinFsp
+  contract); the cache shape (`AttrSnapshot`) deliberately does not
+  carry enough info to re-resolve a path from an inode alone.
+- Gitlinks render as empty directories. The provider does **not**
+  attempt to resolve the submodule's commit OID against this store
+  (it would be missing or point into another repo).
+- Symlink targets live in blob bytes; `readlink` triggers a
+  `HydratingObjectStore::read_blob` on the symlink's OID.
 
 Pack proliferation (many tiny packs from per-blob fetches) needs a
 background-repack policy somewhere in here; currently noted as an open
@@ -93,7 +116,7 @@ e:\repos\gitfs\
 ├── Cargo.toml                       workspace root, MSRV 1.85
 ├── LICENSE-MIT, LICENSE-APACHE      dual license
 ├── crates/
-│   ├── projgit-core/                Phase 1+2+3a -- engine
+│   ├── projgit-core/                Phase 1+2+3a+3e -- engine
 │   ├── projgit-cli/                 placeholder (Phase 4)
 │   ├── projgit-fuse/                Phase 3b -- empty on Windows
 │   └── projgit-winfsp/              placeholder (Phase 3d)
@@ -118,7 +141,7 @@ e:\repos\gitfs\
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 cd e:\repos\gitfs
 cargo build --workspace                 # should be clean on Windows
-cargo test  -p projgit-core             # 22 + 4 + 17 = 43 tests pass
+cargo test  -p projgit-core             # 22 + 4 + 18 + 13 = 57 tests pass
 cargo clippy --workspace --all-targets -- -D warnings   # clean
 # Linux compile-check (requires `rustup target add x86_64-unknown-linux-gnu`):
 cargo check -p projgit-fuse --target x86_64-unknown-linux-gnu --tests
@@ -232,17 +255,20 @@ two design docs.)
 In rough order of "smallest unit of work that yields the most
 visible progress":
 
-1. **Phase 3e first.** A `ProjectionFsProvider` that bridges
-   `Projection` + `HydratingObjectStore` to the `FsProvider` trait.
-   This is small (~200-300 LOC, no new platform code) and unblocks the
-   first end-to-end demo: `projgit clone` a public repo, then mount
-   `ref:main` via FUSE on Linux and `ls` real git data. Proves the
-   whole stack works minus Windows.
+1. **Phase 4 CLI scaffolding.** With Phase 3e landed, the smallest
+   visible step is a `projgit mount <repo> <projection> <mountpoint>`
+   subcommand that wires `partial_clone` (or open existing) →
+   `HydratingObjectStore` → `ProjectionFsProvider` →
+   `projgit_fuse::mount`. This delivers the first Linux end-to-end
+   demo: clone a public repo, mount `ref:main`, `ls` real git data.
 2. **Phase 3d.** Production `projgit-winfsp` on top of the
-   `FspService*` lifecycle (per the 3c spike findings). The riskiest
-   remaining piece. Best done in a fresh focused session.
-3. **Phase 4 CLI** to make the above runnable as `projgit mount …`
-   instead of via test harnesses.
+   `FspService*` lifecycle (per the 3c spike findings). Now also
+   consumes `ProjectionFsProvider` directly. The riskiest remaining
+   piece. Best done in a fresh focused session.
+3. **Phase 5 polish, especially tree-listing cache.** The current
+   `ProjectionFsProvider::readdir` re-reads trees on every call; an
+   LRU on parsed trees in `ObjectStore` would dramatically cut
+   warm-cache latency without changing any public API.
 
 Whichever path you take, **commit per the
 [`commit-work` skill](../.github/skills/commit-work/SKILL.md)** —
