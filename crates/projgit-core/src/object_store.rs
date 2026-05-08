@@ -81,6 +81,19 @@ impl ObjectStore {
         self.repo.to_thread_local()
     }
 
+    /// Per-call thread-local `gix::Repository` handle sharing the
+    /// store's underlying odb snapshot.
+    ///
+    /// Exposed for the [`crate::Fetcher`] implementations that need
+    /// to drive gix's `Remote` lifecycle against the same repo the
+    /// store reads from. Using the same [`gix::ThreadSafeRepository`]
+    /// for both fetch and read is what makes a freshly-written pack
+    /// visible to subsequent `read_blob` / `read_tree` calls without
+    /// re-opening the store.
+    pub fn handle_for_fetch(&self) -> gix::Repository {
+        self.handle()
+    }
+
     /// Path of the underlying `.git` directory.
     pub fn git_dir(&self) -> &Path {
         &self.git_dir

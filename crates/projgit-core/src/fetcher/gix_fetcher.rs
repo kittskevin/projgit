@@ -9,19 +9,21 @@
 use super::{Coalescer, Fetcher, FetcherError};
 use crate::object_store::ObjectStore;
 use gix::ObjectId;
-use std::path::Path;
 use std::sync::Arc;
 
 /// A [`Fetcher`] backed by gitoxide's blocking transport.
 ///
-/// Owns its own `gix::ThreadSafeRepository` handle so the underlying
-/// state is shareable across threads. The [`Coalescer`] inside ensures
-/// concurrent calls for the same OID issue exactly one network fetch.
+/// Drives `gix`'s blocking `Remote` lifecycle through the very same
+/// [`gix::ThreadSafeRepository`] the [`ObjectStore`] reads from. That
+/// shared handle is what makes a freshly-written pack visible to
+/// subsequent reads on the store side: a separate `gix::open` would
+/// snapshot its own odb state and never see new packs written by us.
+/// The [`Coalescer`] inside ensures concurrent calls for the same
+/// OID issue exactly one network fetch.
 pub struct GixFetcher {
-    repo: gix::ThreadSafeRepository,
+    store: Arc<ObjectStore>,
     remote_name: String,
     coalescer: Coalescer<ObjectId, ()>,
-    store: Arc<ObjectStore>,
 }
 
 impl GixFetcher {
@@ -32,26 +34,10 @@ impl GixFetcher {
         store: Arc<ObjectStore>,
         remote_name: impl Into<String>,
     ) -> Result<Self, GixFetcherError> {
-        let git_dir = store.git_dir().to_path_buf();
-        Self::open_at(git_dir, store, remote_name)
-    }
-
-    /// Variant for tests / advanced callers that want to point the
-    /// fetcher at a different git directory than the store reads from.
-    /// Most callers should use [`Self::open`].
-    pub fn open_at(
-        git_dir: impl AsRef<Path>,
-        store: Arc<ObjectStore>,
-        remote_name: impl Into<String>,
-    ) -> Result<Self, GixFetcherError> {
-        let repo = gix::open(git_dir.as_ref())
-            .map_err(|e| GixFetcherError::Open(e.to_string()))?
-            .into_sync();
         Ok(Self {
-            repo,
+            store,
             remote_name: remote_name.into(),
             coalescer: Coalescer::new(),
-            store,
         })
     }
 
@@ -61,8 +47,10 @@ impl GixFetcher {
         use gix::remote::Direction;
 
         // Per-thread Repository handle (cheap, doesn't carry shared
-        // mutable state). This is the gix idiom from §5.3.
-        let repo = self.repo.to_thread_local();
+        // mutable state). Critically, this comes from the same
+        // `ThreadSafeRepository` the store uses, so the pack we're
+        // about to write becomes visible to subsequent reads.
+        let repo = self.store.handle_for_fetch();
 
         let refspec = format!("+{oid}:refs/projgit/wanted/{oid}");
 
