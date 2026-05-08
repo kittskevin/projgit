@@ -1,0 +1,64 @@
+{
+	"name": "projgit (Rust + FUSE)",
+	"image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+
+	// FUSE inside the container needs SYS_ADMIN, /dev/fuse, and an
+	// AppArmor exception so the kernel actually lets us mount.
+	// Standard recipe; documented in .devcontainer/README.md.
+	"runArgs": [
+		"--cap-add=SYS_ADMIN",
+		"--device=/dev/fuse",
+		"--security-opt", "apparmor:unconfined"
+	],
+
+	"mounts": [
+		// Keep `target/` on a Docker named volume rather than the
+		// host bind-mount. On Windows hosts (Docker Desktop / WSL2)
+		// the workspace bind-mount is on NTFS and cargo's many small
+		// I/Os get pathologically slow there. Volume-backed target
+		// is ~10x faster on warm rebuilds.
+		"source=projgit-cargo-target,target=${containerWorkspaceFolder}/target,type=volume",
+
+		// Pass through the host git config so `git commit` works in
+		// the container without re-setting user.name / user.email.
+		// Resolved on Windows hosts via USERPROFILE; on macOS / Linux
+		// via HOME. devcontainers pick whichever is defined.
+		"source=${localEnv:USERPROFILE}${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,consistency=cached"
+	],
+
+	"containerEnv": {
+		// Defensive: matches the volume mount above so cargo never
+		// drifts off it (e.g. if someone sets CARGO_TARGET_DIR
+		// elsewhere on the host).
+		"CARGO_TARGET_DIR": "${containerWorkspaceFolder}/target"
+	},
+
+	// One-time setup after the container is created.
+	// - fuse3 / libfuse3-dev: runtime + headers for fuser to link / mount.
+	// - pkg-config: how fuser's build script finds libfuse.
+	// - lldb / gdb: native debugging from VS Code (CodeLLDB).
+	// - tree / strace: useful when poking at a live FUSE mount.
+	// - rustup components: rust-analyzer / clippy / rustfmt for IDE.
+	"postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends fuse3 libfuse3-dev pkg-config lldb gdb tree strace && rustup component add rust-analyzer clippy rustfmt",
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"vadimcn.vscode-lldb",
+				"tamasfe.even-better-toml"
+			],
+			"settings": {
+				// rust-analyzer should respect our default features
+				// flag matrix and not silently turn things on.
+				"rust-analyzer.cargo.features": "all",
+				"rust-analyzer.check.command": "clippy",
+				// Make sure we don't fight CRLF/LF when files come
+				// from a Windows host.
+				"files.eol": "\n"
+			}
+		}
+	},
+
+	"remoteUser": "vscode"
+}
