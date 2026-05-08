@@ -89,7 +89,7 @@ What's missing in the open ecosystem and what `projgit` aims to provide:
 
 ```
 +-----------------------------+    +-----------------------------+
-|  FS frontend (per OS)       |    |  CLI / control               |
+|  FS frontend (per OS)       |    |  CLI / control              |
 |  - fuser  (Linux/macOS)     |    |  projgit mount/umount/ls/gc |
 |  - winfsp (Windows)         |    +--------------+--------------+
 |  - projfs (Windows, later)  |                   |

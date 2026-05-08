@@ -7,5 +7,9 @@ rust-version.workspace = true
 description = "Core projection engine, object store, and fetcher abstractions for projgit."
 
 [dependencies]
-# Phase 1 will add: gix, gix-odb, gix-pack, gix-protocol, gix-ref, gix-object,
-# gix-hash, gix-traverse, tokio, tracing, anyhow/thiserror, lru, parking_lot.
+gix = { workspace = true }
+bstr = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests build small fixture repos at runtime via gix; no extra deps for now.

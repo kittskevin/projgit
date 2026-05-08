@@ -16,4 +16,15 @@ exclude = ["spikes"]
 version = "0.0.0"
 edition = "2021"
 authors = ["projgit contributors"]
-rust-version = "1.75"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Pinned to the same major version Phase 0a validated. The default
+# transport features stay off here; only the crates that actually drive
+# network I/O (the Fetcher in Phase 2) opt them in.
+gix = { version = "0.66", default-features = false, features = [
+    "max-performance-safe",
+] }
+bstr = "1"
+thiserror = "1"
+
