@@ -1,7 +1,7 @@
 # projgit — Handoff
 
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-05-08, after devcontainer + FUSE smoke test.
+> Last updated: 2026-05-08, after Phase 4 CLI + GitCliFetcher fallback.
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -31,7 +31,14 @@ and [`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
 ## Where we are right now
 
 ```
-  HEAD    chore: devcontainer + FUSE mount_background + smoke test    ← latest
+  HEAD    feat(cli): Phase 4 -- `projgit mount` end-to-end           ← latest
+  HEAD~   feat(core): GitCliFetcher fallback for promisor-only servers
+  HEAD~   fix(core): GixFetcher shares ObjectStore repo (post-fetch visibility)
+  HEAD~   fix(core): readdir no longer hydrates blobs to fill in sizes
+  HEAD~   fix(devcontainer): chown target/ in postCreateCommand
+cb493ac  test(fuse): runtime FUSE mount smoke test + handoff updates
+28b5e2f  chore(devcontainer): add Linux + FUSE development environment
+9687f82  feat(fuse): add mount_background() returning a BackgroundSession
 01e54a6  docs(handoff): mark Phase 3e done; bump test counts
 9ab5449  feat(core): Phase 3e -- ProjectionFsProvider glue
 d5f8836  feat(core): add ObjectStore::commit_time helper
@@ -65,10 +72,36 @@ ca93cea  chore(license): add MIT and Apache-2.0 licenses
   in `projgit-core::projection_fs` bridges `Projection` +
   `HydratingObjectStore<F>` + `RootOverlay` to the `FsProvider` trait.
   Generic over `Fetcher`; per-inode `AttrSnapshot` cache populated
-  lazily from `lookup`/`readdir`; gitlinks render as empty dirs;
-  symlinks resolve via blob hydration; `mtime` stamped from
-  `ObjectStore::commit_time` (new). 13 integration tests + 1
-  commit_time test. Pure logic, no platform code.
+  lazily on `lookup`; gitlinks render as empty dirs; symlinks resolve
+  via blob hydration; `mtime` stamped from `ObjectStore::commit_time`.
+  `readdir` is deliberately blob-free: it emits `(inode, kind, name)`
+  only and never hydrates to compute size, so `ls` of a partial-clone
+  mount stays cheap. 13 integration tests + 1 commit_time test.
+  Pure logic, no platform code.
+- **Phase 4 — CLI.** `crates/projgit-cli` (`projgit` binary) ships
+  one subcommand:
+  `projgit mount <SOURCE> <MOUNTPOINT> [--ref|--commit|--subtree]
+  [--cache-dir DIR] [--remote NAME] [--offline]`. URL sources are
+  partial-cloned into `$XDG_CACHE_HOME/projgit/<basename-hash>` (or
+  `--cache-dir`); local paths open in place. Uses
+  `mount_background` + a Ctrl-C handler so dropping the session
+  unmounts cleanly. Wires CLI → `partial_clone` → `ObjectStore` →
+  fetcher (`GitCliFetcher` for URLs, `NoopFetcher` for `--offline` /
+  local) → `HydratingObjectStore` → `ProjectionFsProvider` →
+  `projgit_fuse::mount_background`. 4 unit tests; verified end-to-end
+  in the devcontainer against `octocat/Hello-World` and
+  `rust-lang/log`.
+- **`GitCliFetcher` (production-default URL fetcher).** Shells out
+  to `git -C <git_dir> cat-file -e <oid>`, which triggers the
+  partial-clone *promisor* fetch with the right protocol framing.
+  Needed because GitHub's current policy rejects the bare-OID
+  `allow-tip-sha1-in-want` requests `GixFetcher` issues for many
+  repositories (server returns `RejectedSourceObjectNotFound`,
+  `gix` reports `receive()` succeeded with an empty pack).
+  `GixFetcher` stays around for environments without a system `git`,
+  for benchmarks, and as the home for future native-Rust transport
+  work. See `crates/projgit-core/src/fetcher/git_cli.rs` for the
+  full rationale.
 - **License decision.** Project is dual-licensed **MIT OR Apache-2.0**.
   We hand-roll WinFsp FFI bindings (no GPL-3.0 `winfsp-rs`).
   See repo memory + [`docs/initial-plan.md` §10](initial-plan.md).
@@ -89,13 +122,15 @@ ca93cea  chore(license): add MIT and Apache-2.0 licenses
   lessons. Includes: `FspService*` lifecycle, the symlink classifier
   per [`docs/design/windows-symlinks.md`](design/windows-symlinks.md),
   per-user volume ownership (Phase 0c finding 5). Now also consumes
-  `ProjectionFsProvider` (3e) directly.
-- **Phase 4 — CLI + mount manager.** With 3e landed, this is the
-  shortest path to a Linux end-to-end demo: wire CLI →
-  `partial_clone` → `ProjectionFsProvider` → `projgit-fuse::mount`.
+  `ProjectionFsProvider` (3e) directly. The Phase 4 CLI's
+  `cmd_mount` is cfg-gated to Linux/macOS; the Windows arm currently
+  prints a friendly "use projgit-winfsp once Phase 3d lands" error.
 - **Phase 5 — Polish (caches, metrics, integration tests).** Notably:
   tree-listing LRU cache (currently `ProjectionFsProvider` re-reads
-  trees via `HydratingObjectStore::read_tree` on every `readdir`).
+  trees via `HydratingObjectStore::read_tree` on every `readdir`),
+  batched `git cat-file --batch-check` in `GitCliFetcher` to avoid
+  per-OID spawn overhead, ref+subtree convenience
+  (`--subtree` currently requires `--commit`).
 
 ### Phase 3e gotchas worth knowing for callers
 - `ProjectionFsProvider::new` resolves the projection's commit OID
@@ -125,8 +160,8 @@ e:\repos\gitfs\
 │   ├── devcontainer.json            base image, runArgs, mounts
 │   └── README.md                    how to use it; FUSE quirks
 ├── crates/
-│   ├── projgit-core/                Phase 1+2+3a+3e -- engine
-│   ├── projgit-cli/                 placeholder (Phase 4)
+│   ├── projgit-core/                Phase 1+2+3a+3e -- engine + GitCliFetcher
+│   ├── projgit-cli/                 Phase 4 -- `projgit mount`
 │   ├── projgit-fuse/                Phase 3b -- empty on Windows
 │   └── projgit-winfsp/              placeholder (Phase 3d)
 ├── spikes/                          throwaway crates, NOT in workspace
@@ -164,10 +199,27 @@ makes builds fast on Windows hosts.
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 cd e:\repos\gitfs
 cargo build --workspace                 # should be clean on Windows
-cargo test  -p projgit-core             # 22 + 4 + 18 + 13 = 57 tests pass
+cargo test  -p projgit-core             # 23 + 4 + 18 + 13 = 58 tests pass
+cargo test  -p projgit-cli              # 4 unit tests
 cargo clippy --workspace --all-targets -- -D warnings   # clean
 # Linux compile-check (requires `rustup target add x86_64-unknown-linux-gnu`):
 cargo check -p projgit-fuse --target x86_64-unknown-linux-gnu --tests
+```
+
+### Run the Phase 4 end-to-end demo (inside the devcontainer)
+
+```sh
+mkdir -p /tmp/mp
+cargo run -p projgit-cli -- mount https://github.com/rust-lang/log /tmp/mp --ref master
+# in another shell:
+ls -la /tmp/mp
+cat /tmp/mp/Cargo.toml
+# Ctrl-C the foreground process to unmount.
+```
+
+Local repos work too:
+```sh
+cargo run -p projgit-cli -- mount /path/to/repo /tmp/mp --ref main --offline
 ```
 
 ### Run the FUSE mount smoke test (inside the devcontainer)
@@ -242,7 +294,9 @@ peel.
    `default-features = false`. Reason: gix's network deps pull
    reqwest + rustls + ring + a C compiler at build time, which would
    break Linux cross-checks from Windows. If you add network code
-   anywhere, gate it behind `cfg(feature = "gix-fetcher")`.
+   anywhere, gate it behind `cfg(feature = "gix-fetcher")`. The
+   `GitCliFetcher` is **not** behind this feature — it shells out to
+   the system `git` and has no extra build deps.
 5. **`ObjectStore` is `Send + Sync`** because it holds a
    `gix::ThreadSafeRepository` and creates per-call thread-local
    `Repository` handles. Don't "fix" it by going back to
@@ -271,8 +325,15 @@ two design docs.)
 
 - **Read-only MVP.** No write path. No "commit-on-write." Cuts scope
   ~50%. Anything writing to the mount is a Phase 6+ thing.
-- **gitoxide is the Fetcher backend.** Branch A confirmed by Phase 0a.
-  `GitCliFetcher` deferred as a future fallback.
+- **`GitCliFetcher` is the production-default for URL mounts;
+  `GixFetcher` stays for offline-friendly / no-git-on-PATH callers.**
+  Phase 0a validated `gix` could fetch a single blob via
+  `allow-tip-sha1-in-want`. As of 2026-05 GitHub rejects that path for
+  many repos with `RejectedSourceObjectNotFound` and a silent empty
+  pack; the same fetch framed as a partial-clone *promisor* request
+  works. The shell-out fetcher gets us correct behaviour today; the
+  `gix` path is where future native-Rust transport work can land if
+  the policy changes back or moves to a sniffable feature.
 - **One CAS, many mounts** is a hard architectural invariant. The
   store API never knows which projection is asking. This is what makes
   blob dedup free.
@@ -296,20 +357,22 @@ two design docs.)
 In rough order of "smallest unit of work that yields the most
 visible progress":
 
-1. **Phase 4 CLI scaffolding.** With Phase 3e landed, the smallest
-   visible step is a `projgit mount <repo> <projection> <mountpoint>`
-   subcommand that wires `partial_clone` (or open existing) →
-   `HydratingObjectStore` → `ProjectionFsProvider` →
-   `projgit_fuse::mount`. This delivers the first Linux end-to-end
-   demo: clone a public repo, mount `ref:main`, `ls` real git data.
-2. **Phase 3d.** Production `projgit-winfsp` on top of the
-   `FspService*` lifecycle (per the 3c spike findings). Now also
-   consumes `ProjectionFsProvider` directly. The riskiest remaining
-   piece. Best done in a fresh focused session.
-3. **Phase 5 polish, especially tree-listing cache.** The current
-   `ProjectionFsProvider::readdir` re-reads trees on every call; an
-   LRU on parsed trees in `ObjectStore` would dramatically cut
-   warm-cache latency without changing any public API.
+1. **Phase 3d.** Production `projgit-winfsp` on top of the
+   `FspService*` lifecycle (per the 3c spike findings). Consumes
+   `ProjectionFsProvider` directly, exactly like Phase 4's CLI does
+   on Linux. The riskiest remaining piece. Best done in a fresh
+   focused session on the Windows host.
+2. **Phase 5 polish, especially tree-listing cache and batched
+   `git cat-file --batch-check` in `GitCliFetcher`.** The current
+   `ProjectionFsProvider::readdir` re-reads trees on every call;
+   `GitCliFetcher` spawns one `git` per OID. Both are fine
+   correctness-wise but get noticeably slow on warm `ls`s of large
+   directories.
+3. **CLI quality-of-life.** A `--background` flag (return a PID so
+   shells can `umount` later), `--ref + --subtree` resolution
+   (currently `--subtree` requires `--commit`), tracing-subscriber
+   wiring for the `-v` flag, and a `projgit umount` companion. None
+   of these block the demo; pick them off in a Phase 4.x cleanup.
 
 Whichever path you take, **commit per the
 [`commit-work` skill](../.github/skills/commit-work/SKILL.md)** —
