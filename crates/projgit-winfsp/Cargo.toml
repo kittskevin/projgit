@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "WinFsp filesystem backend for projgit (Windows)."
+license.workspace = true
+repository.workspace = true
+description = "WinFsp filesystem backend for projgit (Windows). Uses hand-rolled FFI bindings to winfsp.dll to avoid the GPL-3.0 winfsp-rs crate."
 
 [target.'cfg(target_os = "windows")'.dependencies]
 projgit-core = { path = "../projgit-core" }
