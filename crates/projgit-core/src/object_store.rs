@@ -46,12 +46,14 @@ impl ObjectKind {
 
 /// Read-only handle to an on-disk git object store.
 ///
-/// Cheap to clone in spirit: the inner `gix::Repository` shares its
-/// underlying `gix-odb` state via `Arc`, so multiple `ObjectStore`
-/// values backed by the same git directory cooperate correctly.
+/// Holds a `gix::ThreadSafeRepository` so it is `Send + Sync` and can
+/// back many concurrent readers (and a single Fetcher) at once, per
+/// the `docs/initial-plan.md` §5.3 architectural rule. Each method
+/// produces a cheap per-call thread-local `gix::Repository` handle
+/// for the actual lookup.
 #[derive(Debug)]
 pub struct ObjectStore {
-    repo: gix::Repository,
+    repo: gix::ThreadSafeRepository,
     git_dir: PathBuf,
 }
 
@@ -66,10 +68,16 @@ impl ObjectStore {
             path: path.to_path_buf(),
             source: Box::new(source),
         })?;
+        let git_dir = repo.git_dir().to_path_buf();
         Ok(Self {
-            git_dir: repo.git_dir().to_path_buf(),
-            repo,
+            repo: repo.into_sync(),
+            git_dir,
         })
+    }
+
+    /// Internal: cheap per-call thread-local handle for hot-path reads.
+    fn handle(&self) -> gix::Repository {
+        self.repo.to_thread_local()
     }
 
     /// Path of the underlying `.git` directory.
@@ -83,14 +91,17 @@ impl ObjectStore {
     /// Does **not** trigger any network activity even if the store has
     /// a promisor remote configured.
     pub fn contains(&self, oid: ObjectId) -> bool {
-        self.repo.try_find_object(oid).map(|o| o.is_some()).unwrap_or(false)
+        self.handle()
+            .try_find_object(oid)
+            .map(|o| o.is_some())
+            .unwrap_or(false)
     }
 
     /// Return the object's kind and uncompressed size, or
     /// `MissingObject` if absent.
     pub fn header(&self, oid: ObjectId) -> Result<(ObjectKind, u64), ObjectStoreError> {
-        let header = self
-            .repo
+        let h = self.handle();
+        let header = h
             .try_find_header(oid)
             .map_err(|e| ObjectStoreError::Backend(e.to_string()))?
             .ok_or(ObjectStoreError::MissingObject(oid))?;
@@ -100,8 +111,8 @@ impl ObjectStore {
     /// Read the raw bytes of a blob. Returns `MissingObject` if absent
     /// or `UnexpectedKind` if the OID names a non-blob.
     pub fn read_blob(&self, oid: ObjectId) -> Result<Vec<u8>, ObjectStoreError> {
-        let obj = self
-            .repo
+        let h = self.handle();
+        let obj = h
             .try_find_object(oid)
             .map_err(|e| ObjectStoreError::Backend(e.to_string()))?
             .ok_or(ObjectStoreError::MissingObject(oid))?;
@@ -123,8 +134,8 @@ impl ObjectStore {
     /// Returns `MissingObject` if absent or `UnexpectedKind` if the
     /// OID names a non-tree.
     pub fn read_tree(&self, oid: ObjectId) -> Result<Vec<RawTreeEntry>, ObjectStoreError> {
-        let obj = self
-            .repo
+        let h = self.handle();
+        let obj = h
             .try_find_object(oid)
             .map_err(|e| ObjectStoreError::Backend(e.to_string()))?
             .ok_or(ObjectStoreError::MissingObject(oid))?;
@@ -151,8 +162,8 @@ impl ObjectStore {
 
     /// Resolve a commit OID to its top-level tree OID.
     pub fn commit_tree(&self, oid: ObjectId) -> Result<ObjectId, ObjectStoreError> {
-        let obj = self
-            .repo
+        let h = self.handle();
+        let obj = h
             .try_find_object(oid)
             .map_err(|e| ObjectStoreError::Backend(e.to_string()))?
             .ok_or(ObjectStoreError::MissingObject(oid))?;
@@ -180,8 +191,8 @@ impl ObjectStore {
     /// does **not** dereference annotated tags; that is a separate
     /// projection-engine concern.
     pub fn resolve_ref(&self, refname: &str) -> Result<ObjectId, ObjectStoreError> {
-        let mut reference = self
-            .repo
+        let h = self.handle();
+        let mut reference = h
             .find_reference(refname)
             .map_err(|e| ObjectStoreError::Backend(e.to_string()))?;
         let id = reference
