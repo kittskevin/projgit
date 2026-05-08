@@ -36,7 +36,13 @@ mod mount;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use adapter::ProjgitFuse;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use mount::{mount, MountConfig};
+pub use mount::{mount, mount_background, MountConfig};
+
+/// Re-export of [`fuser::BackgroundSession`] so callers don't need
+/// a direct dependency on `fuser` to keep a [`mount_background`]
+/// handle alive.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use fuser::BackgroundSession;
 
 /// Marker constant: `true` on supported targets, `false` elsewhere.
 /// Useful for tests / runtime feature detection.

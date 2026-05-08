@@ -5,7 +5,7 @@
 //! mounts from one process.
 
 use crate::adapter::ProjgitFuse;
-use fuser::{mount2, Config, MountOption, SessionACL};
+use fuser::{mount2, spawn_mount2, BackgroundSession, Config, MountOption, SessionACL};
 use projgit_core::FsProvider;
 use std::path::Path;
 use std::sync::Arc;
@@ -73,6 +73,30 @@ pub fn mount<F: FsProvider + 'static>(
     mount2(fs, mountpoint, &config.to_fuser_config())
 }
 
+/// Mount `provider` at `mountpoint` and return immediately.
+///
+/// Spawns the FUSE event loop on a background thread and returns a
+/// [`BackgroundSession`] handle. The mount stays alive until either:
+///
+/// - the returned `BackgroundSession` is dropped (graceful unmount), or
+/// - the caller explicitly calls [`BackgroundSession::join`] to wait
+///   for the loop to exit.
+///
+/// This is the API the future CLI mount manager + the runtime FUSE
+/// smoke test build on. Prefer it over [`mount`] whenever the caller
+/// needs to do anything else on the same thread.
+///
+/// Errors mirror [`mount`]: missing mountpoint, EPERM, missing
+/// `/dev/fuse` etc. all surface as `io::Error` from `spawn_mount2`.
+pub fn mount_background<F: FsProvider + 'static>(
+    provider: Arc<F>,
+    mountpoint: impl AsRef<Path>,
+    config: &MountConfig,
+) -> std::io::Result<BackgroundSession> {
+    let fs = ProjgitFuse::new(provider);
+    spawn_mount2(fs, mountpoint, &config.to_fuser_config())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +148,25 @@ mod tests {
     fn projgit_fuse_is_send_sync_static() {
         fn assert_send_sync_static<T: Send + Sync + 'static>() {}
         assert_send_sync_static::<ProjgitFuse<InMemoryFsProvider>>();
+    }
+
+    /// `mount_background` must return `Err` (not panic) when the
+    /// mountpoint doesn't exist. Exercises the API surface without
+    /// requiring `/dev/fuse` to be available, so it's safe to run as
+    /// a non-ignored test on any Linux / macOS host.
+    #[test]
+    fn mount_background_errors_on_missing_mountpoint() {
+        let provider = Arc::new(InMemoryFsProvider::new());
+        let cfg = MountConfig::default();
+        // Path under temp_dir that is guaranteed not to exist.
+        let bogus = std::env::temp_dir().join(format!(
+            "projgit-mount-bg-nonexistent-{}",
+            std::process::id()
+        ));
+        let result = mount_background(provider, &bogus, &cfg);
+        assert!(
+            result.is_err(),
+            "expected Err on missing mountpoint, got Ok"
+        );
     }
 }
