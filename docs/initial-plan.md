@@ -166,12 +166,27 @@ A thin wrapper around `gix-odb` that:
 - Opens an existing `.git`-style directory.
 - Resolves objects by OID.
 - Returns a `MissingObject(oid)` error on miss instead of panicking.
-- Surfaces an LRU cache for parsed trees (hot path) and small blobs
-  (≤ 64 KB).
+  This is the **only** error variant the Fetcher intercepts on the hot
+  path; extracting it from gix's internal error organization keeps the
+  consumer pattern-match cheap and decouples us from gix's error layout.
+- Surfaces an LRU cache for parsed trees (the hot path — stored as
+  decoded `TreeData`, not raw bytes, so `readdir` and `lookup` skip
+  re-parsing) and small blobs (≤ 64 KB; larger blobs served via mmap
+  from the underlying packfile).
+- Uses gix's `ThreadSafeRepository` + per-task `Repository` handle
+  pattern: the store holds the `Arc`-shared base once and clones cheap
+  per-thread handles on demand. This is the gix idiom for many readers
+  over one repo and avoids non-`Sync` buffer state on the hot path.
 
-The store itself is **projection-agnostic** — it never knows which mount is
-asking. This is a hard architectural invariant and the reason a single
-store can back many mounts with no duplication.
+The store is **read-only**. The Fetcher is the only component that
+mutates the store (via gix's pack-receive APIs), and a successful fetch
+is followed by an explicit re-read — there are no write methods on
+`ObjectStore` itself. This keeps the read API provably side-effect-free
+and lets `Arc<ObjectStore>` be shared without interior-mutation worries.
+
+The store is also **projection-agnostic** — it never knows which mount
+is asking. This is a hard architectural invariant and the reason a
+single store can back many mounts with no duplication.
 
 ### 5.4 Fetcher
 
