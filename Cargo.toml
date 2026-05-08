@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/projgit-core",
+    "crates/projgit-cli",
+    "crates/projgit-fuse",
+    "crates/projgit-winfsp",
+]
+# Spikes are intentionally NOT workspace members. They are throwaway,
+# self-contained crates with their own dependency sets. Phase 0 spikes will
+# live under spikes/<name>/ and be invoked individually
+# (`cd spikes/<name> && cargo run`).
+exclude = ["spikes"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+authors = ["projgit contributors"]
+rust-version = "1.75"

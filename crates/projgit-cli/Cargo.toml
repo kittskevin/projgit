@@ -1,0 +1,15 @@
+[package]
+name = "projgit-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for projgit."
+
+[[bin]]
+name = "projgit"
+path = "src/main.rs"
+
+[dependencies]
+projgit-core = { path = "../projgit-core" }
+# Phase 4 will add: clap, anyhow, tracing, tracing-subscriber.

@@ -1,0 +1,13 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Spike build artifacts (each spike has its own target/)
+spikes/**/target/
+
+# IDE
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

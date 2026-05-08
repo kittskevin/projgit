@@ -1,0 +1,11 @@
+[package]
+name = "projgit-fuse"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "FUSE filesystem backend for projgit (Linux and macOS)."
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+projgit-core = { path = "../projgit-core" }
+# Phase 3 will add: fuser.

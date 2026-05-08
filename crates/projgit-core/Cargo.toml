@@ -1,0 +1,11 @@
+[package]
+name = "projgit-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Core projection engine, object store, and fetcher abstractions for projgit."
+
+[dependencies]
+# Phase 1 will add: gix, gix-odb, gix-pack, gix-protocol, gix-ref, gix-object,
+# gix-hash, gix-traverse, tokio, tracing, anyhow/thiserror, lru, parking_lot.
