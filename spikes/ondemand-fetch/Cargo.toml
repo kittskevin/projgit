@@ -1,0 +1,16 @@
+[package]
+name = "spike-ondemand-fetch"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Phase 0a spike: can gitoxide fetch a single missing blob from a promisor remote on demand?"
+
+[dependencies]
+# Pin gix to a known-good version with partial-clone awareness.
+# We expect to discover the API surface during the spike.
+gix = { version = "0.66", default-features = false, features = [
+    "blocking-network-client",
+    "blocking-http-transport-reqwest-rust-tls",
+    "max-performance-safe",
+] }
+anyhow = "1"

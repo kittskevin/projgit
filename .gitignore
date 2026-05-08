@@ -5,6 +5,9 @@
 # Spike build artifacts (each spike has its own target/)
 spikes/**/target/
 
+# Spike test fixtures (cloned repos, not committed)
+spikes/**/testrepo/
+
 # IDE
 .idea/
 
