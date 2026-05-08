@@ -13,12 +13,14 @@
 //! - [`projection`]    — the `Projection` enum (`Ref`, `Commit`,
 //!   `Subtree`) and the resolver that turns a virtual path into a
 //!   git object lookup, consulting the overlay first.
-//! - [`fetcher`]       — `Fetcher` trait, `GixFetcher`, `NoopFetcher`,
-//!   single-flight `Coalescer`, and `HydratingObjectStore` that wraps
-//!   an `ObjectStore` with a fetcher for transparent miss-then-fetch.
+//! - [`fetcher`]       — `Fetcher` trait, `GixFetcher`, `GitCliFetcher`,
+//!   `NoopFetcher`, single-flight `Coalescer`, and
+//!   `HydratingObjectStore` that wraps an `ObjectStore` with a
+//!   fetcher for transparent miss-then-fetch.
 //!   `GixFetcher` is gated behind the `gix-fetcher` Cargo feature
-//!   (default-on); consumers that only need the trait + `NoopFetcher`
-//!   can disable it to avoid pulling reqwest + rustls + ring.
+//!   (default-on); consumers that only need the trait,
+//!   `GitCliFetcher`, or `NoopFetcher` can disable it to avoid
+//!   pulling reqwest + rustls + ring.
 //! - [`fs_provider`]   — OS-agnostic read-only `FsProvider` trait that
 //!   FUSE / WinFsp backends implement, plus inode allocator and an
 //!   in-memory provider for testing.
@@ -43,7 +45,10 @@ pub mod tree;
 pub use error::{ObjectStoreError, ProjectionError};
 #[cfg(feature = "gix-fetcher")]
 pub use fetcher::{GixFetcher, GixFetcherError};
-pub use fetcher::{Fetcher, FetcherError, HydrateError, HydratingObjectStore, NoopFetcher};
+pub use fetcher::{
+    Fetcher, FetcherError, GitCliFetcher, GitCliFetcherError, HydrateError, HydratingObjectStore,
+    NoopFetcher,
+};
 pub use fs_provider::{
     Attr, DirEntry, FileType, FsError, FsProvider, InMemoryFsProvider, InodeAllocator, InodeKind,
     ROOT_INODE,

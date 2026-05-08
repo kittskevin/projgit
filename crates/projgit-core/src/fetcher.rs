@@ -24,11 +24,13 @@ use gix::ObjectId;
 use std::sync::Arc;
 
 mod coalesce;
+mod git_cli;
 #[cfg(feature = "gix-fetcher")]
 mod gix_fetcher;
 mod noop;
 
 pub use coalesce::Coalescer;
+pub use git_cli::{GitCliFetcher, GitCliFetcherError};
 #[cfg(feature = "gix-fetcher")]
 pub use gix_fetcher::{GixFetcher, GixFetcherError};
 pub use noop::NoopFetcher;
