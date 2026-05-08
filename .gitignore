@@ -8,6 +8,11 @@ spikes/**/target/
 # Spike test fixtures (cloned repos, not committed)
 spikes/**/testrepo/
 
+# Spike runtime traces / captured stdio
+spikes/**/trace.log
+spikes/**/*.out
+spikes/**/*.err
+
 # IDE
 .idea/
 

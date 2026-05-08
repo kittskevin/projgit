@@ -1,0 +1,25 @@
+[package]
+name = "spike-winfsp-helloworld"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Phase 3c spike: hello-world WinFsp filesystem via hand-rolled FFI bindings (bindgen-generated)."
+
+# License caveat: this spike depends on no GPL-3.0 Rust crate. It uses
+# bindgen against the WinFsp C headers, then calls into winfsp-x64.dll
+# (which has its own FLOSS exception that permits MIT/Apache linking).
+# The spike validates the bindings approach we'll use in production
+# projgit-winfsp under MIT OR Apache-2.0.
+
+[dependencies]
+widestring = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_Security",
+] }
+
+[build-dependencies]
+bindgen = "0.71"

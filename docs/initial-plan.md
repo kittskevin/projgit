@@ -233,8 +233,13 @@ real product code is written.
   See [../spikes/ondemand-fetch/RESULTS.md](../spikes/ondemand-fetch/RESULTS.md).
   Outcome: MVP ships `GixFetcher`; `GitCliFetcher` deferred.
 - **0b. FS hello-world.** Trivial read-only "hello.txt" mount on `fuser`
-  *and* `winfsp` behind a shared trait. No git involved. Confirms the
-  abstraction.
+  *and* `winfsp` behind a shared trait. **Status: PARTIAL.**
+  - Linux/macOS half: subsumed by Phase 3b (the `projgit-fuse` crate
+    consumes the same `FsProvider` trait Phase 3a defined; the FUSE
+    adapter compiles and tests pass under
+    `cargo check --target x86_64-unknown-linux-gnu`).
+  - Windows half: see Phase 3c spike below — mount establishes,
+    but request dispatch unresolved.
 - **0c. WinFsp reparse-point round-trip. — DONE.** Verified via the
   WinFsp `memfs-x64` C++ sample (no Rust code shipped to avoid
   premature license commitment). All four consumer tools traverse
@@ -242,6 +247,15 @@ real product code is written.
   [../spikes/winfsp-reparse/RESULTS.md](../spikes/winfsp-reparse/RESULTS.md).
   Outcome: `Native` mode default in
   [windows-symlinks.md](./design/windows-symlinks.md) confirmed.
+- **0c.bis (informal). WinFsp Rust hello-world.** Validates that
+  hand-rolled (bindgen-driven) FFI bindings to `winfsp.dll` from a
+  Rust binary can establish a mount, in service of the MIT/Apache
+  license decision. **Status: PARTIAL.** Bindgen + delay-load + linker
+  + bitfield setters + mount lifecycle all work; mount establishes
+  (`fsptool lsvol` confirms). Open issue: no IRPs reach the user-mode
+  dispatcher, so probes return `Incorrect function`. See
+  [../spikes/winfsp-helloworld/RESULTS.md](../spikes/winfsp-helloworld/RESULTS.md)
+  for hypotheses and the explicit Phase 3d follow-ups.
 
 ### Phase 1 — Object store + path resolver (no FS yet)
 
@@ -266,10 +280,23 @@ real product code is written.
 
 ### Phase 3 — FS frontend
 
-10. Define `FsProvider` trait.
-11. Implement `fuser` backend (Linux + macOS).
-12. Implement `winfsp` backend (Windows).
-13. Implement stable inode / FileId allocation.
+10. **DONE (Phase 3a).** Define `FsProvider` trait, `InodeAllocator`,
+    `InMemoryFsProvider`. Pure Rust, no platform code; lives in
+    `projgit-core::fs_provider`.
+11. **DONE (Phase 3b).** Implement `fuser` backend (Linux + macOS,
+    cfg-gated). Crate `projgit-fuse`; ships `ProjgitFuse<F>` adapter
+    + `mount` helper. Verified via
+    `cargo check --target x86_64-unknown-linux-gnu --tests`.
+12. **PARTIAL (Phase 3c spike).** Implement `winfsp` backend (Windows).
+    The Phase 3c spike under `spikes/winfsp-helloworld/` validates the
+    FFI / bindgen / link approach but did **not** achieve a working
+    request dispatch. Phase 3d builds the production `projgit-winfsp`
+    crate using the lessons from
+    [../spikes/winfsp-helloworld/RESULTS.md](../spikes/winfsp-helloworld/RESULTS.md):
+    switch from the bare `FspFileSystemStartDispatcher` lifecycle to
+    the `FspService*` framework that the bundled C samples use.
+13. Implement stable inode / FileId allocation. **DONE in 3a as part
+    of the `InodeAllocator`.**
 14. Implement the **symlink classifier + policy enum** for the Windows
     backend (`Native`, `Text`, `Auto`); see
     [windows-symlinks.md](./design/windows-symlinks.md). The bare-minimum
