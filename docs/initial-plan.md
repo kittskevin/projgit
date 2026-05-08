@@ -181,18 +181,29 @@ trait Fetcher {
 }
 ```
 
-Two candidate implementations, chosen based on the Phase 0a spike:
+**Branch A confirmed by Phase 0a spike** (see
+[../spikes/ondemand-fetch/RESULTS.md](../spikes/ondemand-fetch/RESULTS.md)):
+MVP ships `GixFetcher`. `GitCliFetcher` is reserved as a future fallback
+for environments / protocols where the gix path degrades.
 
-- **`GixFetcher`** — uses `gix-protocol` v2 (`ls-refs`, `fetch`) to request
-  a single object from a promisor remote. Preferred if gitoxide's
-  on-demand support is mature enough.
-- **`GitCliFetcher`** — shells out to the system `git` (e.g.
-  `git fetch origin <oid> --depth=1 --filter=blob:none`). Robust fallback;
-  slower per-fetch due to process startup.
+- **`GixFetcher`** (in MVP) — uses `gix`'s `Remote` API to fetch a
+  single OID via the protocol-v2 `want`-line (`allow-tip-sha1-in-want`
+  / `allow-reachable-sha1-in-want`). Refspec form
+  `+<oid>:refs/projgit/wanted/<oid>`. Cold-fetch latency observed at
+  ~430 ms on a small public repo over residential broadband; warm /
+  pooled latency to be measured in Phase 2.
+- **`GitCliFetcher`** (deferred) — shells out to the system `git` (e.g.
+  `git fetch origin <oid> --depth=1 --filter=blob:none`). Slower per
+  fetch (process startup), but inherits the user's git config and
+  credential helpers verbatim.
 
 Concurrency: requests for the same OID are coalesced via a single-flight
 map (`tokio::sync::Mutex<HashMap<Oid, Shared<Future>>>`) so a thundering
 herd of `read()` calls hydrates the blob exactly once.
+
+Pack proliferation (each on-demand fetch creates a tiny pack) is
+mitigated by a periodic background repack triggered when pack count
+crosses a threshold; design lives in Phase 2.
 
 ## 6. Phased plan
 
@@ -203,10 +214,9 @@ real product code is written.
 
 ### Phase 0 — Spikes (parallelizable)
 
-- **0a. Gitoxide on-demand fetch spike.** ~50-line program: open a
-  partial clone (`git clone --filter=blob:none`), pick a blob OID *not*
-  present locally, fetch just that one blob from the remote via `gix`.
-  Outcome decides Fetcher design. **Single biggest project risk.**
+- **0a. Gitoxide on-demand fetch spike. — DONE.** Branch A confirmed.
+  See [../spikes/ondemand-fetch/RESULTS.md](../spikes/ondemand-fetch/RESULTS.md).
+  Outcome: MVP ships `GixFetcher`; `GitCliFetcher` deferred.
 - **0b. FS hello-world.** Trivial read-only "hello.txt" mount on `fuser`
   *and* `winfsp` behind a shared trait. No git involved. Confirms the
   abstraction.
@@ -401,7 +411,9 @@ Full options ladder (A0–A3, B, B+) and UX trade-offs:
 ## 10. Decisions baked in
 
 - **Read-only MVP.** No write path. Reduces scope ~50%.
-- **gitoxide preferred, git CLI fallback allowed** for any protocol gap.
+- **gitoxide is the Fetcher backend.** Branch A confirmed by Phase 0a
+  ([../spikes/ondemand-fetch/RESULTS.md](../spikes/ondemand-fetch/RESULTS.md)).
+  `GitCliFetcher` deferred as a future fallback.
 - **One object store, many mounts** is a hard architectural invariant;
   the store API never knows which projection is asking.
 - **No daemon in MVP.** Per-process mounts using on-disk store + file
