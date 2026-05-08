@@ -37,6 +37,7 @@ pub mod fs_provider;
 pub mod object_store;
 pub mod overlay;
 pub mod projection;
+pub mod projection_fs;
 pub mod tree;
 
 pub use error::{ObjectStoreError, ProjectionError};
@@ -50,6 +51,7 @@ pub use fs_provider::{
 pub use object_store::{ObjectKind, ObjectStore};
 pub use overlay::{RootOverlay, SyntheticEntry};
 pub use projection::{Projection, ResolvedEntry};
+pub use projection_fs::ProjectionFsProvider;
 pub use tree::{EntryMode, TreeEntry, TreeNavigator};
 
 /// Crate version, exposed to the CLI and other consumers.
