@@ -235,11 +235,13 @@ real product code is written.
 - **0b. FS hello-world.** Trivial read-only "hello.txt" mount on `fuser`
   *and* `winfsp` behind a shared trait. No git involved. Confirms the
   abstraction.
-- **0c. WinFsp reparse-point round-trip.** Synthesize an
-  `IO_REPARSE_TAG_SYMLINK` from a WinFsp filesystem and verify it is
-  traversed correctly by `cmd.exe`, PowerShell `Get-Item`, Python
-  `os.readlink`, and `cl.exe /I`. De-risks the Windows symlink design
-  (see [windows-symlinks.md](./design/windows-symlinks.md)).
+- **0c. WinFsp reparse-point round-trip. — DONE.** Verified via the
+  WinFsp `memfs-x64` C++ sample (no Rust code shipped to avoid
+  premature license commitment). All four consumer tools traverse
+  WinFsp-served symlinks transparently as a non-admin user. See
+  [../spikes/winfsp-reparse/RESULTS.md](../spikes/winfsp-reparse/RESULTS.md).
+  Outcome: `Native` mode default in
+  [windows-symlinks.md](./design/windows-symlinks.md) confirmed.
 
 ### Phase 1 — Object store + path resolver (no FS yet)
 
@@ -273,10 +275,16 @@ real product code is written.
     [windows-symlinks.md](./design/windows-symlinks.md). The bare-minimum
     `Text` mode is the floor; `Native` is gated by the Phase 0c spike
     outcome and degrades gracefully to `Text`.
+15. **Per-user volume / file ownership** in the Windows backend.
+    `get_security_by_name` and `get_security` must report the calling
+    user as the owner so modern git's `safe.directory` check accepts
+    the mount. Surfaced by Phase 0c
+    ([../spikes/winfsp-reparse/RESULTS.md](../spikes/winfsp-reparse/RESULTS.md)
+    finding 5).
 
 ### Phase 4 — Mount manager & CLI
 
-15. `projgit` CLI subcommands:
+16. `projgit` CLI subcommands:
     - `projgit init <store-dir> --remote <url>`
     - `projgit clone <url> <store-dir>` (init + initial partial clone)
     - `projgit mount <store> <projection-spec> <mountpoint>`
@@ -285,16 +293,16 @@ real product code is written.
     - `projgit umount <mountpoint>`
     - `projgit ls` — list active mounts
     - `projgit fetch [--all-refs|<ref>...]` — bulk update
-16. **No daemon in MVP.** Per-process mounts share the on-disk store via
+17. **No daemon in MVP.** Per-process mounts share the on-disk store via
     file locks. A `projgitd` daemon can be added later without breaking the
     CLI surface.
 
 ### Phase 5 — Polish
 
-17. LRU caches for parsed trees, small blobs, file handles.
-18. `tracing`-based metrics: cache hit rate, fetch latency, bytes
+18. LRU caches for parsed trees, small blobs, file handles.
+19. `tracing`-based metrics: cache hit rate, fetch latency, bytes
     hydrated, miss count.
-19. Integration tests: mount the same fixture repo twice (`ref:main` and
+20. Integration tests: mount the same fixture repo twice (`ref:main` and
     `commit:<old-sha>`) simultaneously; assert correct contents and zero
     blob duplication on disk.
 
