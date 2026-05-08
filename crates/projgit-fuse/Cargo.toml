@@ -15,3 +15,9 @@ description = "FUSE filesystem backend for projgit (Linux and macOS)."
 projgit-core = { path = "../projgit-core", default-features = false }
 fuser = "0.17"
 libc = "0.2"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+# The `mount_smoke` integration test constructs a `Projection::Commit`
+# directly, which needs `gix::ObjectId`. Use the same workspace pin as
+# projgit-core so we never end up with two versions of gix in the build.
+gix = { workspace = true }

@@ -1793,6 +1793,7 @@ name = "projgit-fuse"
 version = "0.0.0"
 dependencies = [
  "fuser",
+ "gix",
  "libc",
  "projgit-core",
 ]

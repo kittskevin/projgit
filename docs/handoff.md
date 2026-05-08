@@ -1,7 +1,7 @@
 # projgit — Handoff
 
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-05-08, after Phase 3e landing.
+> Last updated: 2026-05-08, after devcontainer + FUSE smoke test.
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -31,7 +31,10 @@ and [`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
 ## Where we are right now
 
 ```
-  HEAD    feat(core): Phase 3e -- ProjectionFsProvider glue + commit_time   ← latest
+  HEAD    chore: devcontainer + FUSE mount_background + smoke test    ← latest
+01e54a6  docs(handoff): mark Phase 3e done; bump test counts
+9ab5449  feat(core): Phase 3e -- ProjectionFsProvider glue
+d5f8836  feat(core): add ObjectStore::commit_time helper
 aba421e  spike(3c): WinFsp hello-world via bindgen FFI -- mount works,
                     dispatch unresolved
 ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
@@ -52,9 +55,12 @@ ca93cea  chore(license): add MIT and Apache-2.0 licenses
   `FsError`, `InodeAllocator` (with synthetic-inode-bit reservation),
   `InMemoryFsProvider`. 9 unit tests.
 - **Phase 3b — fuser backend.** `ProjgitFuse<F>` adapter +
-  `mount(provider, mountpoint, config)`. Cfg-gated to Linux/macOS;
-  empty crate on Windows. Verified via
-  `cargo check -p projgit-fuse --target x86_64-unknown-linux-gnu`.
+  `mount(provider, mountpoint, config)` blocking helper +
+  `mount_background(...)` returning a `BackgroundSession` (drop the
+  handle to unmount). Cfg-gated to Linux/macOS; empty crate on
+  Windows. Verified at runtime by
+  `crates/projgit-fuse/tests/mount_smoke.rs` (run inside the
+  devcontainer; see [`.devcontainer/README.md`](../.devcontainer/README.md)).
 - **Phase 3e — ProjectionFsProvider glue.** `ProjectionFsProvider<F>`
   in `projgit-core::projection_fs` bridges `Projection` +
   `HydratingObjectStore<F>` + `RootOverlay` to the `FsProvider` trait.
@@ -115,6 +121,9 @@ TODO.
 e:\repos\gitfs\
 ├── Cargo.toml                       workspace root, MSRV 1.85
 ├── LICENSE-MIT, LICENSE-APACHE      dual license
+├── .devcontainer/                   Linux + FUSE dev environment
+│   ├── devcontainer.json            base image, runArgs, mounts
+│   └── README.md                    how to use it; FUSE quirks
 ├── crates/
 │   ├── projgit-core/                Phase 1+2+3a+3e -- engine
 │   ├── projgit-cli/                 placeholder (Phase 4)
@@ -135,6 +144,20 @@ e:\repos\gitfs\
 
 ## How to resume work
 
+### Two ways to develop
+
+**On the Windows host (default).** Edits, the projgit-core test
+suite, the WinFsp spike, and Linux compile-checks all work here.
+You cannot actually mount FUSE from Windows.
+
+**Inside the devcontainer (for FUSE work).** Open the workspace in
+VS Code, then **Dev Containers: Reopen in Container**. Provides a
+Debian + fuse3 + Rust environment with `/dev/fuse` available so
+`mount_background` can actually serve a filesystem. See
+[`.devcontainer/README.md`](../.devcontainer/README.md) for the
+full walkthrough, including the `target/` named-volume trick that
+makes builds fast on Windows hosts.
+
 ### Verify the current state builds + tests pass
 
 ```powershell
@@ -146,6 +169,19 @@ cargo clippy --workspace --all-targets -- -D warnings   # clean
 # Linux compile-check (requires `rustup target add x86_64-unknown-linux-gnu`):
 cargo check -p projgit-fuse --target x86_64-unknown-linux-gnu --tests
 ```
+
+### Run the FUSE mount smoke test (inside the devcontainer)
+
+Proves the fuser glue actually dispatches kernel ops to our
+`FsProvider`, with real git data flowing through
+`ProjectionFsProvider`.
+
+```sh
+cargo test -p projgit-fuse --test mount_smoke -- --ignored --nocapture
+```
+
+The test is `#[ignore]`-gated because FUSE isn't available on every
+host (Windows native, CI runners without `/dev/fuse`).
 
 ### Run the network-gated Fetcher test
 
@@ -176,6 +212,11 @@ These are already set up; a fresh dev box would need to install them.
 
 - Rust toolchain ≥ 1.95.0 stable (`rustup update stable`).
 - Linux cross-compile target: `rustup target add x86_64-unknown-linux-gnu`.
+- **Docker Desktop + Dev Containers VS Code extension.** For runtime
+  FUSE work — see [`.devcontainer/README.md`](../.devcontainer/README.md).
+  The container itself bootstraps fuse3 / libfuse3-dev / pkg-config /
+  rust-analyzer / clippy / rustfmt / lldb / gdb on first open via
+  `postCreateCommand`.
 - WinFsp 2.1.25156 with developer features
   (`winget install WinFsp.WinFsp`, then re-install with `ADDLOCAL=ALL`
   via msiexec to get the SDK headers + samples + import library).
