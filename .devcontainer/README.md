@@ -57,6 +57,10 @@ hosts the workspace bind-mount is NTFS-backed and cargo's many
 tiny I/O operations are pathologically slow there. Volume-backed
 `target/` is ~10× faster on warm rebuilds.
 
+The volume is created root-owned on first mount, so
+`postCreateCommand` runs `sudo chown vscode:vscode target/` once;
+that fix persists inside the volume across container rebuilds.
+
 Implications:
 - `cargo clean` from the host **does not** wipe build artifacts.
   Run it from inside the container, or:

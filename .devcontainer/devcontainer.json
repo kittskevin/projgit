@@ -34,12 +34,15 @@
 	},
 
 	// One-time setup after the container is created.
+	// - chown target/: the projgit-cargo-target named volume is
+	//   created root-owned on first mount; without this, cargo
+	//   (running as `vscode`) can't write to target/.
 	// - fuse3 / libfuse3-dev: runtime + headers for fuser to link / mount.
 	// - pkg-config: how fuser's build script finds libfuse.
 	// - lldb / gdb: native debugging from VS Code (CodeLLDB).
 	// - tree / strace: useful when poking at a live FUSE mount.
 	// - rustup components: rust-analyzer / clippy / rustfmt for IDE.
-	"postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends fuse3 libfuse3-dev pkg-config lldb gdb tree strace && rustup component add rust-analyzer clippy rustfmt",
+	"postCreateCommand": "sudo chown vscode:vscode ${containerWorkspaceFolder}/target && sudo apt-get update && sudo apt-get install -y --no-install-recommends fuse3 libfuse3-dev pkg-config lldb gdb tree strace && rustup component add rust-analyzer clippy rustfmt",
 
 	"customizations": {
 		"vscode": {
