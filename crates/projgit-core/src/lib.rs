@@ -16,6 +16,9 @@
 //! - [`fetcher`]       — `Fetcher` trait, `GixFetcher`, `NoopFetcher`,
 //!   single-flight `Coalescer`, and `HydratingObjectStore` that wraps
 //!   an `ObjectStore` with a fetcher for transparent miss-then-fetch.
+//! - [`fs_provider`]   — OS-agnostic read-only `FsProvider` trait that
+//!   FUSE / WinFsp backends implement, plus inode allocator and an
+//!   in-memory provider for testing.
 //! - [`error`]         — typed errors shared across the crate.
 //! - [`clone`]         — one-time partial-clone helper.
 
@@ -25,6 +28,7 @@
 pub mod clone;
 pub mod error;
 pub mod fetcher;
+pub mod fs_provider;
 pub mod object_store;
 pub mod overlay;
 pub mod projection;
@@ -35,6 +39,10 @@ pub use fetcher::{
     Fetcher, FetcherError, GixFetcher, GixFetcherError, HydrateError, HydratingObjectStore,
     NoopFetcher,
 };
+pub use fs_provider::{
+    Attr, DirEntry, FileType, FsError, FsProvider, InMemoryFsProvider, InodeAllocator, InodeKind,
+    ROOT_INODE,
+};
 pub use object_store::{ObjectKind, ObjectStore};
 pub use overlay::{RootOverlay, SyntheticEntry};
 pub use projection::{Projection, ResolvedEntry};
@@ -42,3 +50,4 @@ pub use tree::{EntryMode, TreeEntry, TreeNavigator};
 
 /// Crate version, exposed to the CLI and other consumers.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
