@@ -16,15 +16,20 @@
 //! - [`fetcher`]       — `Fetcher` trait, `GixFetcher`, `NoopFetcher`,
 //!   single-flight `Coalescer`, and `HydratingObjectStore` that wraps
 //!   an `ObjectStore` with a fetcher for transparent miss-then-fetch.
+//!   `GixFetcher` is gated behind the `gix-fetcher` Cargo feature
+//!   (default-on); consumers that only need the trait + `NoopFetcher`
+//!   can disable it to avoid pulling reqwest + rustls + ring.
 //! - [`fs_provider`]   — OS-agnostic read-only `FsProvider` trait that
 //!   FUSE / WinFsp backends implement, plus inode allocator and an
 //!   in-memory provider for testing.
 //! - [`error`]         — typed errors shared across the crate.
-//! - [`clone`]         — one-time partial-clone helper.
+//! - [`clone`]         — one-time partial-clone helper. Behind the
+//!   `gix-fetcher` feature for the same network-dep reason.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "gix-fetcher")]
 pub mod clone;
 pub mod error;
 pub mod fetcher;
@@ -35,10 +40,9 @@ pub mod projection;
 pub mod tree;
 
 pub use error::{ObjectStoreError, ProjectionError};
-pub use fetcher::{
-    Fetcher, FetcherError, GixFetcher, GixFetcherError, HydrateError, HydratingObjectStore,
-    NoopFetcher,
-};
+#[cfg(feature = "gix-fetcher")]
+pub use fetcher::{GixFetcher, GixFetcherError};
+pub use fetcher::{Fetcher, FetcherError, HydrateError, HydratingObjectStore, NoopFetcher};
 pub use fs_provider::{
     Attr, DirEntry, FileType, FsError, FsProvider, InMemoryFsProvider, InodeAllocator, InodeKind,
     ROOT_INODE,

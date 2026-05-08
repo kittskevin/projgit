@@ -9,5 +9,9 @@ repository.workspace = true
 description = "FUSE filesystem backend for projgit (Linux and macOS)."
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-projgit-core = { path = "../projgit-core" }
-# Phase 3 will add: fuser.
+# We don't need the GixFetcher / partial_clone / network deps in the
+# FUSE backend; turn off projgit-core's default features so we don't
+# pull reqwest + rustls + ring + a C compiler at build time.
+projgit-core = { path = "../projgit-core", default-features = false }
+fuser = "0.17"
+libc = "0.2"

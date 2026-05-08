@@ -24,10 +24,12 @@ use gix::ObjectId;
 use std::sync::Arc;
 
 mod coalesce;
+#[cfg(feature = "gix-fetcher")]
 mod gix_fetcher;
 mod noop;
 
 pub use coalesce::Coalescer;
+#[cfg(feature = "gix-fetcher")]
 pub use gix_fetcher::{GixFetcher, GixFetcherError};
 pub use noop::NoopFetcher;
 

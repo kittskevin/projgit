@@ -8,14 +8,21 @@ license.workspace = true
 repository.workspace = true
 description = "Core projection engine, object store, and fetcher abstractions for projgit."
 
+[features]
+# By default we include the GixFetcher, which needs gix's blocking
+# network transport. Consumers that only need the read-only Projection
+# / ObjectStore / FsProvider machinery (e.g. the FUSE adapter) can
+# disable this to avoid pulling reqwest + rustls + ring + a C compiler.
+default = ["gix-fetcher"]
+
+# Enables `GixFetcher` and the `partial_clone` helper. Pulls in gix's
+# blocking-network-client + reqwest+rustls transport.
+gix-fetcher = ["gix/blocking-network-client", "gix/blocking-http-transport-reqwest-rust-tls"]
+
 [dependencies]
-# We extend the lean workspace pin with the blocking transport features
-# Phase 0a validated. These pull in reqwest+rustls but compile cleanly
-# on Windows / Linux / macOS without system OpenSSL.
-gix = { workspace = true, features = [
-    "blocking-network-client",
-    "blocking-http-transport-reqwest-rust-tls",
-] }
+# Lean by default; the `gix-fetcher` feature opts in the network
+# features Phase 0a validated.
+gix = { workspace = true }
 bstr = { workspace = true }
 thiserror = { workspace = true }
 
