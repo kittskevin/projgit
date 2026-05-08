@@ -13,5 +13,21 @@ name = "projgit"
 path = "src/main.rs"
 
 [dependencies]
+# We want both `GixFetcher` (network mode) and `NoopFetcher` (offline /
+# local-repo mode) available, plus `partial_clone` — so keep the
+# default `gix-fetcher` feature on.
 projgit-core = { path = "../projgit-core" }
-# Phase 4 will add: clap, anyhow, tracing, tracing-subscriber.
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+# Lightweight Ctrl-C / SIGTERM handler so we can drop the
+# `BackgroundSession` and unmount cleanly on shutdown.
+ctrlc = { version = "3", features = ["termination"] }
+# We construct `gix::ObjectId` from --commit hex. Use the workspace pin
+# so we never drift onto a different gix major than projgit-core.
+gix = { workspace = true }
+
+# The FUSE backend only exists on Linux + macOS. The CLI's `mount`
+# subcommand is cfg-gated to those targets; on other targets it prints
+# a friendly "use projgit-winfsp once Phase 3d lands" message.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+projgit-fuse = { path = "../projgit-fuse" }
