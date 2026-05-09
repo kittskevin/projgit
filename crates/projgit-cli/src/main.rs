@@ -61,8 +61,8 @@ struct MountArgs {
     commit: Option<String>,
 
     /// Mount only this `/`-separated subdirectory of the projection.
-    /// Currently requires `--commit`; ref+subtree resolution is a
-    /// Phase 5 enhancement.
+    /// Combines with `--ref` (peeled to a commit at construction)
+    /// or `--commit`.
     #[arg(long)]
     subtree: Option<String>,
 
@@ -81,6 +81,13 @@ struct MountArgs {
     /// surfaces as an I/O error instead of triggering network traffic.
     #[arg(long)]
     offline: bool,
+
+    /// On unmount, print a one-line summary of the in-process LRU
+    /// caches (parsed-tree LRU + small-blob LRU). Useful when
+    /// tuning cache sizes or sanity-checking that warm reads are
+    /// hitting the cache.
+    #[arg(long)]
+    stats: bool,
 }
 
 fn main() -> Result<()> {
@@ -158,8 +165,9 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
             .with_context(|| format!("opening object store at {}", git_dir.display()))?,
     );
 
-    // 3. Build the projection.
-    let projection = build_projection(&args)?;
+    // 3. Build the projection. Done after opening the store so we
+    //    can peel `--ref` to a commit OID when combined with `--subtree`.
+    let projection = build_projection(&args, &store)?;
 
     // 4. Pick a fetcher.
     //
@@ -182,6 +190,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     let overlay = RootOverlay::new();
     let cfg = MountConfig::default();
     let mp = args.mountpoint.clone();
+    let print_stats = args.stats;
 
     if args.offline || !source_is_url {
         let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
@@ -189,7 +198,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
             ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
                 .context("building ProjectionFsProvider")?,
         );
-        run_mount(provider, &mp, &cfg)
+        run_mount(provider, &mp, &cfg, print_stats)
     } else {
         let fetcher =
             GitCliFetcher::open(store.clone()).context("opening GitCliFetcher (needs `git` on PATH)")?;
@@ -198,7 +207,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
             ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
                 .context("building ProjectionFsProvider")?,
         );
-        run_mount(provider, &mp, &cfg)
+        run_mount(provider, &mp, &cfg, print_stats)
     }
 }
 
@@ -216,6 +225,7 @@ fn run_mount<F>(
     provider: std::sync::Arc<projgit_core::ProjectionFsProvider<F>>,
     mountpoint: &std::path::Path,
     config: &projgit_fuse::MountConfig,
+    print_stats: bool,
 ) -> Result<()>
 where
     F: projgit_core::Fetcher + 'static,
@@ -224,7 +234,7 @@ where
         "projgit: mounting at {} (Ctrl-C to unmount)",
         mountpoint.display()
     );
-    let session = projgit_fuse::mount_background(provider, mountpoint, config)
+    let session = projgit_fuse::mount_background(provider.clone(), mountpoint, config)
         .with_context(|| format!("mounting at {}", mountpoint.display()))?;
 
     // Park the main thread on a Ctrl-C / SIGTERM. Dropping `session`
@@ -238,6 +248,27 @@ where
 
     eprintln!("projgit: unmounting…");
     drop(session);
+
+    if print_stats {
+        let store = provider.store().store();
+        let t = store.tree_cache_stats();
+        let b = store.blob_cache_stats();
+        eprintln!(
+            "projgit: tree cache hits={} misses={} inserts={} evictions={} len={}/{}",
+            t.hits, t.misses, t.inserts, t.evictions, t.len, t.capacity,
+        );
+        eprintln!(
+            "projgit: blob cache hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
+            b.hits,
+            b.misses,
+            b.inserts,
+            b.evictions,
+            b.skipped_too_large,
+            b.bytes_used,
+            b.capacity_bytes,
+        );
+    }
+
     eprintln!("projgit: unmounted.");
     Ok(())
 }
@@ -246,7 +277,10 @@ where
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_projection(args: &MountArgs) -> Result<projgit_core::Projection> {
+fn build_projection(
+    args: &MountArgs,
+    store: &projgit_core::ObjectStore,
+) -> Result<projgit_core::Projection> {
     use projgit_core::Projection;
 
     // Pick the base projection from the mutually-exclusive --ref / --commit.
@@ -262,34 +296,30 @@ fn build_projection(args: &MountArgs) -> Result<projgit_core::Projection> {
     };
 
     // Fold in --subtree if present.
-    if let Some(path) = &args.subtree {
-        let trimmed = path.trim_matches('/');
-        if trimmed.is_empty() {
-            return Ok(base);
-        }
-        let commit = match base {
-            Projection::Commit(oid) => oid,
-            Projection::Ref(_) => {
-                // The `Subtree` variant requires a commit OID. We
-                // don't have an `ObjectStore` here yet to peel the
-                // ref, and threading that through this helper would
-                // pull mount-side dependencies into projection
-                // construction. Defer the convenience to Phase 5.
-                bail!(
-                    "`--subtree` currently requires `--commit`. \
-                     Resolving a ref + subtree pair is a Phase 5 \
-                     enhancement; pass --commit <oid> for now."
-                );
-            }
-            Projection::Subtree { .. } => unreachable!("base is Ref or Commit"),
-        };
-        Ok(Projection::Subtree {
-            commit,
-            path: trimmed.to_owned(),
-        })
-    } else {
-        Ok(base)
+    let Some(path) = &args.subtree else {
+        return Ok(base);
+    };
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(base);
     }
+    // The `Subtree` variant requires a commit OID. Peel the
+    // current base down to one. For `Projection::Ref` this is the
+    // ref-tip resolve we already do at provider-construction time;
+    // doing it here, once, keeps the resulting `Projection::Subtree`
+    // self-contained and matches the rest of the projection layer's
+    // "OID-based identity" rule.
+    let commit = match base {
+        Projection::Commit(oid) => oid,
+        Projection::Ref(name) => store
+            .resolve_ref(&name)
+            .with_context(|| format!("resolving ref `{name}` for --subtree"))?,
+        Projection::Subtree { .. } => unreachable!("base is Ref or Commit"),
+    };
+    Ok(Projection::Subtree {
+        commit,
+        path: trimmed.to_owned(),
+    })
 }
 
 fn looks_like_url(s: &str) -> bool {
