@@ -1,7 +1,7 @@
 # projgit — Handoff
 
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-05-09, after Phase 5a perf polish (tree LRU + batched cat-file).
+> Last updated: 2026-05-09, after Phase 5b nice-to-haves (blob LRU, --stats, --ref+--subtree).
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -31,7 +31,12 @@ and [`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
 ## Where we are right now
 
 ```
-  HEAD    feat(core): Phase 5a -- tree LRU + long-lived cat-file        ← latest
+  HEAD    feat(cli): --stats flag prints cache snapshot on unmount   ← latest
+  HEAD~   feat(core): small-blob LRU in ObjectStore
+  HEAD~   feat(cli): --ref + --subtree resolution
+1bec429  docs(handoff): mark Phase 5a done; refresh `What I'd do next`
+44c1f4b  perf(core): keep one git cat-file --batch-check child per fetcher
+82d83f3  feat(core): add tree-listing LRU to ObjectStore
 7580461  docs(handoff): mark Phase 4 done; document fetcher selection
 2d7f069  feat(cli): Phase 4 -- `projgit mount` end-to-end
 58a9f06  feat(core): add GitCliFetcher (promisor-aware fallback)
@@ -39,8 +44,6 @@ and [`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
 8a96060  fix(core): readdir no longer hydrates blobs to fill in size
 ef8b33a  fix(devcontainer): chown target/ in postCreateCommand
 cb493ac  test(fuse): runtime FUSE mount smoke test + handoff updates
-28b5e2f  chore(devcontainer): add Linux + FUSE development environment
-9687f82  feat(fuse): add mount_background() returning a BackgroundSession
 9ab5449  feat(core): Phase 3e -- ProjectionFsProvider glue
 ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
 0c53505  feat(core): Phase 3a -- FsProvider trait, InodeAllocator
@@ -103,25 +106,37 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   for benchmarks, and as the home for future native-Rust transport
   work. See `crates/projgit-core/src/fetcher/git_cli.rs` for the
   full rationale.
-- **Phase 5a — perf polish.** Two cheap wins after the Phase 4
-  demo highlighted the per-`ls` cost on real repos:
-  - **Tree-listing LRU.** `ObjectStore` now memoises parsed
+- **Phase 5a/5b — perf polish + nice-to-haves.** A small bundle of
+  improvements that started after the Phase 4 demo highlighted
+  per-`ls` cost on real repos:
+  - **Tree-listing LRU.** `ObjectStore` memoises parsed
     `Vec<RawTreeEntry>` keyed by tree OID in a small bounded LRU
     (`tree_cache.rs`, default 256 entries). Implementation is a
-    HashMap + BTreeMap reverse index for O(log n) eviction; a
-    `ObjectStore::tree_cache_stats()` method exposes
-    hits/misses/inserts/evictions for tests and future metrics.
-    Warm `ls -la src/` against `rust-lang/log` dropped from ~5
-    sequential gix tree parses to a single hash lookup.
+    HashMap + BTreeMap reverse index for O(log n) eviction.
+  - **Small-blob LRU.** `ObjectStore::read_blob` consults a
+    byte-bounded LRU (`blob_cache.rs`, default 16 MiB total /
+    64 KiB per entry; payloads above the per-entry cap are served
+    fresh and skipped on insert). Mirrors the tree LRU's shape.
   - **Long-lived `git cat-file --batch-check`.** `GitCliFetcher`
     keeps one `git` child alive for the lifetime of the fetcher
     and shuttles OIDs over its stdin / stdout pipes. If the child
-    dies (broken pipe, transport timeout) it's torn down and
-    respawned lazily on the next miss. End-to-end measurement on
-    `rust-lang/log`: warm `ls` ~2 ms (was ~30+ ms per stat), and
-    cold `ls` of a 5-file directory drops from N spawns + N TLS
-    handshakes to one `git` process and one reused HTTPS
-    connection.
+    dies it's torn down and respawned lazily on the next miss.
+  - **`--ref + --subtree`.** Resolved against the open
+    `ObjectStore` (peel ref → commit → `Subtree`). Removes the
+    Phase 4 "requires --commit" sharp edge.
+  - **`projgit mount --stats`.** On unmount, prints a one-line
+    snapshot of the tree + blob LRU counters. Both stats types
+    (`TreeCacheStats`, `BlobCacheStats`) are re-exported from
+    `projgit_core` for future programmatic consumers.
+
+  End-to-end on `rust-lang/log` inside the devcontainer:
+  - Cold `ls -la src/` (5 files): ~1.5 s (network-bound; 5
+    sequential HTTPS RTTs).
+  - Warm `ls -la src/`: **~2 ms** (tree LRU + blobs already local).
+  - Cold `ls -la tests/` (5 files, batch-check child alive): ~530 ms
+    instead of 5 fork+exec + 5 TLS handshakes.
+  - `pgrep` confirms exactly one persistent `git cat-file
+    --batch-check` child for the whole mount.
 - **License decision.** Project is dual-licensed **MIT OR Apache-2.0**.
   We hand-roll WinFsp FFI bindings (no GPL-3.0 `winfsp-rs`).
   See repo memory + [`docs/initial-plan.md` §10](initial-plan.md).
@@ -145,12 +160,12 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   `ProjectionFsProvider` (3e) directly. The Phase 4 CLI's
   `cmd_mount` is cfg-gated to Linux/macOS; the Windows arm currently
   prints a friendly "use projgit-winfsp once Phase 3d lands" error.
-- **Phase 5 — remaining polish.** With Phase 5a in (tree-listing LRU
-  + batched `cat-file`), what's left here is metrics surfacing
-  (a `--stats` flag printing the cache snapshot), ref+subtree
-  convenience (`--subtree` currently requires `--commit`), and a
-  small-blob LRU to cut warm `cat` cost. None of this is on the
-  critical path for the Windows backend.
+- **Phase 5 — remaining polish.** With Phases 5a/5b in (tree LRU +
+  blob LRU + batched `cat-file` + `--stats` + `--ref + --subtree`),
+  the remaining items here are convenience flags that don't block
+  the Windows backend: a `projgit mount --background` PID-file
+  flow with a `projgit umount` companion, and `tracing-subscriber`
+  wiring for the existing `-v` flag.
 
 ### Phase 3e gotchas worth knowing for callers
 - `ProjectionFsProvider::new` resolves the projection's commit OID
@@ -219,7 +234,7 @@ makes builds fast on Windows hosts.
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 cd e:\repos\gitfs
 cargo build --workspace                 # should be clean on Windows
-cargo test  -p projgit-core             # 27 + 4 + 19 + 13 = 63 tests pass
+cargo test  -p projgit-core             # 31 + 4 + 20 + 13 = 68 tests pass
 cargo test  -p projgit-cli              # 4 unit tests
 cargo clippy --workspace --all-targets -- -D warnings   # clean
 # Linux compile-check (requires `rustup target add x86_64-unknown-linux-gnu`):
@@ -382,17 +397,14 @@ visible progress":
    `ProjectionFsProvider` directly, exactly like Phase 4's CLI does
    on Linux. The riskiest remaining piece. Best done in a fresh
    focused session on the Windows host.
-2. **CLI quality-of-life.** A `--background` flag (return a PID so
-   shells can `umount` later), a `--stats` flag printing the
-   tree-cache + fetcher counters, `--ref` + `--subtree` resolution
-   (currently `--subtree` requires `--commit`),
-   `tracing-subscriber` wiring for the existing `-v` flag, and a
-   `projgit umount` companion. None of these block the demo; pick
-   them off in a Phase 4.x cleanup.
-3. **Small-blob LRU.** `ObjectStore::read_blob` re-decodes the same
-   blob on every read of a hot file. A bounded LRU on raw blob
-   bytes (capped at e.g. 64 KB per entry, ~16 MB total) would make
-   warm `cat` calls ~free. Mirrors the tree LRU's shape.
+2. **`projgit mount --background` + `projgit umount`.** Today the
+   foreground process owns the mount; a PID-file flow plus an
+   `umount` companion would let scripts manage many mounts.
+   Designs need a small mount registry under `$XDG_RUNTIME_DIR`.
+3. **`tracing-subscriber` wiring for the existing `-v` flag.** The
+   verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
+   it. Wiring `tracing-subscriber` (with optional crate feature)
+   would surface fetcher/provider events at `-v` / `-vv`.
 
 Whichever path you take, **commit per the
 [`commit-work` skill](../.github/skills/commit-work/SKILL.md)** —
