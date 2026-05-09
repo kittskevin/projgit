@@ -1,7 +1,7 @@
 # projgit — Handoff
 
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-05-08, after Phase 4 CLI + GitCliFetcher fallback.
+> Last updated: 2026-05-09, after Phase 5a perf polish (tree LRU + batched cat-file).
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -31,22 +31,19 @@ and [`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
 ## Where we are right now
 
 ```
-  HEAD    feat(cli): Phase 4 -- `projgit mount` end-to-end           ← latest
-  HEAD~   feat(core): GitCliFetcher fallback for promisor-only servers
-  HEAD~   fix(core): GixFetcher shares ObjectStore repo (post-fetch visibility)
-  HEAD~   fix(core): readdir no longer hydrates blobs to fill in sizes
-  HEAD~   fix(devcontainer): chown target/ in postCreateCommand
+  HEAD    feat(core): Phase 5a -- tree LRU + long-lived cat-file        ← latest
+7580461  docs(handoff): mark Phase 4 done; document fetcher selection
+2d7f069  feat(cli): Phase 4 -- `projgit mount` end-to-end
+58a9f06  feat(core): add GitCliFetcher (promisor-aware fallback)
+40118eb  fix(core): GixFetcher shares ObjectStore's repo (post-fetch visibility)
+8a96060  fix(core): readdir no longer hydrates blobs to fill in size
+ef8b33a  fix(devcontainer): chown target/ in postCreateCommand
 cb493ac  test(fuse): runtime FUSE mount smoke test + handoff updates
 28b5e2f  chore(devcontainer): add Linux + FUSE development environment
 9687f82  feat(fuse): add mount_background() returning a BackgroundSession
-01e54a6  docs(handoff): mark Phase 3e done; bump test counts
 9ab5449  feat(core): Phase 3e -- ProjectionFsProvider glue
-d5f8836  feat(core): add ObjectStore::commit_time helper
-aba421e  spike(3c): WinFsp hello-world via bindgen FFI -- mount works,
-                    dispatch unresolved
 ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
 0c53505  feat(core): Phase 3a -- FsProvider trait, InodeAllocator
-ca93cea  chore(license): add MIT and Apache-2.0 licenses
 1033f98  feat(core): Phase 2 -- Fetcher, single-flight, hydrating store
 97a3b90  feat(core): Phase 1 -- ObjectStore, TreeNavigator, Projection
 ```
@@ -91,9 +88,13 @@ ca93cea  chore(license): add MIT and Apache-2.0 licenses
   `projgit_fuse::mount_background`. 4 unit tests; verified end-to-end
   in the devcontainer against `octocat/Hello-World` and
   `rust-lang/log`.
-- **`GitCliFetcher` (production-default URL fetcher).** Shells out
-  to `git -C <git_dir> cat-file -e <oid>`, which triggers the
-  partial-clone *promisor* fetch with the right protocol framing.
+- **`GitCliFetcher` (production-default URL fetcher).** Drives the
+  partial-clone *promisor* fetch path via a long-lived
+  `git -C <git_dir> cat-file --batch-check` child: write the OID,
+  read one status line, classify present / `missing` / unknown.
+  The single child amortises fork/exec across an entire mount
+  session and reuses the underlying TLS connection git keeps to the
+  remote.
   Needed because GitHub's current policy rejects the bare-OID
   `allow-tip-sha1-in-want` requests `GixFetcher` issues for many
   repositories (server returns `RejectedSourceObjectNotFound`,
@@ -102,6 +103,25 @@ ca93cea  chore(license): add MIT and Apache-2.0 licenses
   for benchmarks, and as the home for future native-Rust transport
   work. See `crates/projgit-core/src/fetcher/git_cli.rs` for the
   full rationale.
+- **Phase 5a — perf polish.** Two cheap wins after the Phase 4
+  demo highlighted the per-`ls` cost on real repos:
+  - **Tree-listing LRU.** `ObjectStore` now memoises parsed
+    `Vec<RawTreeEntry>` keyed by tree OID in a small bounded LRU
+    (`tree_cache.rs`, default 256 entries). Implementation is a
+    HashMap + BTreeMap reverse index for O(log n) eviction; a
+    `ObjectStore::tree_cache_stats()` method exposes
+    hits/misses/inserts/evictions for tests and future metrics.
+    Warm `ls -la src/` against `rust-lang/log` dropped from ~5
+    sequential gix tree parses to a single hash lookup.
+  - **Long-lived `git cat-file --batch-check`.** `GitCliFetcher`
+    keeps one `git` child alive for the lifetime of the fetcher
+    and shuttles OIDs over its stdin / stdout pipes. If the child
+    dies (broken pipe, transport timeout) it's torn down and
+    respawned lazily on the next miss. End-to-end measurement on
+    `rust-lang/log`: warm `ls` ~2 ms (was ~30+ ms per stat), and
+    cold `ls` of a 5-file directory drops from N spawns + N TLS
+    handshakes to one `git` process and one reused HTTPS
+    connection.
 - **License decision.** Project is dual-licensed **MIT OR Apache-2.0**.
   We hand-roll WinFsp FFI bindings (no GPL-3.0 `winfsp-rs`).
   See repo memory + [`docs/initial-plan.md` §10](initial-plan.md).
@@ -125,12 +145,12 @@ ca93cea  chore(license): add MIT and Apache-2.0 licenses
   `ProjectionFsProvider` (3e) directly. The Phase 4 CLI's
   `cmd_mount` is cfg-gated to Linux/macOS; the Windows arm currently
   prints a friendly "use projgit-winfsp once Phase 3d lands" error.
-- **Phase 5 — Polish (caches, metrics, integration tests).** Notably:
-  tree-listing LRU cache (currently `ProjectionFsProvider` re-reads
-  trees via `HydratingObjectStore::read_tree` on every `readdir`),
-  batched `git cat-file --batch-check` in `GitCliFetcher` to avoid
-  per-OID spawn overhead, ref+subtree convenience
-  (`--subtree` currently requires `--commit`).
+- **Phase 5 — remaining polish.** With Phase 5a in (tree-listing LRU
+  + batched `cat-file`), what's left here is metrics surfacing
+  (a `--stats` flag printing the cache snapshot), ref+subtree
+  convenience (`--subtree` currently requires `--commit`), and a
+  small-blob LRU to cut warm `cat` cost. None of this is on the
+  critical path for the Windows backend.
 
 ### Phase 3e gotchas worth knowing for callers
 - `ProjectionFsProvider::new` resolves the projection's commit OID
@@ -199,7 +219,7 @@ makes builds fast on Windows hosts.
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 cd e:\repos\gitfs
 cargo build --workspace                 # should be clean on Windows
-cargo test  -p projgit-core             # 23 + 4 + 18 + 13 = 58 tests pass
+cargo test  -p projgit-core             # 27 + 4 + 19 + 13 = 63 tests pass
 cargo test  -p projgit-cli              # 4 unit tests
 cargo clippy --workspace --all-targets -- -D warnings   # clean
 # Linux compile-check (requires `rustup target add x86_64-unknown-linux-gnu`):
@@ -362,17 +382,17 @@ visible progress":
    `ProjectionFsProvider` directly, exactly like Phase 4's CLI does
    on Linux. The riskiest remaining piece. Best done in a fresh
    focused session on the Windows host.
-2. **Phase 5 polish, especially tree-listing cache and batched
-   `git cat-file --batch-check` in `GitCliFetcher`.** The current
-   `ProjectionFsProvider::readdir` re-reads trees on every call;
-   `GitCliFetcher` spawns one `git` per OID. Both are fine
-   correctness-wise but get noticeably slow on warm `ls`s of large
-   directories.
-3. **CLI quality-of-life.** A `--background` flag (return a PID so
-   shells can `umount` later), `--ref + --subtree` resolution
-   (currently `--subtree` requires `--commit`), tracing-subscriber
-   wiring for the `-v` flag, and a `projgit umount` companion. None
-   of these block the demo; pick them off in a Phase 4.x cleanup.
+2. **CLI quality-of-life.** A `--background` flag (return a PID so
+   shells can `umount` later), a `--stats` flag printing the
+   tree-cache + fetcher counters, `--ref` + `--subtree` resolution
+   (currently `--subtree` requires `--commit`),
+   `tracing-subscriber` wiring for the existing `-v` flag, and a
+   `projgit umount` companion. None of these block the demo; pick
+   them off in a Phase 4.x cleanup.
+3. **Small-blob LRU.** `ObjectStore::read_blob` re-decodes the same
+   blob on every read of a hot file. A bounded LRU on raw blob
+   bytes (capped at e.g. 64 KB per entry, ~16 MB total) would make
+   warm `cat` calls ~free. Mirrors the tree LRU's shape.
 
 Whichever path you take, **commit per the
 [`commit-work` skill](../.github/skills/commit-work/SKILL.md)** —
