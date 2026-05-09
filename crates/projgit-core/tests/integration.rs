@@ -262,6 +262,48 @@ fn object_store_commit_time_returns_committer_time() {
     ));
 }
 
+#[test]
+fn read_tree_is_cached_after_first_call() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head_hex) = build_fixture("os_tree_cache");
+    let store = ObjectStore::open(&repo).unwrap();
+
+    let head = parse_oid(&head_hex);
+    let root_tree = store.commit_tree(head).unwrap();
+
+    // Cold call -> miss + insert.
+    let first = store.read_tree(root_tree).unwrap();
+    let s1 = store.tree_cache_stats();
+    assert_eq!(s1.misses, 1, "first read_tree should miss");
+    assert_eq!(s1.inserts, 1);
+    assert_eq!(s1.hits, 0);
+    assert_eq!(s1.len, 1);
+
+    // Warm call -> hit; same data.
+    let second = store.read_tree(root_tree).unwrap();
+    assert_eq!(first, second);
+    let s2 = store.tree_cache_stats();
+    assert_eq!(s2.hits, 1, "second read_tree should hit");
+    assert_eq!(s2.misses, 1);
+    assert_eq!(s2.inserts, 1);
+
+    // Reading a different tree caches a second entry without
+    // disturbing the first.
+    let src = first
+        .iter()
+        .find(|e| e.name == b"src".as_bstr())
+        .expect("src dir");
+    assert!(projgit_core::EntryMode::from_raw(src.mode_raw).is_dir());
+    let _ = store.read_tree(src.oid).unwrap();
+    let s3 = store.tree_cache_stats();
+    assert_eq!(s3.misses, 2);
+    assert_eq!(s3.inserts, 2);
+    assert_eq!(s3.len, 2);
+}
+
 // -----------------------------------------------------------------------------
 // TreeNavigator tests
 // -----------------------------------------------------------------------------

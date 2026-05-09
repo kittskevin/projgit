@@ -11,14 +11,19 @@
 //!   we raise it in preference to letting gix's nested error organization
 //!   leak out.
 //!
-//! Caches (LRU for parsed trees, LRU for small blobs ≤ 64 KB) and
-//! many-readers `Repository`-handle plumbing arrive in Phase 5; the
-//! Phase 1 implementation calls `gix` directly for clarity.
+//! Caches:
+//!
+//! - **Parsed-tree LRU.** `read_tree` consults a small bounded LRU
+//!   ([`crate::tree_cache`]) before walking the gix tree. Tree
+//!   objects are immutable in the OID-keyed sense, so the cache
+//!   never has to invalidate. A small-blob cache may follow.
 
 use crate::error::ObjectStoreError;
+use crate::tree_cache::{TreeCache, TreeCacheStats, DEFAULT_CAPACITY};
 use bstr::BString;
 use gix::ObjectId;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// The kind of a git object, mirroring git's four object types.
@@ -56,6 +61,7 @@ impl ObjectKind {
 pub struct ObjectStore {
     repo: gix::ThreadSafeRepository,
     git_dir: PathBuf,
+    tree_cache: TreeCache,
 }
 
 impl ObjectStore {
@@ -73,6 +79,7 @@ impl ObjectStore {
         Ok(Self {
             repo: repo.into_sync(),
             git_dir,
+            tree_cache: TreeCache::with_capacity(DEFAULT_CAPACITY),
         })
     }
 
@@ -147,7 +154,17 @@ impl ObjectStore {
     ///
     /// Returns `MissingObject` if absent or `UnexpectedKind` if the
     /// OID names a non-tree.
+    ///
+    /// Backed by an internal LRU keyed by tree OID. Cold reads parse
+    /// the tree once and clone the resulting `Vec` for the caller;
+    /// warm reads return a clone of the cached `Vec` without
+    /// touching gix at all. The cache is invisible to consumers.
     pub fn read_tree(&self, oid: ObjectId) -> Result<Vec<RawTreeEntry>, ObjectStoreError> {
+        if let Some(cached) = self.tree_cache.get(&oid) {
+            return Ok((*cached).clone());
+        }
+        self.tree_cache.record_miss();
+
         let h = self.handle();
         let obj = h
             .try_find_object(oid)
@@ -171,7 +188,21 @@ impl ObjectStore {
                 oid: entry.oid().to_owned(),
             });
         }
+        // Publish to cache after a successful parse. Cloning the Arc
+        // contents on subsequent hits is far cheaper than re-parsing.
+        let arc = Arc::new(out.clone());
+        self.tree_cache.put(oid, arc);
         Ok(out)
+    }
+
+    /// Snapshot of the parsed-tree LRU's counters.
+    ///
+    /// Useful for tests, diagnostics, and future metrics. Resetting
+    /// the cache or its counters is intentionally not supported on
+    /// the public API; callers that need a clean slate can build a
+    /// fresh `ObjectStore`.
+    pub fn tree_cache_stats(&self) -> TreeCacheStats {
+        self.tree_cache.stats()
     }
 
     /// Return the committer timestamp of a commit as a [`SystemTime`].
