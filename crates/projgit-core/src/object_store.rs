@@ -16,8 +16,13 @@
 //! - **Parsed-tree LRU.** `read_tree` consults a small bounded LRU
 //!   ([`crate::tree_cache`]) before walking the gix tree. Tree
 //!   objects are immutable in the OID-keyed sense, so the cache
-//!   never has to invalidate. A small-blob cache may follow.
+//!   never has to invalidate.
+//! - **Small-blob LRU.** `read_blob` consults a byte-bounded LRU
+//!   ([`crate::blob_cache`]) so warm `cat` calls of source-sized
+//!   files don't re-decode through gix. Skips blobs above a
+//!   per-entry size threshold.
 
+use crate::blob_cache::{BlobCache, BlobCacheStats, DEFAULT_CAPACITY_BYTES, DEFAULT_PER_ENTRY_MAX_BYTES};
 use crate::error::ObjectStoreError;
 use crate::tree_cache::{TreeCache, TreeCacheStats, DEFAULT_CAPACITY};
 use bstr::BString;
@@ -62,6 +67,7 @@ pub struct ObjectStore {
     repo: gix::ThreadSafeRepository,
     git_dir: PathBuf,
     tree_cache: TreeCache,
+    blob_cache: BlobCache,
 }
 
 impl ObjectStore {
@@ -80,6 +86,7 @@ impl ObjectStore {
             repo: repo.into_sync(),
             git_dir,
             tree_cache: TreeCache::with_capacity(DEFAULT_CAPACITY),
+            blob_cache: BlobCache::new(DEFAULT_CAPACITY_BYTES, DEFAULT_PER_ENTRY_MAX_BYTES),
         })
     }
 
@@ -131,7 +138,19 @@ impl ObjectStore {
 
     /// Read the raw bytes of a blob. Returns `MissingObject` if absent
     /// or `UnexpectedKind` if the OID names a non-blob.
+    ///
+    /// Backed by an internal byte-bounded LRU
+    /// ([`crate::blob_cache`]). Cold reads decode the blob once and
+    /// publish a clone to the cache; warm reads return a clone of
+    /// the cached bytes without touching gix. Blobs over the cache's
+    /// per-entry size cap (default 64 KiB) are served straight from
+    /// gix on every read.
     pub fn read_blob(&self, oid: ObjectId) -> Result<Vec<u8>, ObjectStoreError> {
+        if let Some(cached) = self.blob_cache.get(&oid) {
+            return Ok((*cached).clone());
+        }
+        self.blob_cache.record_miss();
+
         let h = self.handle();
         let obj = h
             .try_find_object(oid)
@@ -145,7 +164,12 @@ impl ObjectStore {
                 actual,
             });
         }
-        Ok(obj.data.clone())
+        let bytes = obj.data.clone();
+        // Publish to the cache after a successful read. The cache
+        // skips entries above its per-entry cap internally, so we
+        // don't need to gate the put here.
+        self.blob_cache.put(oid, Arc::new(bytes.clone()));
+        Ok(bytes)
     }
 
     /// Read and parse a tree's entries, returning them in the order
@@ -203,6 +227,12 @@ impl ObjectStore {
     /// fresh `ObjectStore`.
     pub fn tree_cache_stats(&self) -> TreeCacheStats {
         self.tree_cache.stats()
+    }
+
+    /// Snapshot of the small-blob LRU's counters. See
+    /// [`Self::tree_cache_stats`] for caveats.
+    pub fn blob_cache_stats(&self) -> BlobCacheStats {
+        self.blob_cache.stats()
     }
 
     /// Return the committer timestamp of a commit as a [`SystemTime`].

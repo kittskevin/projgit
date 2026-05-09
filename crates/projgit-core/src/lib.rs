@@ -41,6 +41,7 @@ pub mod overlay;
 pub mod projection;
 pub mod projection_fs;
 pub mod tree;
+mod blob_cache;
 mod tree_cache;
 
 pub use error::{ObjectStoreError, ProjectionError};
@@ -59,6 +60,7 @@ pub use overlay::{RootOverlay, SyntheticEntry};
 pub use projection::{Projection, ResolvedEntry};
 pub use projection_fs::ProjectionFsProvider;
 pub use tree::{EntryMode, TreeEntry, TreeNavigator};
+pub use blob_cache::BlobCacheStats;
 pub use tree_cache::TreeCacheStats;
 
 /// Crate version, exposed to the CLI and other consumers.

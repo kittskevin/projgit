@@ -304,6 +304,42 @@ fn read_tree_is_cached_after_first_call() {
     assert_eq!(s3.len, 2);
 }
 
+#[test]
+fn read_blob_is_cached_after_first_call() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head_hex) = build_fixture("os_blob_cache");
+    let store = ObjectStore::open(&repo).unwrap();
+
+    let head = parse_oid(&head_hex);
+    let root_tree = store.commit_tree(head).unwrap();
+    let entries = store.read_tree(root_tree).unwrap();
+    let readme = entries
+        .iter()
+        .find(|e| e.name == b"README.md".as_bstr())
+        .expect("README.md");
+
+    // Cold call -> miss + insert; bytes match.
+    let first = store.read_blob(readme.oid).unwrap();
+    let expected = b"# fixture repo\n";
+    assert_eq!(&first, expected);
+    let s1 = store.blob_cache_stats();
+    assert_eq!(s1.misses, 1);
+    assert_eq!(s1.inserts, 1);
+    assert_eq!(s1.len, 1);
+    assert_eq!(s1.bytes_used, expected.len());
+
+    // Warm call -> hit; same bytes.
+    let second = store.read_blob(readme.oid).unwrap();
+    assert_eq!(second, first);
+    let s2 = store.blob_cache_stats();
+    assert_eq!(s2.hits, 1);
+    assert_eq!(s2.misses, 1);
+    assert_eq!(s2.inserts, 1);
+}
+
 // -----------------------------------------------------------------------------
 // TreeNavigator tests
 // -----------------------------------------------------------------------------
