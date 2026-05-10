@@ -117,22 +117,37 @@ checkout time (still O(files) `write()` calls per container).
 ### 4.2 Stock `git clone --filter=blob:none`
 
 Lazy-fetches blobs via the partial-clone "promisor remote" mechanism.
-This is what projgit uses today as its upstream contract.
+This is the upstream protocol projgit speaks; the question here is
+what the *user-facing* `git clone --filter=blob:none` workflow gives
+you, which is less than people often assume.
 
-**Fits lazy-fetch.** Bytes arrive on demand.
+**Half-fits lazy-fetch.** History blobs (other revisions, `git log -p`,
+`git blame` deep enough to need old content) arrive on demand. But the
+default post-clone `git checkout HEAD` materialises the entire worktree
+at checkout time — it has to, because checkout writes real files. So
+worktree disk and `write()` syscalls are still O(repo) per container,
+the same as 4.1. The partial-clone savings are on *history*, not on
+the working tree.
 
-**Half-fits "appears complete."** Files exist as zero-byte placeholders
-until promisor-fetched. `os.walk` sees them; `open()` triggers a
-fetch. Close to projgit's behaviour.
+**Fits "appears complete."** It's a real worktree on disk, so `os.walk`
+and friends see real files with real bytes. (This is the part that
+*is* like 4.1.)
 
-**Fails on multiplexing.** Each container has its own `.git/index`
-and its own copy of the partial-clone state. Cross-container dedup
-only happens at the underlying-pack level if you `--reference` an
-external `.git/objects/`, and even then per-container disk overhead
-is the size of the index (non-trivial on monorepos).
+**Fails on multiplexing.** Each container has its own worktree, its
+own `.git/index` (non-trivial on monorepos even with sparse-index),
+and its own copy of the partial-clone promisor state. Cross-container
+dedup of *objects* is possible via `--reference` to a shared bare repo,
+but the per-container worktree and index are unavoidable.
 
-Importantly, the promisor mechanism does the right thing here, which
-is why projgit can lean on it as the upstream API.
+**Combining with sparse-checkout** (the obvious next move) fixes the
+worktree-disk problem but reintroduces 4.3's enumerability failure:
+files outside the sparse patterns aren't on disk at all.
+
+Importantly, the promisor *protocol* does the right thing — it's a
+clean lazy-fetch RPC. That's why projgit speaks it as its upstream
+contract. What projgit adds on top is the virtual filesystem that
+stock `git checkout` doesn't provide: files visible to `os.walk`
+without being materialised, with bytes fetched on `open()`.
 
 ### 4.3 Sparse checkout (`git sparse-checkout`)
 
@@ -153,51 +168,89 @@ being on disk" requires a virtual filesystem; stock git is not one.
 
 ### 4.4 GVFS / VFS for Git / Scalar (Microsoft)
 
-Closest off-the-shelf fit. GVFS pioneered the architecture; Microsoft
-later upstreamed the primitives (partial-clone, sparse-index,
-commit-graph, multi-pack-index, background maintenance) into stock
-git, then renamed the "Microsoft-recommended setup" as **Scalar**.
+The closest *prior art* to projgit, with an instructive history.
 
-**Scalar today** = stock git with all the right opt-ins enabled +
-some helper commands. **No virtual filesystem in mainline.** ProjFS
-support exists in Microsoft's fork but is Windows-only and not
-upstream.
+**The arc.** Microsoft built GVFS (later renamed VFS for Git) for the
+Windows + Office monorepos circa 2017. It was a real virtual
+filesystem: ProjFS on Windows, hydrating files from a custom GVFS
+protocol against a matching server. It worked. Then Microsoft
+retreated: they upstreamed the *enabling primitives* (partial-clone,
+sparse-index, commit-graph, multi-pack-index, background maintenance)
+into stock git, and packaged "the Microsoft-recommended opt-ins" as
+**Scalar** — without the virtual filesystem.
 
-So Scalar fits 80% of the use case for repos that fit in stock
-sparse-checkout's "agent knows what paths it cares about" model,
-but doesn't help when the agent needs to wander.
+**Scalar today** is stock git + helper commands + sane defaults for
+big repos. There is no virtual filesystem in mainline git. The VFS
+for Git fork still exists but is in maintenance mode and Windows-only
+(ProjFS doesn't exist on Linux/macOS).
 
-### 4.5 EdenFS + Mononoke (Meta)
+**Why this matters for us.** On the use case in §1:
 
-Closest *architectural* fit, hands down. EdenFS is a virtual
-filesystem (FUSE / NFS / ProjFS) that lazy-materialises a working
-tree backed by Mononoke (Meta's purpose-built source-control
-server).
+- **On Linux** (where eval containers actually run), Scalar reduces
+  to partial-clone + sparse-checkout with nicer defaults — i.e. §4.2
+  combined with §4.3, with §4.3's enumerability failure intact.
+  Scalar gives you nothing extra here.
+- **On Windows**, VFS for Git would technically virtualise, but it
+  needs the GVFS-protocol server and is single-OS.
 
-**Fits all three properties.** Files appear available, bytes are
-lazy, multiple checkouts share one daemon and one backing store.
+The instructive part isn't "Scalar fails our use case" — it's *why*
+Microsoft retreated. The virtualisation worked; it was the cost of
+maintaining a git fork plus the Windows-only platform reach that
+made partial-clone-only the better bet for them. projgit's bet is
+that those costs are lower today — gix gives us a clean git library
+to build on, and FUSE + WinFsp covers Linux/macOS/Windows — and
+that the use case in §1 needs the virtualisation Microsoft walked
+away from.
 
-**Two real problems for our use case:**
+### 4.5 EdenFS + Sapling + Mononoke (Meta)
 
-1. **Operationally heavy.** EdenFS is co-designed with Mononoke.
-   Mononoke is a stateless-app-servers + distributed-blobstore +
-   derived-data-databases system, designed for Meta-scale operations.
-   Standing it up for a single team's eval pipeline is a different
-   project.
-2. **Hg-first, monorepo-first design.** EdenFS speaks Mercurial /
-   Sapling natively; git support exists but is a second-class shim.
-   The data model is hg-shaped (Bonsai changesets internally).
+The closest *architectural* cousin. EdenFS is a virtual filesystem
+(FUSE on Linux, NFS on macOS, ProjFS on Windows) that lazy-materialises
+a working tree from an underlying object store. Sapling is Meta's
+hg-compatible client (open-sourced 2022). Mononoke is the
+source-control server. EdenFS is what we'd build if we owned both
+ends of the wire — projgit owes it intellectual debt.
 
-If you have Meta's scale problem, EdenFS is the right answer. If you
-have ours, it's an order of magnitude too much infrastructure.
+**Fits all three §3 properties** when run as the full stack: files
+appear available, bytes are lazy, multiple checkouts on one host
+share a daemon and a backing store.
+
+**Why it doesn't fit our use case:**
+
+1. **No "stock git server" path.** EdenFS's fast path is Mononoke
+   (or local Sapling backed by a converted repo). You can technically
+   point it at a git remote, but you lose most of the lazy-fetch
+   wins: regular git has no equivalent of Mononoke's batched
+   derived-data RPCs, so tree fetches go one-at-a-time over the
+   wire. The §5 "works against your existing GitHub without
+   deploying anything new" trade-off is the architectural
+   disagreement, not a deployment detail.
+2. **Operationally heavy.** EdenFS alone is a privileged daemon with
+   its own config, on-disk state, and lifecycle. With Mononoke it's
+   a full distributed system (stateless app servers + blobstore +
+   derived-data databases) designed for Meta-scale operations.
+3. **Sapling-shaped data model.** Sapling is hg-compatible at the
+   client level; Mononoke's internal changeset model (Bonsai) is
+   neither git nor hg. Git interoperability exists but is the
+   conversion-shim path, not the native one.
+
+If you have Meta's scale and are willing to run Meta's stack, EdenFS
+is the right answer — projgit's "stock git remote" architecture
+wouldn't survive at that operating point (one-at-a-time tree fetches,
+no derived-data RPCs, no push-down filtering). We're betting that
+many teams have the *use case* — wander-anywhere agents over a
+monorepo — without the *scale* that justifies running Meta's stack,
+and that for those teams "virtual filesystem on the client, stock git
+on the server" is the missing point in the design space.
 
 ### 4.6 Custom server-side projects (Gitaly, JGit DfsRepository, …)
 
-Source-control RPC layers that scale serving but **don't change the
-client experience**. They don't make the working tree virtual; the
-client is still stock `git`.
-
-Useful infrastructure for forge operators; doesn't fit our problem.
+Worth mentioning so it's clear we considered them: source-control RPC
+layers (Gitaly behind GitLab, JGit's DfsRepository behind Gerrit,
+GitHub's Spokes) make the *server* faster and more scalable, but the
+*client* is still stock `git`. They don't help with any of §3's
+properties on the client side. They're orthogonal to projgit, not
+alternatives to it.
 
 ### 4.7 Just use a fast filesystem and live with full clones
 
@@ -225,7 +278,7 @@ projgit's positioning, sharpened against the alternatives:
 | Server | **Stock git remote** (anything that supports `--filter=blob:none`) | Works against GitHub / GitLab / SSH / your existing infra without deploying anything new. Loses the surgical-RPC wins of Mononoke. |
 | Read/write | **Read-only MVP** | Halves scope. Write path is real engineering; we'll address it via overlayfs (a separate doc) when needed. |
 | Storage format | **Stock git odb** (gix-compatible) | Tooling can read our store directly. No custom format to debug. Loses the per-blob-file random-access wins of a custom store. |
-| Daemon | **Optional, not required** | One process per mount works today; a `projgitd` daemon is a Phase 6 add-on (designed but not built) that wins when you have many containers per host. |
+| Daemon | **Optional for single mounts; required for §1's multiplexing** | One process per mount works for development and small-scale use; the `projgitd` daemon (designed but not built, Phase 6) is what delivers the "many containers, one upstream connection" property the §1 use case actually needs. |
 | FS frontend | **FUSE on Linux/macOS, WinFsp on Windows** | The two backends share a `FsProvider` trait; ProjFS deferred for code-sharing reasons. |
 | Synthesised `.git/` | **Mechanism shipped in Phase 1, content deferred** | The `RootOverlay` machinery exists; what we put in `.git/` is the next big design question for this use case (see [design/dotgit-synthesis.md](design/dotgit-synthesis.md)). |
 | Prefetch | **Manifest-driven + readdir-batched first; learned patterns later** | Designed in [design/prefetch.md](design/prefetch.md). |
@@ -239,9 +292,9 @@ A short summary of the empty cell in the matrix:
 - **GVFS / Scalar** retreated from virtualisation in favour of
   upstreaming primitives; the mainline result is "fast partial
   clone," not "virtual working tree."
-- **EdenFS** virtualises beautifully but requires Mononoke (a
-  source-control server you'd have to deploy) and is hg-shaped
-  internally.
+- **EdenFS** virtualises beautifully but its fast path needs
+  Mononoke (a source-control server you'd have to deploy or convert
+  to), and its native client is Sapling, not git.
 - **Forge-internal infra** (Gitaly, GitHub Spokes, etc.) scales the
   *server*, not the client filesystem.
 - **`overlayfs` / `unionfs`** alone don't talk to git; they're the
