@@ -238,13 +238,16 @@ real product code is written.
     consumes the same `FsProvider` trait Phase 3a defined; the FUSE
     adapter compiles and tests pass under
     `cargo check --target x86_64-unknown-linux-gnu`).
-  - Windows half: see Phase 3c spike below — mount establishes,
-    but request dispatch unresolved.
+  - Windows half: see
+    [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md):
+    the archived spike established a mount, but request dispatch remained
+    unresolved.
 - **0c. WinFsp reparse-point round-trip. — DONE.** Verified via the
   WinFsp `memfs-x64` C++ sample (no Rust code shipped to avoid
   premature license commitment). All four consumer tools traverse
-  WinFsp-served symlinks transparently as a non-admin user. See
-  [../spikes/winfsp-reparse/RESULTS.md](../spikes/winfsp-reparse/RESULTS.md).
+  WinFsp-served symlinks transparently as a non-admin user. Results are
+  preserved in
+  [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md).
   Outcome: `Native` mode default in
   [windows-symlinks.md](./design/windows-symlinks.md) confirmed.
 - **0c.bis (informal). WinFsp Rust hello-world.** Validates that
@@ -253,9 +256,9 @@ real product code is written.
   license decision. **Status: PARTIAL.** Bindgen + delay-load + linker
   + bitfield setters + mount lifecycle all work; mount establishes
   (`fsptool lsvol` confirms). Open issue: no IRPs reach the user-mode
-  dispatcher, so probes return `Incorrect function`. See
-  [../spikes/winfsp-helloworld/RESULTS.md](../spikes/winfsp-helloworld/RESULTS.md)
-  for hypotheses and the explicit Phase 3d follow-ups.
+  dispatcher, so probes return `Incorrect function`. Findings and the
+  resume checklist are preserved in
+  [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md).
 
 ### Phase 1 — Object store + path resolver (no FS yet)
 
@@ -288,11 +291,11 @@ real product code is written.
     + `mount` helper. Verified via
     `cargo check --target x86_64-unknown-linux-gnu --tests`.
 12. **PARTIAL (Phase 3c spike).** Implement `winfsp` backend (Windows).
-    The Phase 3c spike under `spikes/winfsp-helloworld/` validates the
-    FFI / bindgen / link approach but did **not** achieve a working
-    request dispatch. Phase 3d builds the production `projgit-winfsp`
-    crate using the lessons from
-    [../spikes/winfsp-helloworld/RESULTS.md](../spikes/winfsp-helloworld/RESULTS.md):
+    The archived Phase 3c spike validated the FFI / bindgen / link
+    approach but did **not** achieve a working request dispatch. Phase
+    3d builds the production `projgit-winfsp` crate using the lessons
+    preserved in
+    [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md):
     switch from the bare `FspFileSystemStartDispatcher` lifecycle to
     the `FspService*` framework that the bundled C samples use.
 13. Implement stable inode / FileId allocation. **DONE in 3a as part
@@ -305,9 +308,8 @@ real product code is written.
 15. **Per-user volume / file ownership** in the Windows backend.
     `get_security_by_name` and `get_security` must report the calling
     user as the owner so modern git's `safe.directory` check accepts
-    the mount. Surfaced by Phase 0c
-    ([../spikes/winfsp-reparse/RESULTS.md](../spikes/winfsp-reparse/RESULTS.md)
-    finding 5).
+    the mount. Surfaced by Phase 0c and preserved in
+    [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md).
 
 ### Phase 4 — Mount manager & CLI
 

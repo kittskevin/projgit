@@ -269,10 +269,11 @@ case above. For each policy:
     behaves like `text` when the reparse path is disabled (simulated by
     a feature flag in the WinFsp backend)
 
-### 8.3 Phase 0c spike (gating)
+### 8.3 Phase 0c validation
 
-A standalone WinFsp filesystem that exposes a single symlink reparse
-point. Pass criteria:
+The Phase 0c validation used WinFsp's bundled `memfs-x64.exe` sample to expose
+a symlink reparse point. Results are preserved in
+[winfsp-implementation-plan.md](winfsp-implementation-plan.md). Pass criteria:
 
 1. `cmd.exe /c dir` shows the entry as `<SYMLINK>` or `<SYMLINKD>`.
 2. `cmd.exe /c type link.txt` reads through to the target.
