@@ -66,11 +66,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 /// Build the standard fixture repo (mirrors
 /// `crates/projgit-core/tests/projection_fs.rs::build_fixture`).
 fn build_fixture(name: &str) -> (PathBuf, gix::ObjectId) {
-    let base = std::env::temp_dir().join(format!(
-        "projgit-fuse-{}-{}",
-        name,
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("projgit-fuse-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
 
@@ -140,11 +136,7 @@ impl Drop for DirGuard {
 /// Create a fresh empty directory under temp_dir and return a guard
 /// that cleans it up.
 fn make_mountpoint(name: &str) -> (PathBuf, DirGuard) {
-    let mp = std::env::temp_dir().join(format!(
-        "projgit-fuse-mp-{}-{}",
-        name,
-        std::process::id()
-    ));
+    let mp = std::env::temp_dir().join(format!("projgit-fuse-mp-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&mp);
     std::fs::create_dir_all(&mp).unwrap();
     let guard = DirGuard(mp.clone());
@@ -201,8 +193,8 @@ fn fuse_mount_serves_real_projection_data() {
 
     // Mount in the background. `_session` is dropped at end of scope,
     // which triggers a clean unmount before the directory guard runs.
-    let _session = mount_background(provider, &mountpoint, &MountConfig::default())
-        .expect("mount_background");
+    let _session =
+        mount_background(provider, &mountpoint, &MountConfig::default()).expect("mount_background");
 
     // Wait for the kernel to actually attach our FS to the
     // mountpoint. If this times out, dispatch never came up.
@@ -230,14 +222,12 @@ fn fuse_mount_serves_real_projection_data() {
 
     // ---- read a regular file ----
 
-    let readme = std::fs::read_to_string(mountpoint.join("README.md"))
-        .expect("read README.md");
+    let readme = std::fs::read_to_string(mountpoint.join("README.md")).expect("read README.md");
     assert_eq!(readme, "# fixture repo\n");
 
     // ---- executable bit on run.sh ----
 
-    let run_meta = std::fs::metadata(mountpoint.join("run.sh"))
-        .expect("metadata run.sh");
+    let run_meta = std::fs::metadata(mountpoint.join("run.sh")).expect("metadata run.sh");
     use std::os::unix::fs::PermissionsExt;
     let mode = run_meta.permissions().mode();
     assert!(
@@ -249,9 +239,12 @@ fn fuse_mount_serves_real_projection_data() {
 
     let link_meta = std::fs::symlink_metadata(mountpoint.join("link-to-readme"))
         .expect("symlink_metadata link-to-readme");
-    assert!(link_meta.file_type().is_symlink(), "link-to-readme is not a symlink");
-    let target = std::fs::read_link(mountpoint.join("link-to-readme"))
-        .expect("read_link link-to-readme");
+    assert!(
+        link_meta.file_type().is_symlink(),
+        "link-to-readme is not a symlink"
+    );
+    let target =
+        std::fs::read_link(mountpoint.join("link-to-readme")).expect("read_link link-to-readme");
     assert_eq!(target, std::path::PathBuf::from("README.md"));
 
     // ---- nested directory listing ----
@@ -261,12 +254,14 @@ fn fuse_mount_serves_real_projection_data() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     util_names.sort();
-    assert_eq!(util_names, vec!["helper.c".to_owned(), "helper.h".to_owned()]);
+    assert_eq!(
+        util_names,
+        vec!["helper.c".to_owned(), "helper.h".to_owned()]
+    );
 
     // ---- read deeper into a subtree ----
 
-    let main_c = std::fs::read_to_string(mountpoint.join("src/main.c"))
-        .expect("read src/main.c");
+    let main_c = std::fs::read_to_string(mountpoint.join("src/main.c")).expect("read src/main.c");
     assert_eq!(main_c, "int main(void){return 0;}\n");
 
     // Drop order: `_session` first (BackgroundSession unmounts),

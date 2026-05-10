@@ -106,10 +106,22 @@ mod tests {
     fn mount_config_defaults_are_safe_and_read_only() {
         let cfg = MountConfig::default();
         let fc = cfg.to_fuser_config();
-        assert!(fc.mount_options.iter().any(|o| matches!(o, MountOption::RO)));
-        assert!(fc.mount_options.iter().any(|o| matches!(o, MountOption::NoExec)));
-        assert!(fc.mount_options.iter().any(|o| matches!(o, MountOption::NoSuid)));
-        assert!(fc.mount_options.iter().any(|o| matches!(o, MountOption::NoDev)));
+        assert!(fc
+            .mount_options
+            .iter()
+            .any(|o| matches!(o, MountOption::RO)));
+        assert!(fc
+            .mount_options
+            .iter()
+            .any(|o| matches!(o, MountOption::NoExec)));
+        assert!(fc
+            .mount_options
+            .iter()
+            .any(|o| matches!(o, MountOption::NoSuid)));
+        assert!(fc
+            .mount_options
+            .iter()
+            .any(|o| matches!(o, MountOption::NoDev)));
         assert_eq!(fc.acl, SessionACL::Owner);
         assert_eq!(fc.n_threads, None);
     }

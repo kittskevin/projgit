@@ -284,7 +284,11 @@ impl InodeAllocator {
             forward: RwLock::new(std::collections::HashMap::new()),
             _next: Mutex::new(()),
         };
-        alloc.forward.get_mut().unwrap().insert(ROOT_INODE, InodeKind::Root);
+        alloc
+            .forward
+            .get_mut()
+            .unwrap()
+            .insert(ROOT_INODE, InodeKind::Root);
         alloc
     }
 

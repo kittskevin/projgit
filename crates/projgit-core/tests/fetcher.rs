@@ -81,9 +81,7 @@ fn hydrating_store_passes_through_present_blobs() {
     }
     let (repo_dir, _head) = build_local_repo("present");
     let store = Arc::new(ObjectStore::open(&repo_dir).unwrap());
-    let proj_root = store
-        .commit_tree(_head)
-        .unwrap();
+    let proj_root = store.commit_tree(_head).unwrap();
     let entries = store.read_tree(proj_root).unwrap();
     let hello_oid = entries
         .iter()
@@ -124,8 +122,7 @@ struct CountingFetcher {
 }
 impl Fetcher for CountingFetcher {
     fn fetch_object(&self, oid: gix::ObjectId) -> Result<(), FetcherError> {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Pretend we couldn't hydrate so the test never expects post-fetch
         // success without writing to the real store.
         Err(FetcherError::NotHydratable(oid))

@@ -196,7 +196,10 @@ mod tests {
         o.insert(BString::from("apple"), SyntheticEntry::file(b"a".to_vec()));
         o.insert(BString::from("middle"), SyntheticEntry::file(b"m".to_vec()));
         let names: Vec<&[u8]> = o.names().map(|n| n.as_slice()).collect();
-        assert_eq!(names, vec![b"apple".as_ref(), b"middle".as_ref(), b"zebra".as_ref()]);
+        assert_eq!(
+            names,
+            vec![b"apple".as_ref(), b"middle".as_ref(), b"zebra".as_ref()]
+        );
     }
 
     #[test]

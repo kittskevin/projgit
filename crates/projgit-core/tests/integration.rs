@@ -65,11 +65,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 ///
 /// Returns `(repo_dir, head_commit_oid_hex)`.
 fn build_fixture(name: &str) -> (PathBuf, String) {
-    let base = std::env::temp_dir().join(format!(
-        "projgit-test-{}-{}",
-        name,
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("projgit-test-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
 

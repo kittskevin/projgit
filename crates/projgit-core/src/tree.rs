@@ -105,11 +105,7 @@ impl<'a> TreeNavigator<'a> {
     ///
     /// Empty path resolves to a synthetic directory entry naming the
     /// tree itself; this is what the projection root resolves to.
-    pub fn lookup(
-        &self,
-        tree_oid: ObjectId,
-        path: &str,
-    ) -> Result<TreeEntry, ProjectionError> {
+    pub fn lookup(&self, tree_oid: ObjectId, path: &str) -> Result<TreeEntry, ProjectionError> {
         let components = split_path(path)?;
         if components.is_empty() {
             return Ok(TreeEntry {

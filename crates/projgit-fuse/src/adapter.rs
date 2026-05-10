@@ -56,11 +56,7 @@ impl<F: FsProvider> ProjgitFuse<F> {
 }
 
 impl<F: FsProvider + 'static> Filesystem for ProjgitFuse<F> {
-    fn init(
-        &mut self,
-        _req: &Request,
-        _config: &mut KernelConfig,
-    ) -> Result<(), std::io::Error> {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> Result<(), std::io::Error> {
         // Nothing to negotiate yet. Future: enable readdirplus,
         // adjust readahead, etc.
         Ok(())
@@ -73,13 +69,7 @@ impl<F: FsProvider + 'static> Filesystem for ProjgitFuse<F> {
         }
     }
 
-    fn getattr(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: Option<FileHandle>,
-        reply: ReplyAttr,
-    ) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.provider.getattr(ino.0) {
             Ok(attr) => reply.attr(&ATTR_TTL, &to_fuser_attr(&attr)),
             Err(e) => reply.error(errno_for(&e)),
