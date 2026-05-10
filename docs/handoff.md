@@ -1,7 +1,7 @@
 # projgit — Handoff
 
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-05-09, after Phase 5b nice-to-haves (blob LRU, --stats, --ref+--subtree).
+> Last updated: 2026-05-10, after open-source polish, CI, T1 prefetch status refresh, and WinFsp spike archival.
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -9,11 +9,11 @@ The deep references are linked; trust them, not memory.
 
 ## What is projgit?
 
-A cross-platform user-mode filesystem in Rust. It lazily fetches git
+An experimental user-mode filesystem in Rust. It lazily fetches git
 objects from a normal git remote (via gitoxide) into a single shared
 content-addressable store, then exposes one or more **read-only
-projections** of that store as filesystem mounts (FUSE on Linux/macOS,
-WinFsp on Windows).
+projections** of that store as filesystem mounts. The working backend is
+FUSE on Linux/macOS; the WinFsp backend is planned but deferred.
 
 Three projection kinds:
 - **Ref** — `refs/heads/main` mounted as a directory tree.
@@ -31,9 +31,15 @@ and [`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
 ## Where we are right now
 
 ```
-  HEAD    feat(cli): --stats flag prints cache snapshot on unmount   ← latest
-  HEAD~   feat(core): small-blob LRU in ObjectStore
-  HEAD~   feat(cli): --ref + --subtree resolution
+  HEAD    docs(handoff): refresh open-source polish status   ← latest committed
+19436f1  docs(winfsp): archive Windows prototype plan
+799bbf4  ci: add Rust verification workflow
+1590b61  docs: add public README and examples
+a1d0616  style: apply rustfmt
+ff2138c  feat(core): prefetch headers after readdir
+5bccea7  docs(problem): sharpen alternatives analysis
+8bf9994  docs(problem-statement): make parallel container concurrency explicit
+87f34ff  docs(design): prefetch tier ladder + recommended sequence
 1bec429  docs(handoff): mark Phase 5a done; refresh `What I'd do next`
 44c1f4b  perf(core): keep one git cat-file --batch-check child per fetcher
 82d83f3  feat(core): add tree-listing LRU to ObjectStore
@@ -124,10 +130,14 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   - **`--ref + --subtree`.** Resolved against the open
     `ObjectStore` (peel ref → commit → `Subtree`). Removes the
     Phase 4 "requires --commit" sharp edge.
-  - **`projgit mount --stats`.** On unmount, prints a one-line
-    snapshot of the tree + blob LRU counters. Both stats types
-    (`TreeCacheStats`, `BlobCacheStats`) are re-exported from
-    `projgit_core` for future programmatic consumers.
+  - **Header LRU + T1 prefetch.** `ObjectStore::header` now has a
+    bounded header cache. `ProjectionFsProvider::readdir` posts
+    regular-file, executable-file, and symlink OIDs to a background
+    prefetch worker, which batches header probes and warms the cache.
+    See [`docs/design/prefetch.md`](design/prefetch.md).
+  - **`projgit mount --stats`.** On unmount, prints tree, header,
+    blob, and T1 prefetch counters. The stats types are re-exported
+    from `projgit_core` for future programmatic consumers.
 
   End-to-end on `rust-lang/log` inside the devcontainer:
   - Cold `ls -la src/` (5 files): ~1.5 s (network-bound; 5
@@ -141,25 +151,21 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   We hand-roll WinFsp FFI bindings (no GPL-3.0 `winfsp-rs`).
   See repo memory + [`docs/initial-plan.md` §10](initial-plan.md).
 
-### In progress / partial
-- **Phase 3c — WinFsp hello-world spike.** PARTIAL. The
-  bindgen-driven FFI approach builds, links, loads `winfsp-x64.dll`
-  via delay-load, and successfully establishes a mountpoint
-  (`fsptool lsvol` confirms). But **no IRPs reach our user-mode
-  callbacks** — `dir Z:\` returns "Incorrect function." See
-  [`spikes/winfsp-helloworld/RESULTS.md`](../spikes/winfsp-helloworld/RESULTS.md)
-  for ranked hypotheses. Top of the list: switch from bare
-  `FspFileSystemStartDispatcher` to the `FspService*` lifecycle that
-  the bundled C samples use.
+### Deferred / archived
+- **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
+  crates were removed from the public repo surface; the useful findings
+  are preserved in
+  [`docs/design/winfsp-implementation-plan.md`](design/winfsp-implementation-plan.md).
+  The next Windows step is to implement `projgit-winfsp` directly using
+  the WinFsp `FspService*` lifecycle from the C samples.
 
 ### Not yet started
-- **Phase 3d — Production `projgit-winfsp`.** Builds on the 3c spike's
-  lessons. Includes: `FspService*` lifecycle, the symlink classifier
-  per [`docs/design/windows-symlinks.md`](design/windows-symlinks.md),
-  per-user volume ownership (Phase 0c finding 5). Now also consumes
-  `ProjectionFsProvider` (3e) directly. The Phase 4 CLI's
-  `cmd_mount` is cfg-gated to Linux/macOS; the Windows arm currently
-  prints a friendly "use projgit-winfsp once Phase 3d lands" error.
+- **Phase 3d — Production `projgit-winfsp`.** Not started. Includes:
+  `FspService*` lifecycle, the symlink classifier per
+  [`docs/design/windows-symlinks.md`](design/windows-symlinks.md),
+  per-user volume ownership, and a WinFsp adapter over
+  `ProjectionFsProvider` (3e). The CLI remains cfg-gated to
+  Linux/macOS; the Windows arm reports that support is deferred.
 - **Phase 5 — remaining polish.** With Phases 5a/5b in (tree LRU +
   blob LRU + batched `cat-file` + `--stats` + `--ref + --subtree`),
   the remaining items here are convenience flags that don't block
@@ -189,6 +195,7 @@ TODO.
 
 ```
 e:\repos\gitfs\
+├── README.md                        public overview + quick start
 ├── Cargo.toml                       workspace root, MSRV 1.85
 ├── LICENSE-MIT, LICENSE-APACHE      dual license
 ├── .devcontainer/                   Linux + FUSE dev environment
@@ -200,16 +207,19 @@ e:\repos\gitfs\
 │   ├── projgit-fuse/                Phase 3b -- empty on Windows
 │   └── projgit-winfsp/              placeholder (Phase 3d)
 ├── spikes/                          throwaway crates, NOT in workspace
-│   ├── ondemand-fetch/              0a: gix on-demand fetch (DONE)
-│   ├── winfsp-reparse/              0c: reparse-point semantics (DONE)
-│   └── winfsp-helloworld/           3c: hand-rolled FFI (PARTIAL)
+│   └── ondemand-fetch/              0a: gix on-demand fetch (DONE)
 ├── docs/
+│   ├── EXAMPLES.md                  worked CLI examples
 │   ├── initial-plan.md              the plan; status notes inline
 │   ├── handoff.md                   THIS FILE
 │   └── design/
+│       ├── winfsp-implementation-plan.md  Windows backend resume plan
+│       ├── prefetch.md              T1 implemented; later tiers designed
 │       ├── windows-symlinks.md      decided
 │       └── dotgit-synthesis.md      mechanism decided, content deferred
-└── .github/skills/commit-work/      preferred commit workflow
+└── .github/
+    ├── workflows/ci.yml             fmt + clippy + tests
+    └── skills/commit-work/          preferred commit workflow
 ```
 
 ## How to resume work
@@ -217,8 +227,9 @@ e:\repos\gitfs\
 ### Two ways to develop
 
 **On the Windows host (default).** Edits, the projgit-core test
-suite, the WinFsp spike, and Linux compile-checks all work here.
-You cannot actually mount FUSE from Windows.
+suite, and Linux compile-checks all work here. You cannot actually
+mount FUSE from Windows. Future WinFsp work should resume from
+[`docs/design/winfsp-implementation-plan.md`](design/winfsp-implementation-plan.md).
 
 **Inside the devcontainer (for FUSE work).** Open the workspace in
 VS Code, then **Dev Containers: Reopen in Container**. Provides a
@@ -233,9 +244,9 @@ makes builds fast on Windows hosts.
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 cd e:\repos\gitfs
-cargo build --workspace                 # should be clean on Windows
-cargo test  -p projgit-core             # 31 + 4 + 20 + 13 = 68 tests pass
-cargo test  -p projgit-cli              # 4 unit tests
+cargo build --workspace                 # should be clean
+cargo test --workspace --all-targets    # default suite
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings   # clean
 # Linux compile-check (requires `rustup target add x86_64-unknown-linux-gnu`):
 cargo check -p projgit-fuse --target x86_64-unknown-linux-gnu --tests
@@ -278,26 +289,18 @@ $env:PROJGIT_NETWORK_TESTS = "1"
 cargo test -p projgit-core --test fetcher gix_fetcher_hydrates
 ```
 
-### Re-run a spike (each spike is standalone)
+### Resume WinFsp work
 
-Spikes are excluded from the workspace; build / run them in their own
-directory. The 3c spike requires WinFsp + LLVM installed (see its
-RESULTS.md for the install commands).
-```powershell
-cd spikes/winfsp-helloworld
-$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
-$env:PATH = "C:\Program Files (x86)\WinFsp\bin;" + $env:PATH
-cargo build
-.\target\debug\spike-winfsp-helloworld.exe Z:
-# in another shell, while the spike runs:
-& 'C:\Program Files (x86)\WinFsp\bin\fsptool-x64.exe' lsvol
-```
+The WinFsp prototypes are archived into
+[`docs/design/winfsp-implementation-plan.md`](design/winfsp-implementation-plan.md).
+Resume directly in `crates/projgit-winfsp`; do not add a new spike crate
+unless the implementation plan first proves wrong.
 
 ## Pre-installed environment on this machine
 
 These are already set up; a fresh dev box would need to install them.
 
-- Rust toolchain ≥ 1.95.0 stable (`rustup update stable`).
+- Rust toolchain >= 1.85.0 stable (`rustup update stable`).
 - Linux cross-compile target: `rustup target add x86_64-unknown-linux-gnu`.
 - **Docker Desktop + Dev Containers VS Code extension.** For runtime
   FUSE work — see [`.devcontainer/README.md`](../.devcontainer/README.md).
@@ -344,14 +347,14 @@ peel.
    the root `Cargo.toml`). They are deliberately throwaway. Don't
    promote spike code into a `crates/` member without rewriting it.
 8. **WinFsp DLL on PATH at runtime.** Any binary that links WinFsp
-   (the spike, eventually `projgit-winfsp`) needs
+  (eventually `projgit-winfsp`) needs
    `C:\Program Files (x86)\WinFsp\bin` on PATH or the process exits
    with `0xC06D007E` (delay-load failure).
 9. **Modern `git`'s `safe.directory` check fails inside our future
    WinFsp mount** because the FSD reports volume ownership as
    `BUILTIN\Administrators`. Phase 3d step 15 must synthesize per-user
    ownership in `get_security_by_name` / `get_security`. (Surfaced in
-   Phase 0c [`spikes/winfsp-reparse/RESULTS.md`](../spikes/winfsp-reparse/RESULTS.md).)
+  [`docs/design/winfsp-implementation-plan.md`](design/winfsp-implementation-plan.md).)
 
 ## Decisions you don't have to re-litigate
 
@@ -392,16 +395,18 @@ two design docs.)
 In rough order of "smallest unit of work that yields the most
 visible progress":
 
-1. **Phase 3d.** Production `projgit-winfsp` on top of the
-   `FspService*` lifecycle (per the 3c spike findings). Consumes
-   `ProjectionFsProvider` directly, exactly like Phase 4's CLI does
-   on Linux. The riskiest remaining piece. Best done in a fresh
-   focused session on the Windows host.
-2. **`projgit mount --background` + `projgit umount`.** Today the
+1. **Open-source polish verification.** Keep the new README/CI surface
+   green: `cargo fmt`, `cargo clippy`, `cargo test`, and FUSE smoke in
+   the devcontainer.
+2. **Phase 3d.** Production `projgit-winfsp` on top of the
+   `FspService*` lifecycle. Consume `ProjectionFsProvider` directly,
+   exactly like Phase 4's CLI does on Linux. The riskiest remaining
+   piece. Best done in a fresh focused session on the Windows host.
+3. **`projgit mount --background` + `projgit umount`.** Today the
    foreground process owns the mount; a PID-file flow plus an
    `umount` companion would let scripts manage many mounts.
    Designs need a small mount registry under `$XDG_RUNTIME_DIR`.
-3. **`tracing-subscriber` wiring for the existing `-v` flag.** The
+4. **`tracing-subscriber` wiring for the existing `-v` flag.** The
    verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
    it. Wiring `tracing-subscriber` (with optional crate feature)
    would surface fetcher/provider events at `-v` / `-vv`.
