@@ -89,6 +89,6 @@ container will warn about missing user.name / user.email.
 ## Toolchain version
 
 The base image (`mcr.microsoft.com/devcontainers/rust:1-bookworm`)
-ships current stable Rust. Workspace MSRV is **1.95**. If the base
-image ever regresses below 1.95, add a `rustup default 1.95` line
+ships current stable Rust. Workspace MSRV is **1.85**. If the base
+image ever regresses below 1.85, add a `rustup default 1.85` line
 to `postCreateCommand`.
