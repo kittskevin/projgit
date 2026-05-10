@@ -31,38 +31,41 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod blob_cache;
 #[cfg(feature = "gix-fetcher")]
 pub mod clone;
 pub mod error;
 pub mod fetcher;
 pub mod fs_provider;
+mod header_cache;
 pub mod object_store;
 pub mod overlay;
+pub mod prefetch;
 pub mod projection;
 pub mod projection_fs;
 pub mod tree;
-mod blob_cache;
 mod tree_cache;
 
+pub use blob_cache::BlobCacheStats;
 pub use error::{ObjectStoreError, ProjectionError};
-#[cfg(feature = "gix-fetcher")]
-pub use fetcher::{GixFetcher, GixFetcherError};
 pub use fetcher::{
     Fetcher, FetcherError, GitCliFetcher, GitCliFetcherError, HydrateError, HydratingObjectStore,
     NoopFetcher,
 };
+#[cfg(feature = "gix-fetcher")]
+pub use fetcher::{GixFetcher, GixFetcherError};
 pub use fs_provider::{
     Attr, DirEntry, FileType, FsError, FsProvider, InMemoryFsProvider, InodeAllocator, InodeKind,
     ROOT_INODE,
 };
+pub use header_cache::HeaderCacheStats;
 pub use object_store::{ObjectKind, ObjectStore};
 pub use overlay::{RootOverlay, SyntheticEntry};
+pub use prefetch::PrefetchStats;
 pub use projection::{Projection, ResolvedEntry};
 pub use projection_fs::ProjectionFsProvider;
 pub use tree::{EntryMode, TreeEntry, TreeNavigator};
-pub use blob_cache::BlobCacheStats;
 pub use tree_cache::TreeCacheStats;
 
 /// Crate version, exposed to the CLI and other consumers.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-

@@ -82,10 +82,9 @@ struct MountArgs {
     #[arg(long)]
     offline: bool,
 
-    /// On unmount, print a one-line summary of the in-process LRU
-    /// caches (parsed-tree LRU + small-blob LRU). Useful when
-    /// tuning cache sizes or sanity-checking that warm reads are
-    /// hitting the cache.
+    /// On unmount, print a summary of in-process cache and prefetch
+    /// counters. Useful when tuning cache sizes or sanity-checking
+    /// that warm reads are hitting the cache.
     #[arg(long)]
     stats: bool,
 }
@@ -200,8 +199,8 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
         );
         run_mount(provider, &mp, &cfg, print_stats)
     } else {
-        let fetcher =
-            GitCliFetcher::open(store.clone()).context("opening GitCliFetcher (needs `git` on PATH)")?;
+        let fetcher = GitCliFetcher::open(store.clone())
+            .context("opening GitCliFetcher (needs `git` on PATH)")?;
         let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
         let provider = Arc::new(
             ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
@@ -215,8 +214,8 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
 fn cmd_mount(_args: MountArgs) -> Result<()> {
     bail!(
         "`projgit mount` is not yet supported on this platform. \
-         Linux/macOS use FUSE (projgit-fuse); Windows support lands in \
-         Phase 3d (projgit-winfsp)."
+         Linux/macOS use FUSE (projgit-fuse); Windows support is \
+         deferred to the planned projgit-winfsp backend."
     );
 }
 
@@ -252,13 +251,19 @@ where
     if print_stats {
         let store = provider.store().store();
         let t = store.tree_cache_stats();
+        let h = store.header_cache_stats();
         let b = store.blob_cache_stats();
+        let p = provider.prefetch_stats();
         eprintln!(
-            "projgit: tree cache hits={} misses={} inserts={} evictions={} len={}/{}",
+            "projgit: tree cache    hits={} misses={} inserts={} evictions={} len={}/{}",
             t.hits, t.misses, t.inserts, t.evictions, t.len, t.capacity,
         );
         eprintln!(
-            "projgit: blob cache hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
+            "projgit: header cache  hits={} misses={} inserts={} evictions={} len={}/{}",
+            h.hits, h.misses, h.inserts, h.evictions, h.len, h.capacity,
+        );
+        eprintln!(
+            "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
             b.hits,
             b.misses,
             b.inserts,
@@ -266,6 +271,15 @@ where
             b.skipped_too_large,
             b.bytes_used,
             b.capacity_bytes,
+        );
+        eprintln!(
+            "projgit: prefetch (T1) posted={} dropped={} batches={} resolved={} headers={} failed={}",
+            p.posted,
+            p.dropped,
+            p.batches_sent,
+            p.oids_resolved,
+            p.headers_published,
+            p.oids_failed,
         );
     }
 

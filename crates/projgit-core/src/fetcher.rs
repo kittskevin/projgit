@@ -52,6 +52,63 @@ pub trait Fetcher: Send + Sync {
     /// object store. Returns immediately with `Ok(())` if the object
     /// is already present.
     fn fetch_object(&self, oid: ObjectId) -> Result<(), FetcherError>;
+
+    /// Prefetch a batch of object headers in one upstream round
+    /// trip if the implementation can; otherwise a per-OID fallback.
+    ///
+    /// Used by the T1 readdir-time prefetch worker (see
+    /// `docs/design/prefetch.md`). On success, the implementation
+    /// **must** ensure each present OID's header is decodable via
+    /// [`crate::ObjectStore::header`] without a further upstream
+    /// round trip. Implementations that can answer multiple OIDs in
+    /// one round trip (notably [`GitCliFetcher`] via
+    /// `git cat-file --batch-check`) override this; the default
+    /// falls back to one [`Self::fetch_object`] per OID, which is
+    /// correct but defeats the purpose of the optimisation.
+    ///
+    /// Returns one [`HeaderProbe`] per input OID, in the same order.
+    /// Errors per OID don't abort the batch; they're surfaced in
+    /// the corresponding `HeaderProbe::Error` variant so callers can
+    /// keep going for the rest. Hard transport-level failures may
+    /// be reported by returning an `Error` variant for every OID.
+    fn prefetch_headers(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
+        oids.iter()
+            .map(|oid| match self.fetch_object(*oid) {
+                Ok(()) => HeaderProbe::Present(*oid),
+                Err(e) => HeaderProbe::Error(*oid, e),
+            })
+            .collect()
+    }
+}
+
+/// One result from a [`Fetcher::prefetch_headers`] batch.
+///
+/// The `(kind, size)` payload is optional because the default
+/// trait impl can prove the object is present (via `fetch_object`)
+/// but not cheaply read its header -- callers that need the
+/// header should fall through to [`crate::ObjectStore::header`]
+/// after seeing `Present`. Specialised impls like
+/// [`GitCliFetcher`]'s `cat-file --batch-check` get the
+/// `(kind, size)` for free and report it directly via
+/// `PresentWithHeader`, which the prefetch worker can publish
+/// straight to the header cache without re-reading via gix.
+///
+/// Not `Clone`: the `Error` variant carries a [`FetcherError`],
+/// which is intentionally non-`Clone` to keep the error payload
+/// honest about uniqueness.
+#[derive(Debug)]
+pub enum HeaderProbe {
+    /// The OID is locally present after this call. The header can
+    /// be read via `ObjectStore::header` without another upstream
+    /// round trip.
+    Present(ObjectId),
+    /// The OID is present and the implementation also got the
+    /// header for free. The prefetch worker can publish this
+    /// directly to the header cache.
+    PresentWithHeader(ObjectId, ObjectKind, u64),
+    /// The OID could not be made present (server refused, no
+    /// network, etc.). The on-demand path will retry naturally.
+    Error(ObjectId, FetcherError),
 }
 
 /// Errors a [`Fetcher`] may surface.
@@ -160,6 +217,72 @@ impl<F: Fetcher> HydratingObjectStore<F> {
             }
             Err(e) => Err(HydrateError::Store(e)),
         }
+    }
+
+    /// Prefetch a batch of object headers via the fetcher and
+    /// publish results to the underlying [`ObjectStore`]'s header
+    /// cache so subsequent on-demand `header()` calls are warm.
+    ///
+    /// Skips OIDs whose header is already cached -- no IPC, no
+    /// upstream call, no fetcher invocation. Used by the T1
+    /// readdir-time prefetch worker (see `docs/design/prefetch.md`).
+    ///
+    /// Returns the underlying [`HeaderProbe`] results so callers
+    /// can update their own counters / surface errors. Errors are
+    /// per-OID; one failure does not poison the rest of the batch.
+    pub fn prefetch_headers(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
+        // Cache-hit pre-pass: avoid even constructing a query for
+        // OIDs whose header is already resolvable locally. Each
+        // `store.header()` call hits the header LRU first, then
+        // gix's local odb (mmap'd packs / loose objects). Both are
+        // microseconds; we trade them against avoiding an upstream
+        // RTT.
+        let mut to_query: Vec<ObjectId> = Vec::with_capacity(oids.len());
+        for &oid in oids {
+            if self.store.header(oid).is_err() {
+                to_query.push(oid);
+            }
+        }
+
+        if to_query.is_empty() {
+            // Synthesise Present results so the caller still sees a
+            // probe per input OID.
+            return oids.iter().map(|oid| HeaderProbe::Present(*oid)).collect();
+        }
+
+        let probes = self.fetcher.prefetch_headers(&to_query);
+
+        // Publish PresentWithHeader results to the cache; for
+        // bare Present results, do a one-shot store.header() to
+        // populate the cache via the normal path.
+        for probe in &probes {
+            match probe {
+                HeaderProbe::PresentWithHeader(oid, kind, size) => {
+                    self.store.put_header_cache(*oid, *kind, *size);
+                }
+                HeaderProbe::Present(oid) => {
+                    let _ = self.store.header(*oid);
+                }
+                HeaderProbe::Error(_, _) => {}
+            }
+        }
+
+        // Reassemble: preserve the original order. `probes` only
+        // covers `to_query`; the rest were already-cached and get
+        // synthesised Present results.
+        let mut by_oid: std::collections::HashMap<ObjectId, HeaderProbe> =
+            std::collections::HashMap::with_capacity(probes.len());
+        for probe in probes {
+            let oid = match &probe {
+                HeaderProbe::Present(o) => *o,
+                HeaderProbe::PresentWithHeader(o, _, _) => *o,
+                HeaderProbe::Error(o, _) => *o,
+            };
+            by_oid.insert(oid, probe);
+        }
+        oids.iter()
+            .map(|oid| by_oid.remove(oid).unwrap_or(HeaderProbe::Present(*oid)))
+            .collect()
     }
 }
 

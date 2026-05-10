@@ -32,6 +32,7 @@ use crate::fs_provider::{
     Attr, DirEntry, FileType, FsError, FsProvider, InodeAllocator, ROOT_INODE,
 };
 use crate::overlay::{RootOverlay, SyntheticEntry};
+use crate::prefetch::{PrefetchHandle, PrefetchStats};
 use crate::projection::{Projection, ResolvedEntry};
 use crate::tree::{EntryMode, TreeEntry, TreeNavigator};
 use bstr::BString;
@@ -52,11 +53,7 @@ enum AttrSnapshot {
     Root,
     /// A real git tree entry that's a regular or executable file.
     /// Carries the blob OID so `read` can hydrate on demand.
-    TreeFile {
-        oid: ObjectId,
-        size: u64,
-        mode: u16,
-    },
+    TreeFile { oid: ObjectId, size: u64, mode: u16 },
     /// A real git tree directory. Carries the tree OID so `readdir`
     /// can list children.
     TreeDir {
@@ -70,10 +67,7 @@ enum AttrSnapshot {
     /// MVP locked decision.
     Gitlink,
     /// A synthetic file from the [`RootOverlay`].
-    SyntheticFile {
-        content: Arc<Vec<u8>>,
-        mode: u16,
-    },
+    SyntheticFile { content: Arc<Vec<u8>>, mode: u16 },
     /// A synthetic directory from the [`RootOverlay`]. Children are
     /// shared via [`Arc`] so cloning the snapshot is cheap.
     SyntheticDir {
@@ -88,16 +82,19 @@ enum AttrSnapshot {
 /// A read-only [`FsProvider`] backed by a [`Projection`] over a
 /// [`HydratingObjectStore`], with synthetic entries from a
 /// [`RootOverlay`] spliced in at the projection root.
-pub struct ProjectionFsProvider<F: Fetcher> {
+pub struct ProjectionFsProvider<F: Fetcher + 'static> {
     projection: Projection,
     store: Arc<HydratingObjectStore<F>>,
     overlay: RootOverlay,
     allocator: InodeAllocator,
     commit_time: SystemTime,
     attrs: RwLock<HashMap<u64, AttrSnapshot>>,
+    /// Background T1 prefetch worker (see `crate::prefetch`).
+    /// Spawned at construction; joined on drop.
+    prefetch: PrefetchHandle,
 }
 
-impl<F: Fetcher> ProjectionFsProvider<F> {
+impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
     /// Construct a new provider.
     ///
     /// `projection_id` is the per-mount namespace passed to
@@ -107,6 +104,9 @@ impl<F: Fetcher> ProjectionFsProvider<F> {
     /// Resolves the projection's commit OID up front to seed the
     /// `mtime` exposed by every entry. Errors are bubbled up from
     /// the projection / object-store layers.
+    ///
+    /// Spawns the T1 prefetch worker bound to `store`. The worker
+    /// runs for the lifetime of the provider and is joined on drop.
     pub fn new(
         projection: Projection,
         store: Arc<HydratingObjectStore<F>>,
@@ -123,6 +123,8 @@ impl<F: Fetcher> ProjectionFsProvider<F> {
         let mut attrs = HashMap::new();
         attrs.insert(ROOT_INODE, AttrSnapshot::Root);
 
+        let prefetch = PrefetchHandle::spawn(store.clone());
+
         Ok(Self {
             projection,
             store,
@@ -130,6 +132,7 @@ impl<F: Fetcher> ProjectionFsProvider<F> {
             allocator,
             commit_time,
             attrs: RwLock::new(attrs),
+            prefetch,
         })
     }
 
@@ -146,6 +149,11 @@ impl<F: Fetcher> ProjectionFsProvider<F> {
     /// Commit time exposed as `mtime` on every entry.
     pub fn commit_time(&self) -> SystemTime {
         self.commit_time
+    }
+
+    /// Snapshot of the prefetch worker's counters.
+    pub fn prefetch_stats(&self) -> PrefetchStats {
+        self.prefetch.stats()
     }
 
     // -- internals --
@@ -291,13 +299,7 @@ impl<F: Fetcher> ProjectionFsProvider<F> {
                     0o777,
                 ))
             }
-            EntryMode::Gitlink => Ok((
-                inode,
-                AttrSnapshot::Gitlink,
-                FileType::Directory,
-                0,
-                0o755,
-            )),
+            EntryMode::Gitlink => Ok((inode, AttrSnapshot::Gitlink, FileType::Directory, 0, 0o755)),
         }
     }
 
@@ -365,7 +367,7 @@ impl<F: Fetcher> ProjectionFsProvider<F> {
     }
 }
 
-impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
+impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<Attr, FsError> {
         let parent_path = self.parent_path(parent)?;
         let full = Self::join_path(&parent_path, name);
@@ -414,16 +416,26 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
         // The kernel guarantees a follow-up `lookup` for any entry
         // the user actually `stat`s, and `lookup` populates the cache
         // with real sizes/modes lazily.
+        //
+        // T1 prefetch: we *do* post the directory's blob/symlink OIDs
+        // to the background prefetch worker after returning. The
+        // worker will batch them into a single
+        // `git cat-file --batch-check` round trip and warm the
+        // header cache so the kernel's follow-up `lookup`s are fast.
         if inode == ROOT_INODE {
             let pairs = self
                 .projection
                 .read_root(self.store.store(), &self.overlay)
                 .map_err(projection_to_fs)?;
             let mut out = Vec::with_capacity(pairs.len());
+            let mut prefetch_oids: Vec<gix::ObjectId> = Vec::with_capacity(pairs.len());
             for (name, resolved) in pairs {
                 // The `name` from `read_root` is already the entry's
                 // own component name; full path == name at the root.
                 let full = String::from_utf8_lossy(&name).into_owned();
+                if let Some(oid) = harvest_prefetch_oid(&resolved) {
+                    prefetch_oids.push(oid);
+                }
                 let (child_inode, kind) = self.dir_entry_for(&resolved, &full);
                 out.push(DirEntry {
                     inode: child_inode,
@@ -431,6 +443,7 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
                     kind,
                 });
             }
+            self.prefetch.post_headers(prefetch_oids);
             return Ok(out);
         }
 
@@ -444,6 +457,7 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
                 let raw = self.store.read_tree(tree_oid).map_err(hydrate_to_fs)?;
                 let entries: Vec<TreeEntry> = raw.into_iter().map(TreeEntry::from).collect();
                 let mut out = Vec::with_capacity(entries.len());
+                let mut prefetch_oids: Vec<gix::ObjectId> = Vec::with_capacity(entries.len());
                 for entry in entries {
                     let full = if path.is_empty() {
                         String::from_utf8_lossy(&entry.name).into_owned()
@@ -456,6 +470,9 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
                     };
                     let name = entry.name.clone();
                     let resolved = ResolvedEntry::Tree(entry);
+                    if let Some(oid) = harvest_prefetch_oid(&resolved) {
+                        prefetch_oids.push(oid);
+                    }
                     let (child_inode, kind) = self.dir_entry_for(&resolved, &full);
                     out.push(DirEntry {
                         inode: child_inode,
@@ -463,6 +480,7 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
                         kind,
                     });
                 }
+                self.prefetch.post_headers(prefetch_oids);
                 Ok(out)
             }
             AttrSnapshot::SyntheticDir { children, path } => {
@@ -512,9 +530,7 @@ impl<F: Fetcher> FsProvider for ProjectionFsProvider<F> {
                 let bytes = self.store.read_blob(oid).map_err(hydrate_to_fs)?;
                 Ok(slice_blob(&bytes, offset, size))
             }
-            AttrSnapshot::SyntheticFile { content, .. } => {
-                Ok(slice_blob(&content, offset, size))
-            }
+            AttrSnapshot::SyntheticFile { content, .. } => Ok(slice_blob(&content, offset, size)),
             _ => Err(FsError::NotAFile),
         }
     }
@@ -568,6 +584,36 @@ fn projection_to_fs(e: ProjectionError) -> FsError {
 
 fn hydrate_to_fs(e: HydrateError) -> FsError {
     FsError::Io(e.to_string())
+}
+
+/// Pull the blob OID worth prefetching from a `ResolvedEntry`.
+///
+/// Returns `Some(oid)` for entries the T1 prefetch worker can
+/// usefully header-resolve via `cat-file --batch-check`:
+/// regular files, executable files, and symlinks (their targets
+/// live in a blob too, so a `lookup`'s `getattr` wants the size).
+///
+/// Returns `None` for:
+///
+/// - **Directories.** Their OID is a tree, not a blob; a future
+///   T2 tier may prefetch tree contents recursively, but T1's
+///   contract is "headers for blobs."
+/// - **Submodules / gitlinks.** Their OID points at a commit in
+///   another repository; we have no upstream that can serve it,
+///   and our store renders submodules as empty directories
+///   anyway. Posting them would just queue inevitable failures.
+/// - **Synthetic root-overlay entries.** They live in memory; no
+///   blob, no header, no upstream to ask.
+fn harvest_prefetch_oid(resolved: &ResolvedEntry) -> Option<gix::ObjectId> {
+    match resolved {
+        ResolvedEntry::Tree(entry) => match entry.mode {
+            EntryMode::RegularFile | EntryMode::ExecutableFile | EntryMode::Symlink => {
+                Some(entry.oid)
+            }
+            EntryMode::Directory | EntryMode::Gitlink => None,
+        },
+        ResolvedEntry::Synthetic { .. } => None,
+    }
 }
 
 // `TreeNavigator` is only used via `Projection`; the import keeps

@@ -61,11 +61,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 /// link-to-readme     (symlink → README.md, 120000)
 /// ```
 fn build_fixture(name: &str) -> (PathBuf, gix::ObjectId) {
-    let base = std::env::temp_dir().join(format!(
-        "projgit-pfs-{}-{}",
-        name,
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("projgit-pfs-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
 
@@ -96,11 +92,7 @@ fn build_fixture(name: &str) -> (PathBuf, gix::ObjectId) {
     std::fs::write(&target_path, target).unwrap();
     let blob_hex = String::from_utf8(git(
         &base,
-        &[
-            "hash-object",
-            "-w",
-            target_path.to_str().unwrap(),
-        ],
+        &["hash-object", "-w", target_path.to_str().unwrap()],
     ))
     .unwrap();
     let blob_hex = blob_hex.trim();
@@ -124,10 +116,7 @@ fn build_fixture(name: &str) -> (PathBuf, gix::ObjectId) {
 
 /// Build a `ProjectionFsProvider` for `Projection::Commit(head)`
 /// over a `NoopFetcher`-backed hydrating store. Empty overlay.
-fn provider_for(
-    repo: &Path,
-    head: gix::ObjectId,
-) -> ProjectionFsProvider<NoopFetcher> {
+fn provider_for(repo: &Path, head: gix::ObjectId) -> ProjectionFsProvider<NoopFetcher> {
     let store = Arc::new(ObjectStore::open(repo).unwrap());
     let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
     ProjectionFsProvider::new(
@@ -242,7 +231,10 @@ fn lookup_missing_entry_returns_not_found() {
     let (repo, head) = build_fixture("lookup_missing");
     let p = provider_for(&repo, head);
 
-    assert_eq!(p.lookup(ROOT_INODE, b"does-not-exist"), Err(FsError::NotFound));
+    assert_eq!(
+        p.lookup(ROOT_INODE, b"does-not-exist"),
+        Err(FsError::NotFound)
+    );
 }
 
 #[test]
@@ -282,6 +274,66 @@ fn read_on_directory_inode_returns_not_a_file() {
 
     let dir = lookup(&p, ROOT_INODE, b"src");
     assert_eq!(p.read(dir.inode, 0, 16).unwrap_err(), FsError::NotAFile);
+}
+
+#[test]
+fn readdir_t1_prefetch_warms_header_cache() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head) = build_fixture("t1_prefetch");
+    let p = provider_for(&repo, head);
+
+    // Cold: header cache should be empty.
+    let h0 = p.store().store().header_cache_stats();
+    assert_eq!(h0.inserts, 0, "header cache starts empty");
+    assert_eq!(h0.len, 0);
+
+    // Trigger root readdir; this posts blob/symlink OIDs to the
+    // T1 prefetch worker. With NoopFetcher, prefetch_headers takes
+    // the cache-miss branch, then the fetcher returns
+    // NotHydratable (no upstream) -- but importantly,
+    // HydratingObjectStore's pre-pass `store.header()` call **does**
+    // populate the header cache for OIDs that are locally present
+    // (which they all are in this fixture). So the cache warms even
+    // with NoopFetcher.
+    let _ = p.readdir(ROOT_INODE, 0).unwrap();
+
+    // The worker runs on a background thread; give it a brief
+    // window to drain. We poll the prefetch counters rather than
+    // sleeping a fixed duration to keep the test responsive on a
+    // loaded host.
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        let s = p.prefetch_stats();
+        if s.batches_sent > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let pf = p.prefetch_stats();
+    assert_eq!(pf.posted, 1, "exactly one task posted from root readdir");
+    assert!(
+        pf.batches_sent >= 1,
+        "worker should have processed at least one batch: {pf:?}"
+    );
+    // The fixture root has README.md, link-to-readme, run.sh -- 3
+    // blobs/symlinks. (`src` is a directory; harvested OIDs skip it.)
+    assert_eq!(
+        pf.oids_resolved, 3,
+        "expected one resolved probe per blob/symlink in root: {pf:?}"
+    );
+
+    // Cache should now have those 3 entries (populated via the
+    // pre-pass `store.header()` call inside HydratingObjectStore).
+    let h1 = p.store().store().header_cache_stats();
+    assert_eq!(
+        h1.len, 3,
+        "header cache should contain the 3 root-level blob/symlink headers: {h1:?}"
+    );
+    assert!(h1.inserts >= 3);
 }
 
 #[test]
@@ -427,10 +479,7 @@ fn gitlink_renders_as_empty_directory() {
         return;
     }
 
-    let base = std::env::temp_dir().join(format!(
-        "projgit-pfs-gitlink-{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("projgit-pfs-gitlink-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
 
@@ -458,13 +507,8 @@ fn gitlink_renders_as_empty_directory() {
 
     let store = Arc::new(ObjectStore::open(&base).unwrap());
     let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
-    let p = ProjectionFsProvider::new(
-        Projection::Commit(head),
-        hydrating,
-        RootOverlay::new(),
-        3,
-    )
-    .unwrap();
+    let p = ProjectionFsProvider::new(Projection::Commit(head), hydrating, RootOverlay::new(), 3)
+        .unwrap();
 
     // The gitlink shows up at the projection root as a directory.
     let entries = p.readdir(ROOT_INODE, 0).unwrap();

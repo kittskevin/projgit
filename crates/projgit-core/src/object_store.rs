@@ -21,9 +21,18 @@
 //!   ([`crate::blob_cache`]) so warm `cat` calls of source-sized
 //!   files don't re-decode through gix. Skips blobs above a
 //!   per-entry size threshold.
+//! - **Header LRU.** `header` consults a small bounded LRU
+//!   ([`crate::header_cache`]) so warm `lookup`s and the
+//!   `readdir`-time prefetch worker don't repeatedly re-decode
+//!   the same `(kind, size)` tuple via gix.
 
-use crate::blob_cache::{BlobCache, BlobCacheStats, DEFAULT_CAPACITY_BYTES, DEFAULT_PER_ENTRY_MAX_BYTES};
+use crate::blob_cache::{
+    BlobCache, BlobCacheStats, DEFAULT_CAPACITY_BYTES, DEFAULT_PER_ENTRY_MAX_BYTES,
+};
 use crate::error::ObjectStoreError;
+use crate::header_cache::{
+    HeaderCache, HeaderCacheStats, DEFAULT_CAPACITY as DEFAULT_HEADER_CAPACITY,
+};
 use crate::tree_cache::{TreeCache, TreeCacheStats, DEFAULT_CAPACITY};
 use bstr::BString;
 use gix::ObjectId;
@@ -68,6 +77,7 @@ pub struct ObjectStore {
     git_dir: PathBuf,
     tree_cache: TreeCache,
     blob_cache: BlobCache,
+    header_cache: HeaderCache,
 }
 
 impl ObjectStore {
@@ -87,6 +97,7 @@ impl ObjectStore {
             git_dir,
             tree_cache: TreeCache::with_capacity(DEFAULT_CAPACITY),
             blob_cache: BlobCache::new(DEFAULT_CAPACITY_BYTES, DEFAULT_PER_ENTRY_MAX_BYTES),
+            header_cache: HeaderCache::with_capacity(DEFAULT_HEADER_CAPACITY),
         })
     }
 
@@ -127,13 +138,38 @@ impl ObjectStore {
 
     /// Return the object's kind and uncompressed size, or
     /// `MissingObject` if absent.
+    ///
+    /// Backed by an internal LRU ([`crate::header_cache`]). Cold
+    /// reads decode the header via gix once and publish to the
+    /// cache; warm reads return the cached `(kind, size)` tuple
+    /// without touching gix.
     pub fn header(&self, oid: ObjectId) -> Result<(ObjectKind, u64), ObjectStoreError> {
+        if let Some((kind, size)) = self.header_cache.get(&oid) {
+            return Ok((kind, size));
+        }
+        self.header_cache.record_miss();
+
         let h = self.handle();
         let header = h
             .try_find_header(oid)
             .map_err(|e| ObjectStoreError::Backend(e.to_string()))?
             .ok_or(ObjectStoreError::MissingObject(oid))?;
-        Ok((ObjectKind::from_gix(header.kind()), header.size()))
+        let kind = ObjectKind::from_gix(header.kind());
+        let size = header.size();
+        self.header_cache.put(oid, kind, size);
+        Ok((kind, size))
+    }
+
+    /// Populate the header cache directly without going through
+    /// gix decode. Used by the prefetch worker when an upstream
+    /// `git cat-file --batch-check` query returns the header for
+    /// an OID in one round trip.
+    ///
+    /// No-op effects on the underlying gix store; this only
+    /// touches the in-process cache. Safe to call concurrently
+    /// with reads.
+    pub fn put_header_cache(&self, oid: ObjectId, kind: ObjectKind, size: u64) {
+        self.header_cache.put(oid, kind, size);
     }
 
     /// Read the raw bytes of a blob. Returns `MissingObject` if absent
@@ -233,6 +269,12 @@ impl ObjectStore {
     /// [`Self::tree_cache_stats`] for caveats.
     pub fn blob_cache_stats(&self) -> BlobCacheStats {
         self.blob_cache.stats()
+    }
+
+    /// Snapshot of the header LRU's counters. See
+    /// [`Self::tree_cache_stats`] for caveats.
+    pub fn header_cache_stats(&self) -> HeaderCacheStats {
+        self.header_cache.stats()
     }
 
     /// Return the committer timestamp of a commit as a [`SystemTime`].

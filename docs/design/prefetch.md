@@ -1,6 +1,6 @@
 # Design: Prefetch
 
-> Status: **design**, no code yet. Companion to
+> Status: **T1 implemented; T2+ design**. Companion to
 > [../problem-statement.md](../problem-statement.md) (the agent-eval
 > use case driving this) and to the existing tree+blob LRUs
 > documented in `crates/projgit-core/src/{tree_cache,blob_cache}.rs`.
@@ -26,9 +26,8 @@ for them**. Done well, the agent never blocks on the network for
 anything it was going to access soon. Done badly, we DDoS the
 upstream and waste bandwidth on bytes nobody touches.
 
-This doc lays out *what* to prefetch, *when*, and *who decides*. It
-also calls out what we should explicitly *not* build until profiling
-demands it.
+This doc lays out *what* to prefetch, *when*, and *who decides*. Tier 1
+is implemented in `projgit-core`; later tiers remain design notes.
 
 ## 2. Goals & non-goals
 
@@ -117,7 +116,7 @@ kernel → lookup(D, name)   ← projgit reads header from cache (no RTT)
 
 ### Implementation outline
 
-- Introduce `BlobHeaderCache` in `projgit-core` mirroring
+- Introduce `HeaderCache` in `projgit-core` mirroring
   `TreeCache`: `OID → (kind, size)`, bounded LRU, stats. Today
   `ObjectStore::header()` calls gix; T1 introduces a cache layer in
   front. (Cheap; small.)
@@ -135,8 +134,8 @@ kernel → lookup(D, name)   ← projgit reads header from cache (no RTT)
   overrides: send all OIDs to the batch-check child in one go,
   read back N status lines.
 - In `ProjectionFsProvider::readdir`, after returning entries to
-  the caller, post the batch of blob OIDs (skip subtrees and
-  symlinks; those don't have a meaningful "size" cost) to a
+  the caller, post the batch of regular-file, executable-file, and
+  symlink blob OIDs (skip directories and gitlinks) to a
   per-provider prefetch worker.
 
 ### What changes
@@ -148,9 +147,9 @@ kernel → lookup(D, name)   ← projgit reads header from cache (no RTT)
 - `GitCliFetcher` adds a multi-OID query path (the protocol already
   supports it; we just stop limiting ourselves to one OID per
   query).
-- `ProjectionFsProvider` gains a `prefetch_tx: Option<Sender<...>>`
-  field and posts to it after `readdir`. The worker thread is
-  spawned at construction and joined on drop.
+- `ProjectionFsProvider` owns a `PrefetchHandle` and posts to it after
+  `readdir`. The worker thread is spawned at construction and joined on
+  drop.
 
 ### Bounded resource use
 
@@ -168,7 +167,7 @@ kernel → lookup(D, name)   ← projgit reads header from cache (no RTT)
 - `header_cache.{hits, misses, inserts, evictions, len}` (mirrors
   `tree_cache_stats`).
 - `prefetch.{posted, dropped, batches_sent, oids_resolved,
-  oids_failed}`.
+  headers_published, oids_failed}`.
 
 ### Tests
 
