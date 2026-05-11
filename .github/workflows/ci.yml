@@ -1,8 +1,12 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   rust:
@@ -26,8 +30,14 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      - name: Check core without native fetcher
+        run: cargo check -p projgit-core --no-default-features
+
+      - name: Build
+        run: cargo build --workspace --features gvfs-fetcher
+
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features gvfs-fetcher -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --features gvfs-fetcher

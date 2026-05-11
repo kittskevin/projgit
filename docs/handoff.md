@@ -9,11 +9,11 @@ The deep references are linked; trust them, not memory.
 
 ## What is projgit?
 
-An experimental user-mode filesystem in Rust. It lazily fetches git
-objects from a normal git remote (via gitoxide) into a single shared
-content-addressable store, then exposes one or more **read-only
-projections** of that store as filesystem mounts. The working backend is
-FUSE on Linux/macOS; the WinFsp backend is planned but deferred.
+An experimental user-mode filesystem in Rust. It exposes git objects from a
+normal git repository as one or more **read-only projections** backed by a
+single shared content-addressable store. The working mount backend is FUSE on
+Linux/macOS; the production URL hydration path shells out to system `git` for
+partial-clone promisor fetches; the WinFsp backend is planned but deferred.
 
 Three projection kinds:
 - **Ref** — `refs/heads/main` mounted as a directory tree.
@@ -24,9 +24,10 @@ The architectural killer feature: many simultaneous projections share
 **one** object store, so blob deduplication is free.
 
 Core decisions, design docs, and the phased plan all live in
-[`docs/initial-plan.md`](initial-plan.md). Two design docs go deeper on
-specific subsystems: [`docs/design/windows-symlinks.md`](design/windows-symlinks.md)
-and [`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
+[`docs/initial-plan.md`](initial-plan.md). Focused design docs go deeper on
+specific subsystems: [`docs/design/fetchers.md`](design/fetchers.md),
+[`docs/design/windows-symlinks.md`](design/windows-symlinks.md), and
+[`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
 
 ## Where we are right now
 
@@ -135,6 +136,11 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
     regular-file, executable-file, and symlink OIDs to a background
     prefetch worker, which batches header probes and warms the cache.
     See [`docs/design/prefetch.md`](design/prefetch.md).
+  - **Optional `GvfsFetcher`.** Behind the `gvfs-fetcher` feature,
+    projgit can hydrate loose objects through GVFS `GET /gvfs/objects/{oid}`
+    and warm blob sizes through `POST /gvfs/sizes`. CLI selection is explicit
+    with `--fetcher gvfs --gvfs-url ...`; default URL mounts still use
+    `GitCliFetcher`. See [`docs/design/fetchers.md`](design/fetchers.md).
   - **`projgit mount --stats`.** On unmount, prints tree, header,
     blob, and T1 prefetch counters. The stats types are re-exported
     from `projgit_core` for future programmatic consumers.
@@ -213,6 +219,7 @@ e:\repos\gitfs\
 │   ├── initial-plan.md              the plan; status notes inline
 │   ├── handoff.md                   THIS FILE
 │   └── design/
+│       ├── fetchers.md             URL fetcher strategy + GixFetcher trade-off
 │       ├── winfsp-implementation-plan.md  Windows backend resume plan
 │       ├── prefetch.md              T1 implemented; later tiers designed
 │       ├── windows-symlinks.md      decided
@@ -328,13 +335,14 @@ peel.
    (above). Without it, `cargo check --target x86_64-unknown-linux-gnu`
    fails with a target-not-installed error, not a real compile error.
 4. **`projgit-core`'s `gix-fetcher` feature is default-on**, but
-   `projgit-fuse` depends on `projgit-core` with
-   `default-features = false`. Reason: gix's network deps pull
-   reqwest + rustls + ring + a C compiler at build time, which would
-   break Linux cross-checks from Windows. If you add network code
-   anywhere, gate it behind `cfg(feature = "gix-fetcher")`. The
-   `GitCliFetcher` is **not** behind this feature — it shells out to
-   the system `git` and has no extra build deps.
+  `projgit-cli` and `projgit-fuse` depend on `projgit-core` with
+  `default-features = false`. Reason: gix's network deps pull
+  reqwest + rustls + ring + a C compiler at build time, which would
+  break Linux cross-checks from Windows. If you add network code
+  anywhere, gate it behind `cfg(feature = "gix-fetcher")`. The
+  `GitCliFetcher` and partial-clone helper are **not** behind this
+  feature — they shell out to the system `git` and have no extra
+  build deps.
 5. **`ObjectStore` is `Send + Sync`** because it holds a
    `gix::ThreadSafeRepository` and creates per-call thread-local
    `Repository` handles. Don't "fix" it by going back to

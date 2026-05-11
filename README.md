@@ -26,6 +26,7 @@ What works today:
 - Linux/macOS FUSE backend through `fuser`.
 - `projgit mount` for refs, commits, and subtrees.
 - Tree, blob, and header caches, plus T1 readdir-time header prefetch.
+- Optional GVFS protocol fetcher behind the `gvfs-fetcher` feature.
 - Local test coverage for the core, CLI, projection filesystem, and FUSE smoke
   path.
 
@@ -47,6 +48,18 @@ On Linux/macOS, or inside the provided devcontainer:
 cargo build --workspace
 cargo test --workspace --all-targets
 ```
+
+You need Rust 1.85 or newer and the system `git` executable on `PATH`. URL
+mounts use Git's partial-clone promisor support for lazy hydration.
+
+projgit deliberately uses system `git` for URL hydration today instead of the
+native `GixFetcher` path, because hosted servers are more reliable when missing
+objects are requested through Git's partial-clone promisor machinery. See
+[docs/design/fetchers.md](docs/design/fetchers.md) for the trade-off.
+
+GVFS-capable remotes can be tried explicitly with `--features gvfs-fetcher`,
+`--fetcher gvfs`, and `--gvfs-url`; this is an optional backend, not the
+default.
 
 To run the FUSE smoke test, use an environment with `/dev/fuse` available. The
 VS Code devcontainer is configured for this.
@@ -130,10 +143,14 @@ mount permissions.
 - [docs/handoff.md](docs/handoff.md) is the current status document.
 - [docs/design/prefetch.md](docs/design/prefetch.md) covers the prefetch tier
   ladder.
+- [docs/design/fetchers.md](docs/design/fetchers.md) covers why URL mounts use
+  system `git` today and where `GixFetcher` still fits.
 - [docs/design/dotgit-synthesis.md](docs/design/dotgit-synthesis.md) covers
   future `.git/` synthesis.
 - [docs/design/windows-symlinks.md](docs/design/windows-symlinks.md) covers the
   Windows symlink policy.
+- [docs/design/winfsp-implementation-plan.md](docs/design/winfsp-implementation-plan.md)
+  preserves the deferred Windows backend plan.
 
 ## License
 

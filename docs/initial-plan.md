@@ -191,34 +191,33 @@ single store can back many mounts with no duplication.
 ### 5.4 Fetcher
 
 ```rust
-trait Fetcher {
-    async fn fetch_object(&self, oid: ObjectId) -> Result<()>;
+trait Fetcher: Send + Sync {
+    fn fetch_object(&self, oid: ObjectId) -> Result<(), FetcherError>;
+    fn prefetch_headers(&self, oids: &[ObjectId]) -> Vec<HeaderProbe>;
 }
 ```
 
-**Branch A confirmed by Phase 0a spike** (see
-[../spikes/ondemand-fetch/RESULTS.md](../spikes/ondemand-fetch/RESULTS.md)):
-MVP ships `GixFetcher`. `GitCliFetcher` is reserved as a future fallback
-for environments / protocols where the gix path degrades.
+**Phase 0a originally confirmed the native `gix` path**, and the
+`GixFetcher` implementation remains available behind the default-on
+`gix-fetcher` feature. Later Phase 4/5 testing found that GitHub rejects
+the bare-OID want path for many repositories, while the same object request
+works through Git's partial-clone promisor machinery. Current URL mounts
+therefore use `GitCliFetcher` as the production default.
 
-- **`GixFetcher`** (in MVP) — uses `gix`'s `Remote` API to fetch a
-  single OID via the protocol-v2 `want`-line (`allow-tip-sha1-in-want`
-  / `allow-reachable-sha1-in-want`). Refspec form
-  `+<oid>:refs/projgit/wanted/<oid>`. Cold-fetch latency observed at
-  ~430 ms on a small public repo over residential broadband; warm /
-  pooled latency to be measured in Phase 2.
-- **`GitCliFetcher`** (deferred) — shells out to the system `git` (e.g.
-  `git fetch origin <oid> --depth=1 --filter=blob:none`). Slower per
-  fetch (process startup), but inherits the user's git config and
-  credential helpers verbatim.
+- **`GitCliFetcher`** (production default for URL mounts) — shells out to a
+  long-lived `git cat-file --batch-check` process against the partial clone.
+  Missing objects trigger Git's built-in promisor fetch with the right
+  protocol framing; batching also powers T1 header prefetch.
+- **`GixFetcher`** (experimental/default-feature path) — uses `gix`'s
+  `Remote` API to fetch a single OID via the protocol-v2 want-line. It stays
+  useful for no-system-git environments, benchmarks, and future native-Rust
+  transport work.
+- **`NoopFetcher`** — offline/local mode; misses surface as errors instead
+  of trying the network.
 
-Concurrency: requests for the same OID are coalesced via a single-flight
-map (`tokio::sync::Mutex<HashMap<Oid, Shared<Future>>>`) so a thundering
+Concurrency: requests for the same OID are coalesced via a small
+single-flight map built from stdlib `Mutex` + `Condvar`, so a thundering
 herd of `read()` calls hydrates the blob exactly once.
-
-Pack proliferation (each on-demand fetch creates a tiny pack) is
-mitigated by a periodic background repack triggered when pack count
-crosses a threshold; design lives in Phase 2.
 
 ## 6. Phased plan
 
@@ -229,9 +228,11 @@ real product code is written.
 
 ### Phase 0 — Spikes (parallelizable)
 
-- **0a. Gitoxide on-demand fetch spike. — DONE.** Branch A confirmed.
+- **0a. Gitoxide on-demand fetch spike. — DONE.** Branch A initially
+  confirmed that the native path can work.
   See [../spikes/ondemand-fetch/RESULTS.md](../spikes/ondemand-fetch/RESULTS.md).
-  Outcome: MVP ships `GixFetcher`; `GitCliFetcher` deferred.
+  Later GitHub behavior made `GitCliFetcher` the production default for URL
+  mounts, with `GixFetcher` retained behind the `gix-fetcher` feature.
 - **0b. FS hello-world.** Trivial read-only "hello.txt" mount on `fuser`
   *and* `winfsp` behind a shared trait. **Status: PARTIAL.**
   - Linux/macOS half: subsumed by Phase 3b (the `projgit-fuse` crate
@@ -463,9 +464,11 @@ Full options ladder (A0–A3, B, B+) and UX trade-offs:
 ## 10. Decisions baked in
 
 - **Read-only MVP.** No write path. Reduces scope ~50%.
-- **gitoxide is the Fetcher backend.** Branch A confirmed by Phase 0a
-  ([../spikes/ondemand-fetch/RESULTS.md](../spikes/ondemand-fetch/RESULTS.md)).
-  `GitCliFetcher` deferred as a future fallback.
+- **`GitCliFetcher` is the production URL Fetcher backend.** Phase 0a
+  validated the native `gix` path, but later GitHub policy made Git's
+  partial-clone promisor fetch path the reliable default. `GixFetcher`
+  remains available behind the default-on `gix-fetcher` feature for
+  experiments and no-system-git consumers.
 - **One object store, many mounts** is a hard architectural invariant;
   the store API never knows which projection is asking.
 - **No daemon in MVP.** Per-process mounts using on-disk store + file

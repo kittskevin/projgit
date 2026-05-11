@@ -27,12 +27,16 @@ mod coalesce;
 mod git_cli;
 #[cfg(feature = "gix-fetcher")]
 mod gix_fetcher;
+#[cfg(feature = "gvfs-fetcher")]
+mod gvfs;
 mod noop;
 
 pub use coalesce::Coalescer;
 pub use git_cli::{GitCliFetcher, GitCliFetcherError};
 #[cfg(feature = "gix-fetcher")]
 pub use gix_fetcher::{GixFetcher, GixFetcherError};
+#[cfg(feature = "gvfs-fetcher")]
+pub use gvfs::{GvfsFetcher, GvfsFetcherError};
 pub use noop::NoopFetcher;
 
 /// Hydrates a single git object by OID into the local store.
@@ -92,6 +96,10 @@ pub trait Fetcher: Send + Sync {
 /// `(kind, size)` for free and report it directly via
 /// `PresentWithHeader`, which the prefetch worker can publish
 /// straight to the header cache without re-reading via gix.
+/// Some protocol backends can return metadata without hydrating the
+/// object bytes; they report `HeaderOnly`, which is also safe to
+/// publish to the header cache but should not be interpreted as
+/// proof that `read_blob` will be local.
 ///
 /// Not `Clone`: the `Error` variant carries a [`FetcherError`],
 /// which is intentionally non-`Clone` to keep the error payload
@@ -106,6 +114,10 @@ pub enum HeaderProbe {
     /// header for free. The prefetch worker can publish this
     /// directly to the header cache.
     PresentWithHeader(ObjectId, ObjectKind, u64),
+    /// Header metadata is known, but the object itself may not be
+    /// locally present yet. Used by metadata-oriented backends such
+    /// as GVFS `/gvfs/sizes`.
+    HeaderOnly(ObjectId, ObjectKind, u64),
     /// The OID could not be made present (server refused, no
     /// network, etc.). The on-demand path will retry naturally.
     Error(ObjectId, FetcherError),
@@ -257,7 +269,8 @@ impl<F: Fetcher> HydratingObjectStore<F> {
         // populate the cache via the normal path.
         for probe in &probes {
             match probe {
-                HeaderProbe::PresentWithHeader(oid, kind, size) => {
+                HeaderProbe::PresentWithHeader(oid, kind, size)
+                | HeaderProbe::HeaderOnly(oid, kind, size) => {
                     self.store.put_header_cache(*oid, *kind, *size);
                 }
                 HeaderProbe::Present(oid) => {
@@ -276,6 +289,7 @@ impl<F: Fetcher> HydratingObjectStore<F> {
             let oid = match &probe {
                 HeaderProbe::Present(o) => *o,
                 HeaderProbe::PresentWithHeader(o, _, _) => *o,
+                HeaderProbe::HeaderOnly(o, _, _) => *o,
                 HeaderProbe::Error(o, _) => *o,
             };
             by_oid.insert(oid, probe);

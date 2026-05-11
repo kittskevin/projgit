@@ -190,7 +190,8 @@ fn worker_loop<F: Fetcher + 'static>(
                         .fetch_add(probes.len() as u64, Ordering::Relaxed);
                     for probe in &probes {
                         match probe {
-                            HeaderProbe::PresentWithHeader(_, _, _) => {
+                            HeaderProbe::PresentWithHeader(_, _, _)
+                            | HeaderProbe::HeaderOnly(_, _, _) => {
                                 stats.headers_published.fetch_add(1, Ordering::Relaxed);
                             }
                             HeaderProbe::Present(_) => { /* cache populated via store.header */ }

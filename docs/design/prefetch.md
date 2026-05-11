@@ -128,11 +128,14 @@ kernel → lookup(D, name)   ← projgit reads header from cache (no RTT)
   3. Hands the remaining list to the fetcher's batched query.
 - Extend `Fetcher` with one optional method:
   ```rust
-  fn prefetch_headers(&self, oids: &[ObjectId]) -> Vec<HydrateResult>;
+  fn prefetch_headers(&self, oids: &[ObjectId]) -> Vec<HeaderProbe>;
   ```
   Default impl: call `fetch_object` per OID. `GitCliFetcher`
   overrides: send all OIDs to the batch-check child in one go,
   read back N status lines.
+- `HeaderProbe::HeaderOnly` lets transports such as GVFS publish
+  trusted metadata from a server sizes endpoint without pretending
+  the object bytes were hydrated locally.
 - In `ProjectionFsProvider::readdir`, after returning entries to
   the caller, post the batch of regular-file, executable-file, and
   symlink blob OIDs (skip directories and gitlinks) to a

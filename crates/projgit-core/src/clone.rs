@@ -2,10 +2,11 @@
 //!
 //! Pragmatic choice for MVP: shell out to the system `git` for the
 //! initial `git clone --filter=blob:none --no-checkout`. The
-//! *hot path* (per-blob hydration) goes through gitoxide for full
-//! control, but the one-time setup path is much shorter to write
-//! correctly via `git` and inherits the user's credential helpers
-//! without us having to plumb anything.
+//! URL-mount hot path also shells out through [`crate::GitCliFetcher`]
+//! so it can use Git's native partial-clone promisor behavior. The
+//! experimental [`crate::GixFetcher`] stays available behind the
+//! `gix-fetcher` feature for callers that want a native-Rust transport
+//! path.
 //!
 //! Documented as a deliberate trade-off in `docs/initial-plan.md` §5.4.
 

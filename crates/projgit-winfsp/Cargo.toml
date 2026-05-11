@@ -9,5 +9,5 @@ repository.workspace = true
 description = "Planned WinFsp filesystem backend for projgit (Windows). Implementation deferred."
 
 [target.'cfg(target_os = "windows")'.dependencies]
-projgit-core = { path = "../projgit-core" }
+projgit-core = { path = "../projgit-core", default-features = false }
 # Phase 3 will add: winfsp.

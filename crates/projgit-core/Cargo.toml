@@ -9,15 +9,21 @@ repository.workspace = true
 description = "Core projection engine, object store, and fetcher abstractions for projgit."
 
 [features]
-# By default we include the GixFetcher, which needs gix's blocking
-# network transport. Consumers that only need the read-only Projection
-# / ObjectStore / FsProvider machinery (e.g. the FUSE adapter) can
-# disable this to avoid pulling reqwest + rustls + ring + a C compiler.
+# By default we include the experimental GixFetcher, which needs gix's
+# blocking network transport. Consumers that only need the read-only
+# Projection / ObjectStore / FsProvider machinery, or that hydrate via
+# GitCliFetcher, can disable this to avoid pulling reqwest + rustls + ring.
 default = ["gix-fetcher"]
 
-# Enables `GixFetcher` and the `partial_clone` helper. Pulls in gix's
-# blocking-network-client + reqwest+rustls transport.
+# Enables `GixFetcher`. Pulls in gix's blocking-network-client +
+# reqwest+rustls transport. The shell-out partial-clone helper is always
+# available because it only needs the system `git` executable.
 gix-fetcher = ["gix/blocking-network-client", "gix/blocking-http-transport-reqwest-rust-tls"]
+
+# Enables the optional GVFS protocol fetcher. This is not default-on because
+# stock Git remotes do not speak GVFS and the CLI still defaults to system Git's
+# partial-clone promisor path.
+gvfs-fetcher = ["dep:serde", "dep:serde_json", "dep:ureq"]
 
 [dependencies]
 # Lean by default; the `gix-fetcher` feature opts in the network
@@ -25,6 +31,9 @@ gix-fetcher = ["gix/blocking-network-client", "gix/blocking-http-transport-reqwe
 gix = { workspace = true }
 bstr = { workspace = true }
 thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+ureq = { version = "2", optional = true }
 
 [dev-dependencies]
 # Tests build small fixture repos at runtime via gix; no extra deps for now.

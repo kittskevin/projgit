@@ -13,10 +13,11 @@ name = "projgit"
 path = "src/main.rs"
 
 [dependencies]
-# We want both `GixFetcher` (network mode) and `NoopFetcher` (offline /
-# local-repo mode) available, plus `partial_clone` — so keep the
-# default `gix-fetcher` feature on.
-projgit-core = { path = "../projgit-core" }
+# The CLI uses GitCliFetcher for URL-backed mounts and NoopFetcher for
+# offline/local mounts. Keep projgit-core's default `gix-fetcher` feature
+# off so the binary does not pull gix's HTTP transport stack unless it
+# actually needs the experimental native fetcher.
+projgit-core = { path = "../projgit-core", default-features = false }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 # Lightweight Ctrl-C / SIGTERM handler so we can drop the
@@ -31,3 +32,7 @@ gix = { workspace = true }
 # a friendly "use projgit-winfsp once Phase 3d lands" message.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 projgit-fuse = { path = "../projgit-fuse" }
+
+[features]
+default = []
+gvfs-fetcher = ["projgit-core/gvfs-fetcher"]

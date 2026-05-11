@@ -3,6 +3,7 @@
 These examples assume Linux/macOS or the devcontainer, because the current
 mount backend is FUSE-based. Windows mounting is deferred; see
 [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md).
+They also assume Rust 1.85 or newer and `git` on `PATH`.
 
 ## Build And Test
 
@@ -62,6 +63,23 @@ Subtree mounts expose a path inside a ref or commit as the mount root.
 mkdir -p /tmp/projgit-src
 cargo run -p projgit-cli -- mount https://github.com/rust-lang/log /tmp/projgit-src --ref master --subtree src
 ```
+
+## Try A GVFS-Capable Remote
+
+GVFS support is optional and must be selected explicitly. The default URL path
+still uses system Git's partial-clone promisor behavior.
+
+```sh
+mkdir -p /tmp/projgit-gvfs
+PROJGIT_GVFS_TOKEN="$token" \
+  cargo run -p projgit-cli --features gvfs-fetcher -- \
+  mount https://example.com/repo /tmp/projgit-gvfs \
+  --fetcher gvfs --gvfs-url https://example.com/repo
+```
+
+`--gvfs-url` may include or omit a trailing `/gvfs`. The first implementation
+supports single-object hydration and GVFS size-based T1 header prefetch; cache
+server discovery and packfile batch ingestion are deferred.
 
 ## Run Network-Gated Fetcher Tests
 

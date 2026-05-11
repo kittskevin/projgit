@@ -24,8 +24,9 @@ Concretely:
 - The agent inside the container needs to **explore the codebase as if
   it were a normal local checkout** — `os.walk()`, `find`, `grep -r`,
   language-server indexing, git tooling like `git log` / `git diff` /
-  `git blame`. The agent can't predict which paths matter(that is what is under test)) 
-  access patterns are sparse, and unpredictable, especially for the agent failure modes.
+  `git blame`. The agent can't predict which paths matter; that discovery is
+  what is under test. Access patterns are sparse and unpredictable, especially
+  for agent failure modes.
 - Evals run frequently enough that **per-container clone time and disk
   use are first-order costs**. A monorepo of even moderate size
   (10K–1M files) costs measurable wall-clock and gigabytes-per-eval if
@@ -54,7 +55,7 @@ a complete, normal-looking checkout. Files it has never touched must
 appear with real metadata in directory listings. `cat` on any file
 must return the right bytes. `git log src/auth/foo.py` must return
 real history. None of this can require the agent to know in advance
-which files matter. We are evaluating if the agent knows what files matter.
+which files matter. We are evaluating whether the agent knows what files matter.
 
 ## 2. What "appears complete" actually requires
 

@@ -69,6 +69,11 @@ Implications:
 - The artifacts inside the volume are Linux ELF binaries, not
   consumable from the Windows host.
 
+Do not run `sudo cargo ...` in the container. `sudo` may not inherit the
+Rust toolchain path (`sudo: cargo: command not found`), and forcing it can
+leave root-owned build artifacts behind. Use plain `cargo ...`; if ownership
+does get confused, repair it with `sudo chown -R vscode:vscode target/`.
+
 ## Host configuration notes
 
 The same `devcontainer.json` works on Windows, macOS, and Linux

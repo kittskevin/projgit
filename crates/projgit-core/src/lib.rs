@@ -25,14 +25,13 @@
 //!   FUSE / WinFsp backends implement, plus inode allocator and an
 //!   in-memory provider for testing.
 //! - [`error`]         — typed errors shared across the crate.
-//! - [`clone`]         — one-time partial-clone helper. Behind the
-//!   `gix-fetcher` feature for the same network-dep reason.
+//! - [`clone`]         — one-time partial-clone helper backed by the
+//!   system `git` executable.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod blob_cache;
-#[cfg(feature = "gix-fetcher")]
 pub mod clone;
 pub mod error;
 pub mod fetcher;
