@@ -130,10 +130,13 @@ Optional checks:
 ```sh
 PROJGIT_NETWORK_TESTS=1 cargo test -p projgit-core --test fetcher -- --nocapture
 cargo test -p projgit-fuse --test mount_smoke -- --ignored --nocapture
+PROJGIT_NETWORK_TESTS=1 \
+  cargo test -p projgit-fuse --test mount_real_remote -- --ignored --nocapture
 ```
 
 Network tests hit GitHub. The FUSE smoke test requires `/dev/fuse` and suitable
-mount permissions.
+mount permissions. The `mount_real_remote` test partial-clones
+`https://github.com/rust-lang/log` and walks it through the real FUSE mount.
 
 ## Design Docs
 

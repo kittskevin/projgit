@@ -89,6 +89,17 @@ These tests hit GitHub and are opt-in.
 PROJGIT_NETWORK_TESTS=1 cargo test -p projgit-core --test fetcher -- --nocapture
 ```
 
+## Run The End-To-End Mount Test Against A Real Remote
+
+This test partial-clones `https://github.com/rust-lang/log`, mounts it through
+the real FUSE backend with `GitCliFetcher`, and walks the projection from the
+kernel side. It needs both `/dev/fuse` and network, so it is doubly gated.
+
+```sh
+PROJGIT_NETWORK_TESTS=1 \
+  cargo test -p projgit-fuse --test mount_real_remote -- --ignored --nocapture
+```
+
 ## Troubleshooting
 
 - `mountpoint ... does not exist`: create the mount directory first.
