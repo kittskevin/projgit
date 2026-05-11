@@ -103,6 +103,40 @@ projgit's design target is the missing middle ground:
 The longer motivation and prior-art comparison are in
 [docs/problem-statement.md](docs/problem-statement.md).
 
+## Measured Behavior
+
+Captured by [crates/projgit-cli/examples/bench_mount.rs](crates/projgit-cli/examples/bench_mount.rs)
+against `https://github.com/rust-lang/log` at `master`, median of 3 iterations,
+times in milliseconds. Full results and methodology in
+[docs/bench/baseline.md](docs/bench/baseline.md).
+
+| Operation              | projgit cold | projgit warm | git baseline |
+| ---------------------- | -----------: | -----------: | -----------: |
+| `readdir` of root      |        0.93 |        0.97 |        6.78 |
+| recursive walk         |        8.04 |        1.57 |        5.67 |
+| `cat` 3 files          |     8,754.7 |        0.48 |     2,904.3 |
+
+`git baseline` is `git ls-tree` and `git cat-file blob` against a fresh
+`git clone --filter=blob:none --no-checkout` of the same repo.
+
+Take-aways:
+
+- `readdir` is **~7×** faster than `git ls-tree` even cold; tree objects
+  ship with the partial clone and projgit serves them in-process.
+- Warm reads are **~6,000×** faster than the git baseline because the
+  bytes live in projgit's small-blob LRU.
+- Cold first-read of an uncached file is currently **slower** than
+  `git cat-file` cold; `GitCliFetcher` does not yet pipeline blob bytes
+  the way native git's promisor fetch does. This is the next fetcher
+  improvement, and the bench exists to catch when it changes.
+
+Reproduce on Linux/macOS:
+
+```sh
+PROJGIT_NETWORK_TESTS=1 \
+  cargo run -p projgit-cli --example bench_mount --release
+```
+
 ## Project Layout
 
 ```text
