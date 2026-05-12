@@ -53,6 +53,8 @@ pub use fetcher::{
 };
 #[cfg(feature = "gix-fetcher")]
 pub use fetcher::{GixFetcher, GixFetcherError};
+#[cfg(feature = "gvfs-fetcher")]
+pub use fetcher::{GvfsFetcher, GvfsFetcherError};
 pub use fs_provider::{
     Attr, DirEntry, FileType, FsError, FsProvider, InMemoryFsProvider, InodeAllocator, InodeKind,
     ROOT_INODE,

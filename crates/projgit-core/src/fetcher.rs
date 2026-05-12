@@ -264,7 +264,7 @@ impl<F: Fetcher> HydratingObjectStore<F> {
 
         let probes = self.fetcher.prefetch_headers(&to_query);
 
-        // Publish PresentWithHeader results to the cache; for
+        // Publish direct header results to the cache; for
         // bare Present results, do a one-shot store.header() to
         // populate the cache via the normal path.
         for probe in &probes {

@@ -6,7 +6,7 @@
 //! git data (instead of just the [`crate::InMemoryFsProvider`] test
 //! fixture). It is pure logic — no platform code — and is generic
 //! over [`crate::Fetcher`] so tests can use [`crate::NoopFetcher`]
-//! while runtime mounts use [`crate::GixFetcher`].
+//! while URL-backed runtime mounts use [`crate::GitCliFetcher`].
 //!
 //! ## Cache shape
 //!

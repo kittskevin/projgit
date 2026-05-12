@@ -87,6 +87,25 @@ struct MountArgs {
     /// that warm reads are hitting the cache.
     #[arg(long)]
     stats: bool,
+
+    /// Fetch backend for URL-backed mounts.
+    #[arg(long, value_enum, default_value = "git")]
+    fetcher: FetcherChoice,
+
+    /// Base GVFS protocol URL, with or without a trailing `/gvfs`.
+    /// Required when `--fetcher gvfs` is selected.
+    #[cfg(feature = "gvfs-fetcher")]
+    #[arg(long, value_name = "URL")]
+    gvfs_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum FetcherChoice {
+    /// Use system Git's partial-clone promisor path.
+    Git,
+    /// Use the optional GVFS protocol backend.
+    #[cfg(feature = "gvfs-fetcher")]
+    Gvfs,
 }
 
 fn main() -> Result<()> {
@@ -117,6 +136,8 @@ fn init_logging(verbose: u8) {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cmd_mount(args: MountArgs) -> Result<()> {
+    #[cfg(feature = "gvfs-fetcher")]
+    use projgit_core::GvfsFetcher;
     use projgit_core::{
         clone::{git_dir_for, partial_clone, CloneOptions},
         GitCliFetcher, HydratingObjectStore, NoopFetcher, ObjectStore, ProjectionFsProvider,
@@ -192,6 +213,9 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     let print_stats = args.stats;
 
     if args.offline || !source_is_url {
+        if args.fetcher != FetcherChoice::Git {
+            bail!("--fetcher gvfs requires a URL source and cannot be combined with --offline");
+        }
         let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
         let provider = Arc::new(
             ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
@@ -199,14 +223,42 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
         );
         run_mount(provider, &mp, &cfg, print_stats)
     } else {
-        let fetcher = GitCliFetcher::open(store.clone())
-            .context("opening GitCliFetcher (needs `git` on PATH)")?;
-        let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
-        let provider = Arc::new(
-            ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
-                .context("building ProjectionFsProvider")?,
-        );
-        run_mount(provider, &mp, &cfg, print_stats)
+        match args.fetcher {
+            FetcherChoice::Git => {
+                let fetcher = GitCliFetcher::open(store.clone())
+                    .context("opening GitCliFetcher (needs `git` on PATH)")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                let provider = Arc::new(
+                    ProjectionFsProvider::new(
+                        projection, hydrating, overlay, /* projection_id */ 1,
+                    )
+                    .context("building ProjectionFsProvider")?,
+                );
+                run_mount(provider, &mp, &cfg, print_stats)
+            }
+            #[cfg(feature = "gvfs-fetcher")]
+            FetcherChoice::Gvfs => {
+                let gvfs_url = args
+                    .gvfs_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--fetcher gvfs requires --gvfs-url <URL>"))?;
+                let fetcher = match std::env::var("PROJGIT_GVFS_TOKEN") {
+                    Ok(token) if !token.is_empty() => {
+                        GvfsFetcher::with_bearer_token(store.clone(), gvfs_url, token)
+                    }
+                    _ => GvfsFetcher::open(store.clone(), gvfs_url),
+                }
+                .context("opening GvfsFetcher")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                let provider = Arc::new(
+                    ProjectionFsProvider::new(
+                        projection, hydrating, overlay, /* projection_id */ 1,
+                    )
+                    .context("building ProjectionFsProvider")?,
+                );
+                run_mount(provider, &mp, &cfg, print_stats)
+            }
+        }
     }
 }
 
