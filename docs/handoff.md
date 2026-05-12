@@ -246,7 +246,7 @@ e:\repos\gitfs\
 │   └── design/
 │       ├── workload.md              workload shape projgit is built for
 │       ├── fetchers.md             URL fetcher strategy + GixFetcher trade-off
-│       ├── batch-fault.md           designed: body batching + anticipatory hydration
+│       ├── fetch-coalescing.md           designed: body batching + anticipatory hydration
 │       ├── winfsp-implementation-plan.md  Windows backend resume plan
 │       ├── prefetch.md              T1 implemented; later tiers designed
 │       ├── windows-symlinks.md      decided
@@ -455,7 +455,7 @@ In rough order of "smallest unit of work that yields the most
 visible progress":
 
 1. **Close the cold-cat gap surfaced by the bench.** Today
-   `GitCliFetcher` services one blob per fault. A small batch-fault
+   `GitCliFetcher` services one blob per fault. A small fetch-coalescing
    scheme — e.g. cluster faults observed within a short window and
    shuttle them through `git cat-file --batch` (the bytes variant)
    — would close the ~3× cold gap to the `git cat-file` baseline. The

@@ -1,4 +1,4 @@
-# Design: Batch-Fault Hydration
+# Design: Fetch Coalescing
 
 > Status 5/11/2026 Not implemented
 >
@@ -255,7 +255,7 @@ Mirror the existing two-tier shape:
 
 Not mutually exclusive. Numbered for reference, not priority.
 
-### Design A — Reactive batch-fault only
+### Design A — Reactive coalescing only
 
 - Add `Fetcher::fetch_objects(&[ObjectId])` with a default loop.
 - A small reactive coalescer wakes on a 1–5 ms window or N pending

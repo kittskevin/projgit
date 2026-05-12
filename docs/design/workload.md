@@ -5,7 +5,7 @@
 > [`docs/problem-statement.md`](../problem-statement.md) (what use
 > case, why nothing else fits) and
 > [`docs/design/prefetch.md`](prefetch.md) /
-> [`docs/design/batch-fault.md`](batch-fault.md) (specific
+> [`docs/design/fetch-coalescing.md`](fetch-coalescing.md) (specific
 > subsystems shaped by this).
 
 ## 0. Why this document exists
@@ -130,7 +130,7 @@ Metadata is mostly handled today (the LRUs and T1 prefetch were
 built specifically for this). The body story is incomplete — the
 benchmark's cold-cat regression is exactly the read-storm cost
 showing through. See
-[`docs/design/batch-fault.md`](batch-fault.md).
+[`docs/design/fetch-coalescing.md`](fetch-coalescing.md).
 
 ## 3. How Every Subsystem Maps To The Shape
 
@@ -150,9 +150,9 @@ subsystem traces back to a property in §1.
 | Read-only MVP                               | Workload doesn't need writes; cuts scope ~50%              | [`../initial-plan.md`](../initial-plan.md) §10 |
 | Single-commit projection                    | Workload binds to one commit per mount (§1.5)              | `crates/projgit-core/src/projection.rs` |
 | Network-gated tests + bench                 | Honest measurement of the shape we claim to serve          | [`../bench/baseline.md`](../bench/baseline.md) |
-| Batch-fault hydration *(planned)*           | Read storms (§1.2) + tolerance for over-fetching (§1.4)    | [`batch-fault.md`](batch-fault.md)     |
-| Anticipatory body prefetch *(planned)*      | Predictable ordering (§1.3) + tolerance (§1.4)             | [`batch-fault.md`](batch-fault.md)     |
-| GVFS as first-class second backend *(planned)* | Multi-backend bench credibility, server-side batching (§1.6) | [`fetchers.md`](fetchers.md), [`batch-fault.md`](batch-fault.md) |
+| Fetch coalescing *(planned)*                      | Read storms (§1.2) + tolerance for over-fetching (§1.4)    | [`fetch-coalescing.md`](fetch-coalescing.md)     |
+| Anticipatory body prefetch *(planned)*      | Predictable ordering (§1.3) + tolerance (§1.4)             | [`fetch-coalescing.md`](fetch-coalescing.md)     |
+| GVFS as first-class second backend *(planned)* | Multi-backend bench credibility, server-side batching (§1.6) | [`fetchers.md`](fetchers.md), [`fetch-coalescing.md`](fetch-coalescing.md) |
 
 If a planned subsystem doesn't trace cleanly to a property in §1,
 it probably isn't projgit's job.
@@ -173,7 +173,7 @@ prefetch and batching are accelerators on top. Concretely:
   `lookup` will fetch correctly when it runs.
 - We can fail an anticipatory body batch — the `read` will fault
   on demand.
-- We can disable batch-fault entirely with a feature flag — every
+- We can disable fetch coalescing entirely with a feature flag — every
   individual fault still works.
 
 The worst case for any optimisation we ship is "we wasted some
