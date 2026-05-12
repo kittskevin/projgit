@@ -124,7 +124,7 @@ Take-aways:
 - `readdir` is **~7×** faster than `git ls-tree` even cold; tree objects
   ship with the partial clone and projgit serves them in-process.
 - Warm reads are **~6,000×** faster than the git baseline because the
-  bytes live in projgit's small-blob LRU.
+  bytes live in projgit's small-blob LRU cache.
 - Cold first-read of an uncached file is currently **slower** than
   `git cat-file` cold; `GitCliFetcher` does not yet pipeline blob bytes
   the way native git's promisor fetch does. This is the next fetcher
