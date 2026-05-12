@@ -103,6 +103,43 @@ projgit's design target is the missing middle ground:
 The longer motivation and prior-art comparison are in
 [docs/problem-statement.md](docs/problem-statement.md).
 
+## Designed For One Workload Shape
+
+projgit is opinionated for a specific access pattern, not a general-purpose
+virtual git client. Every cache, prefetch tier, and fetcher choice flows from
+this shape:
+
+> **Many short-lived processes pointed at a Git commit, performing wide-shallow
+> access with bursty concurrency and predictable ordering, that tolerate
+> speculative work in exchange for low interactive latency.**
+
+In concrete terms:
+
+- **Wide-shallow access.** Most files are never touched. Reads target a small,
+  unpredictable subset (`README.md`, lockfiles, a few source files surfaced by
+  search). Total bytes read are usually well under 1% of the commit.
+- **Bursty concurrency.** Traffic comes in storms (directory walks,
+  `ripgrep`, language-server indexing, parallel agent tool calls) separated
+  by idle gaps that prefetch can use.
+- **Predictable ordering.** `readdir → lookup → read` is the canonical
+  sequence; each step structurally hints at what's next, so prefetch isn't
+  guessing.
+- **Tolerance for over-fetching.** Bytes-not-read (especially for small files) 
+  are a cheap mistake; reads blocked on the network are an expensive one.
+  Anticipatory work to make files contents available, within a budget, is safe.
+- **High parallelism with shared storage.** Many mounts on one host share the
+  on-disk Git object store, so the first cold fetch is amortised across every
+  subsequent reader of the same commit.
+
+Workloads projgit deliberately is **not** for: long-lived dev workstations
+(just clone), heavy writes (read-only), full-tree static analysis (no lazy-fetch
+win), binary or multimedia repos (blows our small-blob budgets), and anything
+that wants commit-history semantics (no graph walking inside the mount).
+
+The design discipline that follows from this shape, and a per-subsystem map
+of which workload property each cache/prefetch tier serves, lives in
+[docs/design/workload.md](docs/design/workload.md).
+
 ## Measured Behavior
 
 Captured by [crates/projgit-cli/examples/bench_mount.rs](crates/projgit-cli/examples/bench_mount.rs)

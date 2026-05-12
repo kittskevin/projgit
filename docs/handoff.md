@@ -244,7 +244,9 @@ e:\repos\gitfs\
 │   ├── initial-plan.md              the plan; status notes inline
 │   ├── handoff.md                   THIS FILE
 │   └── design/
+│       ├── workload.md              workload shape projgit is built for
 │       ├── fetchers.md             URL fetcher strategy + GixFetcher trade-off
+│       ├── batch-fault.md           designed: body batching + anticipatory hydration
 │       ├── winfsp-implementation-plan.md  Windows backend resume plan
 │       ├── prefetch.md              T1 implemented; later tiers designed
 │       ├── windows-symlinks.md      decided
