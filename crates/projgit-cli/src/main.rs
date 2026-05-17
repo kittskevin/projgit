@@ -1,18 +1,28 @@
 //! `projgit` command-line entry point.
 //!
-//! Phase 4 ships exactly one subcommand — `mount` — wiring the pieces
-//! Phase 1–3 produced into the first end-to-end demo:
+//! Ships one subcommand today, `mount`, which wires the projection
+//! engine (`projgit-core`) and the FUSE adapter (`projgit-fuse`) into a
+//! single end-to-end demo: clone the upstream into a shared on-disk cache,
+//! open it as an `ObjectStore`, build a `Projection` (ref / commit /
+//! subtree), wrap it in a `ProjectionFsProvider` backed by the chosen
+//! `Fetcher`, then mount it through FUSE until the user sends Ctrl-C.
 //!
 //! ```text
 //! projgit mount https://github.com/foo/bar /mnt/bar          # clone + mount HEAD
 //! projgit mount /path/to/repo /mnt/bar --commit <oid>        # local repo, specific commit
 //! projgit mount https://… /mnt/bar --ref refs/tags/v1 \
-//!                                  --subtree src
+//!                                  --subtree src --stats
 //! ```
 //!
-//! See `docs/initial-plan.md` Phase 4 for the broader command surface
-//! (`init`, `clone`, `umount`, `ls`, `fetch`) that lands in subsequent
-//! phases.
+//! Notable flags: `--offline` (no fetcher; any miss is an I/O error),
+//! `--fetcher` (pick a fetcher backend; `git` is the default and only
+//! always-on choice), `--cache-dir` (where URL sources are partial-cloned),
+//! `--stats` (print cache and prefetch counters on unmount).
+//!
+//! The CLI surface is deliberately minimal: anything beyond `mount` (an
+//! `umount` companion with a PID-file flow, daemonized background mounts,
+//! `tracing-subscriber` wiring for the existing `-v` flag) is tracked in
+//! `docs/handoff.md` and deferred.
 
 #![forbid(unsafe_code)]
 
