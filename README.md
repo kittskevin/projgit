@@ -235,14 +235,30 @@ projgit's design target is the missing middle ground:
 - **Lazy fetch:** disk and bandwidth proportional to touched objects.
 - **Total enumerability:** `os.walk`, `find`, language servers, and build tools
   see the whole tree.
-- **Shared storage:** many projections reuse the same Git object store.
+- **Sharen experimental research project and personal portfolio piece — not a
+production filesystem. The licenses below cover liability (the standard MIT and
+Apache-2.0 "AS IS" / "no warranty" clauses); beyond that:
+
+- **Not for production use.** Nothing here has been hardened, security-audited,
+  or tested at scale, and the on-disk cache format, CLI surface, and Rust API
+  may change without notice.
+- **No support is offered.** Issues and pull requests may not be reviewed. Bug
+  reports are welcome but the maintainer makes no commitment to act on thhe same Git object store.
 
 The longer motivation and prior-art comparison are in
 [docs/problem-statement.md](docs/problem-statement.md).
 
 ## Status
 
-This is a prototype, not a production filesystem.
+This is an experimental research project and personal portfolio piece — not a
+production filesystem. The licenses below cover liability (the standard MIT and
+Apache-2.0 "AS IS" / "no warranty" clauses); beyond that:
+
+- **Not for production use.** Nothing here has been hardened, security-audited,
+  or tested at scale, and the on-disk cache format, CLI surface, and Rust API
+  may change without notice.
+- **No support is offered.** Issues and pull requests may not be reviewed. Bug
+  reports are welcome but the maintainer makes no commitment to act on them.
 
 What works today:
 
