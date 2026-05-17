@@ -1,6 +1,6 @@
 //! On-demand object hydration.
 //!
-//! See `docs/initial-plan.md` §5.4 and Phase 0a results
+//! See `docs/implementation/initial-plan.md` §5.4 and Phase 0a results
 //! (`spikes/ondemand-fetch/RESULTS.md`).
 //!
 //! ## Design choices for MVP

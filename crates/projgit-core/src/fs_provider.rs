@@ -250,7 +250,7 @@ pub enum InodeKind {
 
 /// Allocates and memoises stable inode numbers per mount.
 ///
-/// Per `docs/initial-plan.md` §5.2 the desired property is
+/// Per `docs/implementation/initial-plan.md` §5.2 the desired property is
 /// `(projection_id, blob_oid, path) -> u64`. This implementation
 /// deterministically hashes the inputs and caches the bidirectional
 /// mapping so backends can both *allocate* (during `lookup` /

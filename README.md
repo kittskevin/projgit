@@ -304,8 +304,8 @@ mount permissions. The `mount_real_remote` test partial-clones
 
 - [docs/problem-statement.md](docs/problem-statement.md) explains the concrete
   agent-evaluation use case.
-- [docs/initial-plan.md](docs/initial-plan.md) captures the phased architecture.
-- [docs/handoff.md](docs/handoff.md) is the current status document.
+- [docs/initial-plan.md](docs/implementation/initial-plan.md) captures the phased architecture.
+- [docs/handoff.md](docs/implementation/handoff.md) is the current status document.
 - [docs/design/prefetch.md](docs/design/prefetch.md) covers the prefetch tier
   ladder.
 - [docs/design/fetchers.md](docs/design/fetchers.md) covers why URL mounts use

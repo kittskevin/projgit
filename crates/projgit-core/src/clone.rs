@@ -8,7 +8,7 @@
 //! `gix-fetcher` feature for callers that want a native-Rust transport
 //! path.
 //!
-//! Documented as a deliberate trade-off in `docs/initial-plan.md` §5.4.
+//! Documented as a deliberate trade-off in `docs/implementation/initial-plan.md` §5.4.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

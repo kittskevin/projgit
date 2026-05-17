@@ -240,5 +240,5 @@ ignored by default until CI has the required driver installed.
 6. Implement symlink classifier and reparse-point output.
 7. Implement per-user ownership.
 8. Wire `projgit mount` on Windows.
-9. Update [../handoff.md](../handoff.md) and [../../README.md](../../README.md)
+9. Update [../handoff.md](../implementation/handoff.md) and [../../README.md](../../README.md)
    only after the backend works end to end.

@@ -22,7 +22,7 @@
 //! The CLI surface is deliberately minimal: anything beyond `mount` (an
 //! `umount` companion with a PID-file flow, daemonized background mounts,
 //! `tracing-subscriber` wiring for the existing `-v` flag) is tracked in
-//! `docs/handoff.md` and deferred.
+//! `docs/implementation/handoff.md` and deferred.
 
 #![forbid(unsafe_code)]
 

@@ -147,7 +147,7 @@ subsystem traces back to a property in §1.
 | T1 readdir-time header prefetch             | Predictable ordering (§1.3) + metadata storms (§1.2)       | [`prefetch.md`](prefetch.md)           |
 | Long-lived `git cat-file --batch-check`     | Bursty metadata storms amortise the child cost (§1.2)      | `crates/projgit-core/src/fetcher/git_cli.rs` |
 | Blob-free `readdir`                         | Wide-shallow access (§1.1) — never hydrate to compute size | `crates/projgit-core/src/projection_fs.rs` |
-| Read-only MVP                               | Workload doesn't need writes; cuts scope ~50%              | [`../initial-plan.md`](../initial-plan.md) §10 |
+| Read-only MVP                               | Workload doesn't need writes; cuts scope ~50%              | [`../initial-plan.md`](../implementation/initial-plan.md) §10 |
 | Single-commit projection                    | Workload binds to one commit per mount (§1.5)              | `crates/projgit-core/src/projection.rs` |
 | Network-gated tests + bench                 | Honest measurement of the shape we claim to serve          | [`../bench/baseline.md`](../bench/baseline.md) |
 | Fetch coalescing *(planned)*                      | Read storms (§1.2) + tolerance for over-fetching (§1.4)    | [`fetch-coalescing.md`](fetch-coalescing.md)     |
@@ -260,7 +260,7 @@ which is a project nobody benefits from.
 - A spec for any one subsystem. Each subsystem has its own design
   doc (linked in §3).
 - A timeline. Phase ordering lives in
-  [`../handoff.md`](../handoff.md).
+  [`../handoff.md`](../implementation/handoff.md).
 - A scaling guide. The §1.6 amortisation property is qualitative;
   exact concurrency limits depend on the deployment and aren't
   fixed by projgit.

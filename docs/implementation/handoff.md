@@ -1,5 +1,12 @@
 # projgit — Handoff
 
+> **Internal status notes for contributors.** Not user documentation. If you
+> landed here from outside the project, start with the [README](../../README.md)
+> and [docs/problem-statement.md](../problem-statement.md) instead. This file is
+> a running scratch pad for whoever is actively working on projgit; it's
+> deliberately written in the second person and assumes you're about to edit
+> code.
+>
 > Living document. Updated whenever we land a phase or change direction.
 > Last updated: 2026-05-12, after GVFS backend finalization, network-gated
 > end-to-end mount test, and reproducible mount benchmark with checked-in
@@ -27,9 +34,9 @@ The architectural killer feature: many simultaneous projections share
 
 Core decisions, design docs, and the phased plan all live in
 [`docs/initial-plan.md`](initial-plan.md). Focused design docs go deeper on
-specific subsystems: [`docs/design/fetchers.md`](design/fetchers.md),
-[`docs/design/windows-symlinks.md`](design/windows-symlinks.md), and
-[`docs/design/dotgit-synthesis.md`](design/dotgit-synthesis.md).
+specific subsystems: [`docs/design/fetchers.md`](../design/fetchers.md),
+[`docs/design/windows-symlinks.md`](../design/windows-symlinks.md), and
+[`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md).
 
 ## Where we are right now
 
@@ -74,7 +81,7 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   handle to unmount). Cfg-gated to Linux/macOS; empty crate on
   Windows. Verified at runtime by
   `crates/projgit-fuse/tests/mount_smoke.rs` (run inside the
-  devcontainer; see [`.devcontainer/README.md`](../.devcontainer/README.md)).
+  devcontainer; see [`.devcontainer/README.md`](../../.devcontainer/README.md)).
 - **Phase 3e — ProjectionFsProvider glue.** `ProjectionFsProvider<F>`
   in `projgit-core::projection_fs` bridges `Projection` +
   `HydratingObjectStore<F>` + `RootOverlay` to the `FsProvider` trait.
@@ -135,14 +142,14 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
     bounded header cache. `ProjectionFsProvider::readdir` posts
     regular-file, executable-file, and symlink OIDs to a background
     prefetch worker, which batches header probes and warms the cache.
-    See [`docs/design/prefetch.md`](design/prefetch.md).
+    See [`docs/design/prefetch.md`](../design/prefetch.md).
   - **Optional `GvfsFetcher`.** Behind the `gvfs-fetcher` feature,
     projgit can hydrate loose objects through GVFS `GET /gvfs/objects/{oid}`
     and warm blob sizes through `POST /gvfs/sizes`. CLI selection is explicit
     with `--fetcher gvfs --gvfs-url ...` (and optional `PROJGIT_GVFS_TOKEN`
     for bearer auth); default URL mounts still use `GitCliFetcher`. Always
     built in CI, never in the default feature set. See
-    [`docs/design/fetchers.md`](design/fetchers.md).
+    [`docs/design/fetchers.md`](../design/fetchers.md).
   - **`projgit mount --stats`.** On unmount, prints tree, header,
     blob, and T1 prefetch counters. The stats types are re-exported
     from `projgit_core` for future programmatic consumers.
@@ -176,7 +183,7 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
     exists to catch this when it changes.
 
   Methodology and full numbers in
-  [`docs/bench/baseline.md`](bench/baseline.md); README links the headline
+  [`docs/bench/baseline.md`](../bench/baseline.md); README links the headline
   table.
 - **License decision.** Project is dual-licensed **MIT OR Apache-2.0**.
   We hand-roll WinFsp FFI bindings (no GPL-3.0 `winfsp-rs`).
@@ -186,14 +193,14 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
-  [`docs/design/winfsp-implementation-plan.md`](design/winfsp-implementation-plan.md).
+  [`docs/design/winfsp-implementation-plan.md`](../design/winfsp-implementation-plan.md).
   The next Windows step is to implement `projgit-winfsp` directly using
   the WinFsp `FspService*` lifecycle from the C samples.
 
 ### Not yet started
 - **Phase 3d — Production `projgit-winfsp`.** Not started. Includes:
   `FspService*` lifecycle, the symlink classifier per
-  [`docs/design/windows-symlinks.md`](design/windows-symlinks.md),
+  [`docs/design/windows-symlinks.md`](../design/windows-symlinks.md),
   per-user volume ownership, and a WinFsp adapter over
   `ProjectionFsProvider` (3e). The CLI remains cfg-gated to
   Linux/macOS; the Windows arm reports that support is deferred.
@@ -241,8 +248,11 @@ e:\repos\gitfs\
 │   └── ondemand-fetch/              0a: gix on-demand fetch (DONE)
 ├── docs/
 │   ├── EXAMPLES.md                  worked CLI examples
-│   ├── initial-plan.md              the plan; status notes inline
-│   ├── handoff.md                   THIS FILE
+│   ├── problem-statement.md         use case + prior-art comparison
+│   ├── bench/baseline.md            checked-in benchmark numbers
+│   ├── implementation/
+│   │   ├── initial-plan.md          historical pre-implementation plan
+│   │   └── handoff.md               THIS FILE
 │   └── design/
 │       ├── workload.md              workload shape projgit is built for
 │       ├── fetchers.md             URL fetcher strategy + GixFetcher trade-off
@@ -263,13 +273,13 @@ e:\repos\gitfs\
 **On the Windows host (default).** Edits, the projgit-core test
 suite, and Linux compile-checks all work here. You cannot actually
 mount FUSE from Windows. Future WinFsp work should resume from
-[`docs/design/winfsp-implementation-plan.md`](design/winfsp-implementation-plan.md).
+[`docs/design/winfsp-implementation-plan.md`](../design/winfsp-implementation-plan.md).
 
 **Inside the devcontainer (for FUSE work).** Open the workspace in
 VS Code, then **Dev Containers: Reopen in Container**. Provides a
 Debian + fuse3 + Rust environment with `/dev/fuse` available so
 `mount_background` can actually serve a filesystem. See
-[`.devcontainer/README.md`](../.devcontainer/README.md) for the
+[`.devcontainer/README.md`](../../.devcontainer/README.md) for the
 full walkthrough, including the `target/` named-volume trick that
 makes builds fast on Windows hosts.
 
@@ -337,7 +347,7 @@ PROJGIT_NETWORK_TESTS=1 \
 ```
 
 Results shape and methodology in
-[`docs/bench/baseline.md`](bench/baseline.md).
+[`docs/bench/baseline.md`](../bench/baseline.md).
 
 ### Run the network-gated Fetcher test
 
@@ -350,7 +360,7 @@ cargo test -p projgit-core --test fetcher gix_fetcher_hydrates
 ### Resume WinFsp work
 
 The WinFsp prototypes are archived into
-[`docs/design/winfsp-implementation-plan.md`](design/winfsp-implementation-plan.md).
+[`docs/design/winfsp-implementation-plan.md`](../design/winfsp-implementation-plan.md).
 Resume directly in `crates/projgit-winfsp`; do not add a new spike crate
 unless the implementation plan first proves wrong.
 
@@ -361,7 +371,7 @@ These are already set up; a fresh dev box would need to install them.
 - Rust toolchain >= 1.85.0 stable (`rustup update stable`).
 - Linux cross-compile target: `rustup target add x86_64-unknown-linux-gnu`.
 - **Docker Desktop + Dev Containers VS Code extension.** For runtime
-  FUSE work — see [`.devcontainer/README.md`](../.devcontainer/README.md).
+  FUSE work — see [`.devcontainer/README.md`](../../.devcontainer/README.md).
   The container itself bootstraps fuse3 / libfuse3-dev / pkg-config /
   rust-analyzer / clippy / rustfmt / lldb / gdb on first open via
   `postCreateCommand`.
@@ -413,7 +423,7 @@ peel.
    WinFsp mount** because the FSD reports volume ownership as
    `BUILTIN\Administrators`. Phase 3d step 15 must synthesize per-user
    ownership in `get_security_by_name` / `get_security`. (Surfaced in
-  [`docs/design/winfsp-implementation-plan.md`](design/winfsp-implementation-plan.md).)
+  [`docs/design/winfsp-implementation-plan.md`](../design/winfsp-implementation-plan.md).)
 
 ## Decisions you don't have to re-litigate
 
@@ -480,6 +490,6 @@ visible progress":
    would surface fetcher/provider events at `-v` / `-vv`.
 
 Whichever path you take, **commit per the
-[`commit-work` skill](../.github/skills/commit-work/SKILL.md)** —
+[`commit-work` skill](../../.github/skills/commit-work/SKILL.md)** —
 write a message file, `git commit -F`, split logically related changes
 from unrelated ones.

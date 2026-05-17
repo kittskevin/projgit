@@ -1,5 +1,13 @@
 # projgit — Initial Plan
 
+> **Internal design document (historical).** Not user documentation. This is
+> the pre-implementation plan from before any code was written; it captures
+> the original phasing and the open questions at that point in time, not the
+> shipped surface. For a current picture, see the [README](../../README.md),
+> [docs/problem-statement.md](../problem-statement.md) (use case), and
+> [docs/handoff.md](handoff.md) (current status). Phase-specific design
+> notes that have since been written live in [docs/design/](../design/).
+>
 > Status: **draft / pre-implementation**. This document captures the
 > high-level design and phased plan for `projgit` before any code is written.
 > It is intentionally light on syntax and heavy on decisions, scope, and
@@ -230,7 +238,7 @@ real product code is written.
 
 - **0a. Gitoxide on-demand fetch spike. — DONE.** Branch A initially
   confirmed that the native path can work.
-  See [../spikes/ondemand-fetch/RESULTS.md](../spikes/ondemand-fetch/RESULTS.md).
+  See [../spikes/ondemand-fetch/RESULTS.md](../../spikes/ondemand-fetch/RESULTS.md).
   Later GitHub behavior made `GitCliFetcher` the production default for URL
   mounts, with `GixFetcher` retained behind the `gix-fetcher` feature.
 - **0b. FS hello-world.** Trivial read-only "hello.txt" mount on `fuser`
@@ -240,7 +248,7 @@ real product code is written.
     adapter compiles and tests pass under
     `cargo check --target x86_64-unknown-linux-gnu`).
   - Windows half: see
-    [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md):
+    [design/winfsp-implementation-plan.md](../design/winfsp-implementation-plan.md):
     the archived spike established a mount, but request dispatch remained
     unresolved.
 - **0c. WinFsp reparse-point round-trip. — DONE.** Verified via the
@@ -248,9 +256,9 @@ real product code is written.
   premature license commitment). All four consumer tools traverse
   WinFsp-served symlinks transparently as a non-admin user. Results are
   preserved in
-  [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md).
+  [design/winfsp-implementation-plan.md](../design/winfsp-implementation-plan.md).
   Outcome: `Native` mode default in
-  [windows-symlinks.md](./design/windows-symlinks.md) confirmed.
+  [windows-symlinks.md](../design/windows-symlinks.md) confirmed.
 - **0c.bis (informal). WinFsp Rust hello-world.** Validates that
   hand-rolled (bindgen-driven) FFI bindings to `winfsp.dll` from a
   Rust binary can establish a mount, in service of the MIT/Apache
@@ -259,7 +267,7 @@ real product code is written.
   (`fsptool lsvol` confirms). Open issue: no IRPs reach the user-mode
   dispatcher, so probes return `Incorrect function`. Findings and the
   resume checklist are preserved in
-  [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md).
+  [design/winfsp-implementation-plan.md](../design/winfsp-implementation-plan.md).
 
 ### Phase 1 — Object store + path resolver (no FS yet)
 
@@ -271,7 +279,7 @@ real product code is written.
    through to the real tree. MVP overlay is empty; the mechanism reserves
    the option to add `.git/`, `.projgit/`, or other synthetic entries
    later without refactoring the engine. See
-   [dotgit-synthesis.md](./design/dotgit-synthesis.md).
+   [dotgit-synthesis.md](../design/dotgit-synthesis.md).
 5. Unit tests against a fixture repo committed under `tests/fixtures/`,
    plus tests for `RootOverlay` with a non-empty fixture overlay.
 
@@ -296,21 +304,21 @@ real product code is written.
     approach but did **not** achieve a working request dispatch. Phase
     3d builds the production `projgit-winfsp` crate using the lessons
     preserved in
-    [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md):
+    [design/winfsp-implementation-plan.md](../design/winfsp-implementation-plan.md):
     switch from the bare `FspFileSystemStartDispatcher` lifecycle to
     the `FspService*` framework that the bundled C samples use.
 13. Implement stable inode / FileId allocation. **DONE in 3a as part
     of the `InodeAllocator`.**
 14. Implement the **symlink classifier + policy enum** for the Windows
     backend (`Native`, `Text`, `Auto`); see
-    [windows-symlinks.md](./design/windows-symlinks.md). The bare-minimum
+    [windows-symlinks.md](../design/windows-symlinks.md). The bare-minimum
     `Text` mode is the floor; `Native` is gated by the Phase 0c spike
     outcome and degrades gracefully to `Text`.
 15. **Per-user volume / file ownership** in the Windows backend.
     `get_security_by_name` and `get_security` must report the calling
     user as the owner so modern git's `safe.directory` check accepts
     the mount. Surfaced by Phase 0c and preserved in
-    [design/winfsp-implementation-plan.md](design/winfsp-implementation-plan.md).
+    [design/winfsp-implementation-plan.md](../design/winfsp-implementation-plan.md).
 
 ### Phase 4 — Mount manager & CLI
 
@@ -391,7 +399,7 @@ recommended choice.
 Git mode `120000` has no clean Windows equivalent: real symlinks need
 `SeCreateSymbolicLinkPrivilege` or Developer Mode, and the file-vs-directory
 kind must be declared at creation time. Full rationale and per-symlink
-classification algorithm: [windows-symlinks.md](./design/windows-symlinks.md).
+classification algorithm: [windows-symlinks.md](../design/windows-symlinks.md).
 
 **Decisions:**
 
@@ -435,7 +443,7 @@ Many tools (`rg`, `cargo`, editors, `git log`) walk upward looking for a
 refuse to run.
 
 Full options ladder (A0–A3, B, B+) and UX trade-offs:
-[dotgit-synthesis.md](./design/dotgit-synthesis.md).
+[dotgit-synthesis.md](../design/dotgit-synthesis.md).
 
 **What is decided:**
 
@@ -479,11 +487,11 @@ Full options ladder (A0–A3, B, B+) and UX trade-offs:
   WinFsp, text-file fallback if unavailable). Out-of-tree targets emit
   file-symlinks with a logged warning. `Text`-mode marker is an NTFS
   Alternate Data Stream. See
-  [windows-symlinks.md](./design/windows-symlinks.md).
+  [windows-symlinks.md](../design/windows-symlinks.md).
 - **Submodules render as empty directories** in MVP. Users who want
   submodule contents mount the submodule's commit explicitly.
 - **`.git/` synthesis is deferred** but the `RootOverlay` mechanism
   ships in Phase 1. The future ship-default is **R1** (sentinel
   `.projgit/info.json` + opt-in `--emit-dotgit=minimal` flag), gated on
   Phase 5 evidence. See
-  [dotgit-synthesis.md](./design/dotgit-synthesis.md).
+  [dotgit-synthesis.md](../design/dotgit-synthesis.md).

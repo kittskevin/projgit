@@ -1,8 +1,8 @@
 # projgit — Problem statement
 
 > Status: **drafted 2026-05-09 to capture the use case driving Phase 6+
-> work.** Companion to [initial-plan.md](initial-plan.md) (the original
-> design) and [handoff.md](handoff.md) (the running status doc).
+> work.** Companion to [initial-plan.md](implementation/initial-plan.md) (the original
+> design) and [handoff.md](implementation/handoff.md) (the running status doc).
 >
 > This document exists because the project's *original* framing —
 > "lazy-fetch git projections as cross-platform read-only mounts" — is
@@ -337,7 +337,7 @@ operational viability.
 
 ## 8. What this document is not
 
-- A timeline. Phase ordering is in [handoff.md](handoff.md).
+- A timeline. Phase ordering is in [handoff.md](implementation/handoff.md).
 - A spec for `projgitd`. The daemon design lives in its own doc when
   we build it.
 - A spec for `.git/` synthesis. That's
@@ -347,7 +347,7 @@ operational viability.
 - A justification for adding a write path. The trade-off note above
   is intentionally light; if/when writes become real, it's a separate
   design conversation that revisits the locked decision in
-  [initial-plan.md §10](initial-plan.md).
+  [initial-plan.md §10](implementation/initial-plan.md).
 
 If a future reader is wondering whether some new feature is in scope:
 ask whether it makes the agent-eval use case in §1 work better. If

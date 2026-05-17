@@ -11,7 +11,7 @@
 > remote on demand, given a partial clone created with
 > `git clone --filter=blob:none --no-checkout`?
 
-(See [docs/initial-plan.md](../../docs/initial-plan.md) §5.4 and the
+(See [docs/initial-plan.md](../../docs/implementation/initial-plan.md) §5.4 and the
 "Why 0a matters" discussion in chat history for context.)
 
 ## Setup
@@ -131,7 +131,7 @@ Fetched blob size: 26 bytes
    `GixFetcher` is the MVP implementation. `GitCliFetcher` becomes a
    future fallback for any environment / protocol where Branch A
    degrades.
-2. **Update [docs/initial-plan.md](../../docs/initial-plan.md) §5.4** to
+2. **Update [docs/initial-plan.md](../../docs/implementation/initial-plan.md) §5.4** to
    reflect "Branch A confirmed" and remove the "if gitoxide on-demand
    support is incomplete" hedge.
 3. **Add Phase 2 sub-tasks** for:

@@ -1,6 +1,6 @@
 # Design: Windows Symlinks in projgit
 
-> Status: **decided**. Companion to [../initial-plan.md](../initial-plan.md)
+> Status: **decided**. Companion to [../initial-plan.md](../implementation/initial-plan.md)
 > §9.1. Captures the problem space, the option matrix considered, the
 > decisions taken, and the implementation contract for the Windows FS
 > backend.

@@ -1,7 +1,7 @@
 # Design: `.git/` Synthesis & `RootOverlay`
 
 > Status: **mechanism decided; content deferred**. Companion to
-> [../initial-plan.md](../initial-plan.md) §9.3. Captures the option
+> [../initial-plan.md](../implementation/initial-plan.md) §9.3. Captures the option
 > ladder, UX trade-offs, complexity analysis, the architectural
 > commitment we are making in MVP, and the criteria for promoting the
 > deferred content design into MVP later.

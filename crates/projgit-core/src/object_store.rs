@@ -1,6 +1,6 @@
 //! Read-only wrapper around `gix-odb`.
 //!
-//! Architectural rules from `docs/initial-plan.md` §5.3:
+//! Architectural rules from `docs/implementation/initial-plan.md` §5.3:
 //!
 //! - **Read-only.** No mutation methods. The Fetcher (Phase 2) is the
 //!   only component that mutates the store, via gix's pack-receive
@@ -68,7 +68,7 @@ impl ObjectKind {
 ///
 /// Holds a `gix::ThreadSafeRepository` so it is `Send + Sync` and can
 /// back many concurrent readers (and a single Fetcher) at once, per
-/// the `docs/initial-plan.md` §5.3 architectural rule. Each method
+/// the `docs/implementation/initial-plan.md` §5.3 architectural rule. Each method
 /// produces a cheap per-call thread-local `gix::Repository` handle
 /// for the actual lookup.
 #[derive(Debug)]

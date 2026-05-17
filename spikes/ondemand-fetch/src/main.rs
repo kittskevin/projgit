@@ -6,7 +6,7 @@
 //! present in the local object store.
 //!
 //! Outcome decides the design of `projgit-core`'s Fetcher (see
-//! `docs/initial-plan.md` §5.4).
+//! `docs/implementation/initial-plan.md` §5.4).
 //!
 //! Usage:
 //!
