@@ -260,7 +260,7 @@ e:\repos\gitfs\
 │       ├── winfsp-implementation-plan.md  Windows backend resume plan
 │       ├── prefetch.md              T1 implemented; later tiers designed
 │       ├── windows-symlinks.md      decided
-│       └── dotgit-synthesis.md      mechanism decided, content deferred
+│       └── dotgit-synthesis.md      A1 variant shipped 2026-05-17
 └── .github/
     ├── workflows/ci.yml             fmt + clippy + tests
     └── skills/commit-work/          preferred commit workflow

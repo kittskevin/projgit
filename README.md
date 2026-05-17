@@ -266,24 +266,30 @@ What works today:
 
 - Core object-store, projection, overlay, and path-resolution logic.
 - Lazy blob hydration through Git partial-clone/promisor behavior.
-- Linux/macOS FUSE backend through `fuser`.
+- Linux/macOS FUSE backend through `fuser`, with file ownership echoed
+  per-request so `git`'s `safe.directory` check passes without setup.
 - `projgit mount` for refs, commits, and subtrees.
+- A1-flavored `.git/` synthesized at the mount root by default
+  (detached HEAD pointing at the projection's commit, plus
+  `objects/info/alternates` reaching the shared on-disk store), so
+  `git rev-parse HEAD`, `git log`, `git cat-file`, `cargo build`'s VCS
+  detection, and IDE repo-root detection all work out of the box.
+  Opt out with `--no-dotgit`.
 - Tree, blob, and header caches, plus T1 readdir-time header prefetch.
 - Optional GVFS protocol fetcher (Azure DevOps Server / Azure Repos) behind the `gvfs-fetcher` Cargo feature.
 - Local test coverage for the core, CLI, projection filesystem, and FUSE smoke
-  path, plus a network-gated end-to-end mount test against a real remote.
+  path, plus a network-gated end-to-end mount test against a real remote
+  (and a sibling test that drives `git log` from inside the mount).
 
 What is deliberately deferred:
 
 - Windows mounting. The `projgit-winfsp` crate is a stub; the implementation
   plan lives in [docs/design/winfsp-implementation-plan.md](docs/design/winfsp-implementation-plan.md).
-- Synthesized `.git/` contents. The root overlay mechanism exists, but the
-  default mount currently exposes the projected tree only.
 - A long-running daemon for many concurrent mounts sharing one upstream
   connection.
 - Writes. The MVP is read-only.
 
-Each of these four items maps to a criterion in
+Each of these three items maps to a criterion in
 [problem-statement §7](docs/problem-statement.md#7-success-criteria); see
 that section for the per-criterion design-target-vs-shipped-scope status.
 

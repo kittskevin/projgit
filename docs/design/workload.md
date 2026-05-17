@@ -233,10 +233,14 @@ Saying what we're not for is half of saying what we are for.
 - **Adversarial or hostile inputs.** projgit assumes a
   cooperative remote and a cooperative reader. Defensive hardening
   beyond what gix gives us is out of scope.
-- **History exploration.** No commit graph. `git log`-style
-  queries depend on `.git/` synthesis (deferred); projgit's
-  identity is "the tree at one commit," not "all reachable
-  history."
+- **History exploration.** No commit graph inside the projection
+  engine. `git log` works inside the mount today (via the A1 `.git/`
+  synthesis, which sets up an alternates pointer at the shared store
+  and lets the system `git` walk history through its normal machinery)
+  but projgit's own identity is "the tree at one commit," not "all
+  reachable history." If your workload wants programmatic history
+  walking *inside projgit* (rather than via the host `git`), projgit
+  is the wrong layer.
 
 If any of those describe your workload, the failure mode is
 "Scalar (or stock git, or sparse-checkout, or EdenFS) was a

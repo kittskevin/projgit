@@ -53,6 +53,21 @@ pub enum Projection {
 }
 
 impl Projection {
+    /// Resolve the projection to its commit OID.
+    ///
+    /// For `Ref` this looks up the ref and returns its commit; for
+    /// `Commit` and `Subtree` the commit is already part of the
+    /// variant. Callers that need the projection's commit identity
+    /// (e.g. to synthesize a `.git/HEAD`) use this; callers that need
+    /// the projection's *tree* root use [`Self::root_tree`].
+    pub fn resolve_commit(&self, store: &ObjectStore) -> Result<ObjectId, ProjectionError> {
+        match self {
+            Self::Ref(name) => Ok(store.resolve_ref(name)?),
+            Self::Commit(oid) => Ok(*oid),
+            Self::Subtree { commit, .. } => Ok(*commit),
+        }
+    }
+
     /// Resolve the projection to its top-level tree OID.
     ///
     /// For `Ref` this looks up the ref then peels to the commit's tree.

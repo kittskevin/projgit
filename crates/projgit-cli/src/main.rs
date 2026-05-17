@@ -28,7 +28,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -98,6 +98,23 @@ struct MountArgs {
     #[arg(long)]
     stats: bool,
 
+    /// Don't synthesize a `.git/` directory at the mount root.
+    ///
+    /// By default the mount carries an A1-flavored `.git/` (detached
+    /// HEAD pointing at the projection's commit, `config`, empty
+    /// `refs/`, and an `objects/info/alternates` line pointing at the
+    /// shared on-disk object store). That makes `git rev-parse HEAD`,
+    /// `git log`, `git cat-file`, `cargo build`'s VCS detection, and
+    /// `ripgrep`'s VCS-aware ignore handling all work as expected.
+    /// `--no-dotgit` opts out and exposes only the projected tree.
+    ///
+    /// `.git/` synthesis is automatically skipped for `--subtree`
+    /// projections, since `.git/HEAD` would point at the full
+    /// commit's tree rather than the subtree the user is browsing.
+    /// See `docs/design/dotgit-synthesis.md` for the design ladder.
+    #[arg(long)]
+    no_dotgit: bool,
+
     /// Fetch backend for URL-backed mounts.
     #[arg(long, value_enum, default_value = "git")]
     fetcher: FetcherChoice,
@@ -151,7 +168,6 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     use projgit_core::{
         clone::{git_dir_for, partial_clone, CloneOptions},
         GitCliFetcher, HydratingObjectStore, NoopFetcher, ObjectStore, ProjectionFsProvider,
-        RootOverlay,
     };
     use projgit_fuse::MountConfig;
     use std::sync::Arc;
@@ -217,7 +233,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     //    `git`'s promisor mechanism uses whatever remote the partial
     //    clone configured (typically `origin`).
     let _remote_hint = &args.remote;
-    let overlay = RootOverlay::new();
+    let overlay = build_root_overlay(&args, &projection, &store, &git_dir)?;
     let cfg = MountConfig::default();
     let mp = args.mountpoint.clone();
     let print_stats = args.stats;
@@ -400,6 +416,38 @@ fn build_projection(
 
 fn looks_like_url(s: &str) -> bool {
     s.contains("://") || s.starts_with("git@")
+}
+
+/// Construct the `RootOverlay` for the mount based on the user's flags
+/// and the projection kind. Default behavior synthesizes an A1 `.git/`
+/// pointing at the commit and the shared object store; `--no-dotgit` or
+/// a `Subtree` projection yields an empty overlay.
+fn build_root_overlay(
+    args: &MountArgs,
+    projection: &projgit_core::Projection,
+    store: &std::sync::Arc<projgit_core::ObjectStore>,
+    git_dir: &Path,
+) -> Result<projgit_core::RootOverlay> {
+    use projgit_core::{dotgit, Projection, RootOverlay};
+
+    if args.no_dotgit {
+        return Ok(RootOverlay::new());
+    }
+    // `.git/HEAD` would point at the full commit's tree, not the
+    // subtree the user is browsing — that produces surprising
+    // `git log <path>` semantics. Subtree mounts opt out by default;
+    // a future variant can revisit this if the use case calls for it.
+    if matches!(projection, Projection::Subtree { .. }) {
+        return Ok(RootOverlay::new());
+    }
+
+    let commit_oid = projection
+        .resolve_commit(store)
+        .with_context(|| "resolving projection commit for .git/ synthesis")?;
+    let objects_dir = git_dir.join("objects");
+    let objects_dir = std::fs::canonicalize(&objects_dir)
+        .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
+    Ok(dotgit::a1_overlay(commit_oid, &objects_dir))
 }
 
 /// Default cache root. Honours `XDG_CACHE_HOME`; falls back to

@@ -200,6 +200,16 @@ alternates-leak risk; A1 is ~250 LOC of code we own forever.
 
 ## 9. Decision
 
+> **Update 2026-05-17:** the A1 variant has been promoted from
+> deferred to shipped-as-default. The trigger was the project audit
+> identifying problem-statement §7 #4 (`git log <path>` works) as the
+> most visibly deferred success criterion. §9.3 promotion criterion #2
+> ("actual workflow blocker traceable to the missing `.git/`") is the
+> rubric this falls under — the workload simply needs git porcelain
+> to work for the eval use case to feel real. §9.1 through §9.4 below
+> document the *original* mechanism-only commitment; the new
+> additions live in §9.5.
+
 **Defer the content decision. Lock the mechanism decision.**
 
 ### 9.1 Decided (in MVP)
@@ -260,6 +270,43 @@ Any one of the following moves the deferred R1 design into MVP:
 - **Bind-mounting / exposing the real shared store at `.git/`.**
   Leaks paths and refs across sibling projections; the shared store is
   projection-agnostic by invariant.
+
+### 9.5 Promoted (2026-05-17): A1 as shipped default
+
+After the original mechanism-only commitment, the audit identified
+problem-statement §7 #4 (`git log <path>` works) as the most visibly
+deferred success criterion. A1 — not R1 — is the lowest variant that
+satisfies it, and the in-tree `RootOverlay` mechanism already supported
+the nested synthetic directories A1 needs. Promotion landed as:
+
+- **`crate::dotgit::a1_overlay(commit_oid, objects_dir)`** in
+  `projgit-core` builds the A1 overlay (HEAD detached at the commit,
+  minimal `[core]` config, empty `refs/heads/`, empty `refs/tags/`,
+  empty `packed-refs`, and `objects/info/alternates` pointing at the
+  shared store's `objects/`).
+- **`projgit mount` synthesizes it by default** for `Ref` and `Commit`
+  projections. `--no-dotgit` opts out; `Subtree` projections opt out
+  automatically because `.git/HEAD` would point at the full commit's
+  tree rather than the subtree the user is browsing (the original
+  §7 risk #4, surfaced verbatim).
+- **FUSE adapter echoes the requesting process's uid/gid as file
+  ownership** so git's `safe.directory` check passes without the user
+  having to run `git config --global --add safe.directory <mount>`.
+  Same mechanism a future WinFsp backend will need (see the WinFsp
+  implementation plan's per-user volume ownership note).
+- **Network-gated end-to-end test**
+  (`crates/projgit-fuse/tests/mount_real_remote.rs ::
+  mount_real_remote_with_dotgit_supports_git_log`) partial-clones
+  `rust-lang/log`, mounts with the A1 overlay through the real FUSE
+  backend, and asserts `git rev-parse HEAD`, `git log -1`, and
+  `git log -1 -- src/lib.rs` all succeed from inside the mount with
+  no user configuration.
+
+The original §7 A-risks remain on the table (uncanny-valley write
+failures, alternates path leak in `git config --list`). They are
+acceptable given the read-only contract is the same one the rest of
+projgit advertises. The R1 sentinel design and A2 / A3 variants stay
+deferred per §9.2 and §9.4.
 
 ## 10. `RootOverlay` mechanism \u2014 the architectural commitment
 

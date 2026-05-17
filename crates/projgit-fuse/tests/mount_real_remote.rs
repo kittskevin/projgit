@@ -26,7 +26,7 @@
 
 use projgit_core::{
     clone::{git_dir_for, partial_clone, CloneOptions},
-    GitCliFetcher, HydratingObjectStore, ObjectStore, Projection, ProjectionFsProvider,
+    dotgit, GitCliFetcher, HydratingObjectStore, ObjectStore, Projection, ProjectionFsProvider,
     RootOverlay,
 };
 use projgit_fuse::{mount_background, MountConfig};
@@ -205,5 +205,138 @@ fn mount_real_remote_serves_public_repo() {
     );
 
     // Done. Drop guards in the documented order.
+    drop(_session);
+}
+
+/// Companion test: same partial-clone path, but with an A1 `.git/`
+/// overlay spliced at the projection root. Proves that
+/// `dotgit::a1_overlay` actually lets `git` operate inside the mount.
+///
+/// This is what closes problem-statement §7 criterion #4 ("git log
+/// <path> works inside the mount") from "Deferred" to "Met".
+#[test]
+#[ignore = "requires FUSE and network; opt in with PROJGIT_NETWORK_TESTS=1"]
+fn mount_real_remote_with_dotgit_supports_git_log() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    if !network_enabled() {
+        eprintln!("SKIP: set PROJGIT_NETWORK_TESTS=1 to enable network tests");
+        return;
+    }
+
+    let (cache_dir, _cache_guard) = make_temp_dir("dotgit-cache");
+    let opts = CloneOptions::new(TARGET_URL.to_owned(), cache_dir.clone());
+    partial_clone(&opts).expect("partial_clone of TARGET_URL");
+
+    let git_dir = git_dir_for(&cache_dir);
+    let store = Arc::new(ObjectStore::open(&git_dir).expect("ObjectStore::open"));
+
+    // Resolve the projection to a commit OID for both `HEAD`
+    // synthesis and the assertion below.
+    let projection = Projection::Ref(TARGET_REF.to_owned());
+    let commit_oid = projection.resolve_commit(&store).expect("resolve_commit");
+
+    // Build the A1 overlay pointing at the shared objects directory.
+    let objects_dir = std::fs::canonicalize(git_dir.join("objects")).expect("canonicalize objects");
+    let overlay = dotgit::a1_overlay(commit_oid, &objects_dir);
+
+    let fetcher = GitCliFetcher::open(store.clone()).expect("GitCliFetcher::open");
+    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+    let provider = Arc::new(
+        ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 2)
+            .expect("ProjectionFsProvider::new"),
+    );
+
+    let (mountpoint, _mountpoint_guard) = make_temp_dir("dotgit-mp");
+    let _session =
+        mount_background(provider, &mountpoint, &MountConfig::default()).expect("mount_background");
+
+    assert!(
+        wait_for_mount(&mountpoint, Duration::from_secs(10)),
+        "mountpoint never became a FUSE mount within 10s"
+    );
+
+    // `.git/HEAD` is visible and contains the detached commit OID.
+    let head = std::fs::read_to_string(mountpoint.join(".git").join("HEAD"))
+        .expect("read synthesized .git/HEAD");
+    assert_eq!(
+        head.trim(),
+        commit_oid.to_string(),
+        "synthesized HEAD must equal the projection's commit OID"
+    );
+
+    // `.git/objects/info/alternates` is visible and contains the
+    // shared objects directory.
+    let alt = std::fs::read_to_string(mountpoint.join(".git/objects/info/alternates"))
+        .expect("read synthesized alternates");
+    assert_eq!(
+        alt.trim(),
+        objects_dir.to_string_lossy(),
+        "alternates must point at the shared objects directory"
+    );
+
+    // `git -C <mount> rev-parse HEAD` returns the projection's commit.
+    // This is the "no user setup required" path — the uid/gid echo in
+    // the FUSE adapter is what stops `safe.directory` from blocking us.
+    let rev_parse = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("spawn git rev-parse");
+    assert!(
+        rev_parse.status.success(),
+        "git rev-parse HEAD failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&rev_parse.stdout),
+        String::from_utf8_lossy(&rev_parse.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rev_parse.stdout).trim(),
+        commit_oid.to_string(),
+        "git rev-parse HEAD must return the projection's commit OID",
+    );
+
+    // `git -C <mount> log -1 --format=%H` returns the same OID and
+    // exercises commit parsing through the alternates objects dir.
+    let log_head = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["log", "-1", "--format=%H"])
+        .output()
+        .expect("spawn git log");
+    assert!(
+        log_head.status.success(),
+        "git log -1 failed: stderr={:?}",
+        String::from_utf8_lossy(&log_head.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&log_head.stdout).trim(),
+        commit_oid.to_string(),
+    );
+
+    // `git -C <mount> log -1 -- src/lib.rs` returns *some* commit
+    // touching src/lib.rs. We don't assert which one (history is
+    // free to change upstream) — only that the command succeeds and
+    // produces a single OID-shaped line.
+    let log_path = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["log", "-1", "--format=%H", "--", "src/lib.rs"])
+        .output()
+        .expect("spawn git log -- src/lib.rs");
+    assert!(
+        log_path.status.success(),
+        "git log -- src/lib.rs failed: stderr={:?}",
+        String::from_utf8_lossy(&log_path.stderr),
+    );
+    let hex = String::from_utf8_lossy(&log_path.stdout).trim().to_owned();
+    assert_eq!(hex.len(), 40, "expected a 40-char OID, got {hex:?}");
+    assert!(
+        hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "expected hex OID, got {hex:?}",
+    );
+
     drop(_session);
 }

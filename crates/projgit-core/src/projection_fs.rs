@@ -113,7 +113,7 @@ impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
         overlay: RootOverlay,
         projection_id: u64,
     ) -> Result<Self, ProjectionError> {
-        let commit_oid = resolve_commit_oid(&projection, store.store())?;
+        let commit_oid = projection.resolve_commit(store.store())?;
         let commit_time = store
             .store()
             .commit_time(commit_oid)
@@ -559,17 +559,6 @@ fn slice_blob(bytes: &[u8], offset: u64, size: u32) -> Vec<u8> {
     let start = (offset as usize).min(bytes.len());
     let end = start.saturating_add(size as usize).min(bytes.len());
     bytes[start..end].to_vec()
-}
-
-fn resolve_commit_oid(
-    projection: &Projection,
-    store: &crate::ObjectStore,
-) -> Result<ObjectId, ProjectionError> {
-    match projection {
-        Projection::Ref(name) => store.resolve_ref(name).map_err(ProjectionError::from),
-        Projection::Commit(oid) => Ok(*oid),
-        Projection::Subtree { commit, .. } => Ok(*commit),
-    }
 }
 
 fn projection_to_fs(e: ProjectionError) -> FsError {

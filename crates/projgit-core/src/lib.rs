@@ -27,12 +27,16 @@
 //! - [`error`]         — typed errors shared across the crate.
 //! - [`clone`]         — one-time partial-clone helper backed by the
 //!   system `git` executable.
+//! - [`dotgit`]        — builds an A1 `.git/` [`RootOverlay`] so tools
+//!   that look upward for `.git/` see the projection as a real git
+//!   repository in detached-HEAD mode.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod blob_cache;
 pub mod clone;
+pub mod dotgit;
 pub mod error;
 pub mod fetcher;
 pub mod fs_provider;
