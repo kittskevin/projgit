@@ -166,10 +166,12 @@ Pieces worth pointing at if you're skimming the code:
 - **Pluggable fetchers behind one trait.**
   [`GitCliFetcher`](crates/projgit-core/src/fetcher/git_cli.rs) drives the
   partial-clone promisor path via a long-lived `git cat-file --batch-check`
-  child (one process / one TLS session for the whole mount).
+  child (one process / one TLS session for the whole mount); used against
+  any stock Git server.
   [`GixFetcher`](crates/projgit-core/src/fetcher/gix_fetcher.rs) is a pure-Rust
-  fallback. [`GvfsFetcher`](crates/projgit-core/src/fetcher/gvfs.rs) (feature-gated)
-  talks the GVFS protocol. Trade-offs in
+  fallback. [`GvfsFetcher`](crates/projgit-core/src/fetcher/gvfs.rs) (behind
+  the `gvfs-fetcher` feature) speaks the GVFS v1 HTTP protocol used by
+  Azure DevOps Server and Azure Repos. Trade-offs in
   [docs/design/fetchers.md](docs/design/fetchers.md).
 - **Anticipatory header prefetch.**
   [`prefetch.rs`](crates/projgit-core/src/prefetch.rs) warms the header cache
@@ -267,7 +269,7 @@ What works today:
 - Linux/macOS FUSE backend through `fuser`.
 - `projgit mount` for refs, commits, and subtrees.
 - Tree, blob, and header caches, plus T1 readdir-time header prefetch.
-- Optional GVFS protocol fetcher behind the `gvfs-fetcher` feature.
+- Optional GVFS protocol fetcher (Azure DevOps Server / Azure Repos) behind the `gvfs-fetcher` Cargo feature.
 - Local test coverage for the core, CLI, projection filesystem, and FUSE smoke
   path, plus a network-gated end-to-end mount test against a real remote.
 

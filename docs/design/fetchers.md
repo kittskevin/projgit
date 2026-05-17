@@ -1,10 +1,11 @@
 # Design: Fetcher Strategy
 
 > Status: **current as of 2026-05-11**. URL-backed mounts use
-> `GitCliFetcher` as the default production path. `GixFetcher` remains
-> available as an experimental/native-Rust transport behind the `gix-fetcher`
-> feature. `GvfsFetcher` is available behind the `gvfs-fetcher` feature for
-> remotes that expose GVFS protocol endpoints.
+> `GitCliFetcher` as the default production path for stock Git remotes.
+> `GvfsFetcher` ships behind the `gvfs-fetcher` feature for **Azure DevOps
+> Server and Azure Repos**, which speak the GVFS v1 HTTP protocol natively.
+> `GixFetcher` remains available as an experimental/native-Rust transport
+> behind the `gix-fetcher` feature.
 
 ## Current Default
 
@@ -26,11 +27,14 @@ Reads and T1 header prefetch send object IDs to that child. In a partial clone,
 stock Git automatically treats missing objects as promisor-remote fetches and
 uses the protocol framing configured by the clone.
 
-## Optional GVFS Backend
+## GVFS Backend (Azure DevOps / Azure Repos)
 
-`GvfsFetcher` is an optional backend for remotes that support the GVFS v1 HTTP
-protocol. It is not selected automatically today; callers must build with the
-`gvfs-fetcher` feature and choose it explicitly:
+`GvfsFetcher` is the production backend for remotes that speak the GVFS v1
+HTTP protocol. The canonical examples are **Azure DevOps Server** and
+**Azure Repos**, which use GVFS for lazy object retrieval. It is not
+selected automatically (URL form doesn't uniquely identify a GVFS-capable
+remote yet); callers build with the `gvfs-fetcher` feature and choose it
+explicitly:
 
 ```sh
 cargo run -p projgit-cli --features gvfs-fetcher -- \

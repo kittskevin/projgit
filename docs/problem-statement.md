@@ -276,7 +276,7 @@ projgit's positioning, sharpened against the alternatives:
 
 | Trade-off | Choice | Why |
 |---|---|---|
-| Server | **Stock git remote** (anything that supports `--filter=blob:none`) | Works against GitHub / GitLab / SSH / your existing infra without deploying anything new. Loses the surgical-RPC wins of Mononoke. |
+| Server | **Whatever lazy-object protocol your upstream already exposes** — Git partial-clone promisor for stock remotes (GitHub / GitLab / SSH / Gitaly / Gitea / …), GVFS v1 HTTP for **Azure DevOps Server / Azure Repos** | Works against your existing infra without deploying anything new server-side. The `Fetcher` trait is the abstraction; backends ship per protocol. Loses the surgical-RPC wins of Mononoke. |
 | Read/write | **Read-only MVP** | Halves scope. Write path is real engineering; we'll address it via overlayfs (a separate doc) when needed. |
 | Storage format | **Stock git odb** (gix-compatible) | Tooling can read our store directly. No custom format to debug. Loses the per-blob-file random-access wins of a custom store. |
 | Daemon | **Optional for single mounts; required for §1's multiplexing** | One process per mount works for development and small-scale use; the `projgitd` daemon (designed but not built, Phase 6) is what delivers the "many containers, one upstream connection" property the §1 use case actually needs. |

@@ -139,7 +139,7 @@ subsystem traces back to a property in §1.
 
 | Subsystem                                   | Workload property it serves                                | File                                   |
 | ------------------------------------------- | ---------------------------------------------------------- | -------------------------------------- |
-| Lazy fetch (partial-clone promisor)         | Wide-shallow access (§1.1)                                 | [`fetchers.md`](fetchers.md)           |
+| Lazy fetch (pluggable per upstream protocol) | Wide-shallow access (§1.1)                                 | [`fetchers.md`](fetchers.md)           |
 | One CAS, many mounts                        | High parallelism + shared storage (§1.6)                   | [`../problem-statement.md`](../problem-statement.md) §3 |
 | Tree LRU                                    | Metadata storms repeat directory listings (§1.2)           | `crates/projgit-core/src/tree_cache.rs` |
 | Header LRU                                  | Metadata storms repeat header lookups (§1.2)               | `crates/projgit-core/src/header_cache.rs` |
@@ -156,14 +156,22 @@ subsystem traces back to a property in §1.
 If a planned subsystem doesn't trace cleanly to a property in §1,
 it probably isn't projgit's job.
 
-*Aside on `GvfsFetcher`:* an alternate fetcher backend exists in tree
-behind the `gvfs-fetcher` Cargo feature. It was useful while shaking out
-the `Fetcher` trait shape (second implementation forces the abstraction
-honest) but it does **not** trace to any §1 property — GitHub, GitLab,
-and Gitaly don't speak the GVFS protocol, so the motivating workload
-never exercises it. Per §6's discipline checklist it would not pass
-"is this projgit's job?" on its own merits. It's kept as a testbed for
-the trait, not as a planned production backend.
+*On the `Fetcher` trait having multiple backends:* "lazy fetch" is the
+§1.1 mapping, but "commodity Git server" is not a single protocol in the
+real world. The trait exists so projgit can serve different server classes
+with one projection engine. Two production backends ship today:
+
+- **`GitCliFetcher`** (default) — drives Git's partial-clone *promisor*
+  protocol via system `git`. Works against any commodity Git server
+  (GitHub, GitLab, Gitea, self-hosted Gitaly, …).
+- **`GvfsFetcher`** (behind the `gvfs-fetcher` Cargo feature) — speaks the
+  GVFS v1 HTTP protocol used by **Azure DevOps Server and Azure Repos**.
+  Selected with `--fetcher gvfs --gvfs-url …`.
+
+Both implement the same §1.1 mapping; they differ in which server-side
+protocol the upstream speaks. A native-Rust experimental `GixFetcher` and
+a test-only `NoopFetcher` also live in tree; see
+[`fetchers.md`](fetchers.md) for the per-backend trade-off discussion.
 
 ## 4. Two Properties Of The Architecture That Make Us Bold
 
