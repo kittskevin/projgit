@@ -44,11 +44,15 @@ pub use mount::{mount, mount_background, MountConfig};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use fuser::BackgroundSession;
 
-/// Marker constant: `true` on supported targets, `false` elsewhere.
-/// Useful for tests / runtime feature detection.
+/// Marker constant: `true` when the FUSE backend is built for this
+/// target and `mount`/`mount_background` actually work; `false`
+/// elsewhere. Mirrored by `projgit_winfsp::SUPPORTED` on Windows,
+/// where the meaning is the same: "this backend can serve a mount\
+/// today." Useful for tests / runtime feature detection.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub const SUPPORTED: bool = true;
 
-/// Marker constant: `false` on this target.
+/// Marker constant: `false` on this target. See the
+/// `target_os = "linux"`/`"macos"` arm above for the meaning.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub const SUPPORTED: bool = false;

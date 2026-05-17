@@ -20,6 +20,8 @@
 
 #![cfg(target_os = "windows")]
 
-/// Marker constant so the crate has something to compile on Windows.
-/// Set to `false` until the WinFsp backend actually lands.
+/// Marker constant. Same meaning as [`projgit_fuse::SUPPORTED`]:
+/// `true` when this crate's backend can actually serve a mount on
+/// this target. The WinFsp backend is not yet implemented (see the
+/// crate-level doc for status), so this is `false` even on Windows.
 pub const SUPPORTED: bool = false;

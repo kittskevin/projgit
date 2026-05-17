@@ -421,15 +421,24 @@ fn resolve_cache_dir(explicit: Option<&std::path::Path>) -> Result<PathBuf> {
 /// Uses `<basename>-<short_hash>`: the basename keeps the path
 /// human-readable, the hash prevents collisions between different
 /// remotes that share a basename (e.g. forks of `bar`).
+///
+/// The hash is computed over a **normalized** form of the URL so that
+/// trivial variations (`https://host/repo`, `https://host/repo.git`,
+/// `https://host/repo/`, case-only differences in scheme or host) all
+/// resolve to the same cache directory. This is what the README means
+/// by "one on-disk object store is shared across every mount": two
+/// `projgit mount` invocations of the same conceptual remote share
+/// the partial-clone cache and the projected blobs hydrated into it.
 fn cache_subdir_for_url(url: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
+    let canonical = canonicalize_url_for_hash(url);
     let mut h = DefaultHasher::new();
-    url.hash(&mut h);
+    canonical.hash(&mut h);
     let short = format!("{:016x}", h.finish());
 
-    let basename = url
+    let basename = canonical
         .trim_end_matches('/')
         .rsplit(['/', ':'])
         .find(|s| !s.is_empty())
@@ -448,6 +457,49 @@ fn cache_subdir_for_url(url: &str) -> String {
         .collect();
 
     format!("{safe}-{short}")
+}
+
+/// Normalize a remote URL for cache-key hashing.
+///
+/// Rules (conservative — only collapse forms that demonstrably point at
+/// the same upstream):
+/// - Trim surrounding whitespace.
+/// - Lowercase the scheme + authority (URI spec: case-insensitive).
+///   The path is left case-sensitive because git server semantics vary.
+/// - Strip a single trailing `/`.
+/// - Strip a single trailing `.git`.
+///
+/// We deliberately do **not** unify SSH and HTTPS forms: they have
+/// different auth contexts and a user who picked one over the other
+/// likely meant it. We also do not strip default ports or query
+/// strings; current sources for projgit don't carry them.
+fn canonicalize_url_for_hash(url: &str) -> String {
+    let trimmed = url.trim();
+    let lowered = if let Some(idx) = trimmed.find("://") {
+        // `scheme://authority/path` — lowercase up to and including
+        // the authority, leave the path alone.
+        let after_scheme = idx + 3;
+        let path_start = trimmed[after_scheme..]
+            .find('/')
+            .map(|p| after_scheme + p)
+            .unwrap_or(trimmed.len());
+        let mut s = String::with_capacity(trimmed.len());
+        s.push_str(&trimmed[..path_start].to_ascii_lowercase());
+        s.push_str(&trimmed[path_start..]);
+        s
+    } else if let Some(colon) = trimmed.find(':') {
+        // SSH short form `user@host:path` — lowercase up to and
+        // including the colon.
+        let mut s = String::with_capacity(trimmed.len());
+        s.push_str(&trimmed[..=colon].to_ascii_lowercase());
+        s.push_str(&trimmed[colon + 1..]);
+        s
+    } else {
+        trimmed.to_owned()
+    };
+    let stripped = lowered.trim_end_matches('/');
+    let stripped = stripped.strip_suffix(".git").unwrap_or(stripped);
+    stripped.to_owned()
 }
 
 #[cfg(test)]
@@ -498,5 +550,40 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
             "basename portion must be sanitized: {s}",
         );
+    }
+
+    #[test]
+    fn cache_subdir_dedupes_equivalent_urls() {
+        // Trivial URL variations that point at the same upstream must
+        // hash to the same cache subdir so the shared on-disk CAS is
+        // actually shared. (Audit finding D2.)
+        let canon = cache_subdir_for_url("https://github.com/foo/bar");
+        for equiv in [
+            "https://github.com/foo/bar",
+            "https://github.com/foo/bar.git",
+            "https://github.com/foo/bar/",
+            "https://github.com/foo/bar.git/",
+            "  https://github.com/foo/bar  ",
+            "HTTPS://GitHub.com/foo/bar",
+            "https://GITHUB.COM/foo/bar.git",
+        ] {
+            assert_eq!(
+                cache_subdir_for_url(equiv),
+                canon,
+                "expected `{equiv}` to share a cache dir with the canonical form"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_subdir_keeps_distinct_protocols_separate() {
+        // HTTPS and SSH are different access protocols (different auth
+        // contexts); a user who picked one likely meant it. Don't
+        // collapse them even though they reach the same upstream.
+        let https = cache_subdir_for_url("https://github.com/foo/bar");
+        let ssh = cache_subdir_for_url("git@github.com:foo/bar");
+        let sshlong = cache_subdir_for_url("ssh://git@github.com/foo/bar");
+        assert_ne!(https, ssh);
+        assert_ne!(https, sshlong);
     }
 }
