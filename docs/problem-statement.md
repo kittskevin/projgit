@@ -319,21 +319,23 @@ For the agent-eval use case specifically, this is what "shipped"
 means. None are arbitrary — each maps to a property an agent will
 notice or not notice.
 
-- A container can mount a commit in **<100 ms** end-to-end (process
-  start → directory walkable).
-- `os.walk('/workspace')` returns **every file in the commit** with
-  real size/mode/mtime, with first-walk latency bounded by directory
-  count × one batched RTT (not file count × RTT).
-- `cat <path>` returns correct bytes within **one upstream RTT** on
-  cold; under **1 ms** on warm.
-- `git log <path>` works inside the mount and returns real history
-  within **one upstream RTT** for a typical query.
-- Per-container disk overhead **<10 MiB** at steady state.
-- A single host can run **≥100 concurrent mounts** against the same
-  commit without each adding a separate upstream connection.
+| # | Criterion | Status |
+|---|-----------|--------|
+| 1 | A container can mount a commit in **<100 ms** end-to-end (process start → directory walkable). | **Unmeasured.** No bench captures process-start-to-mount latency yet. |
+| 2 | `os.walk('/workspace')` returns **every file in the commit** with real size/mode/mtime, with first-walk latency bounded by directory count × one batched RTT (not file count × RTT). | **Met.** `readdir` is blob-free; the network-gated end-to-end mount test and bench both validate the walk. |
+| 3 | `cat <path>` returns correct bytes within **one upstream RTT** on cold; under **1 ms** on warm. | **Partially met.** Warm is met (~0.5 ms per the bench). Cold currently issues one promisor fetch per file (~3× slower than `git cat-file` cold); closing the gap is the work in [design/fetch-coalescing.md](design/fetch-coalescing.md). |
+| 4 | `git log <path>` works inside the mount and returns real history within **one upstream RTT** for a typical query. | **Deferred.** Requires `.git/` synthesis content; the `RootOverlay` mechanism is shipped but no content is exposed by default (see [design/dotgit-synthesis.md](design/dotgit-synthesis.md)). |
+| 5 | Per-container disk overhead **<10 MiB** at steady state. | **Unmeasured.** No metric tracks per-mount steady-state disk. The shared on-disk CAS amortises cost across mounts of the same URL but per-mount overhead isn't quantified. |
+| 6 | A single host can run **≥100 concurrent mounts** against the same commit without each adding a separate upstream connection. | **Deferred.** Requires the `projgitd` daemon called out in §5's trade-off table. Per-process mounts today each hold their own upstream `git cat-file --batch-check` child and TLS session; the shared CAS dedupes object storage on disk but not upstream connections. |
 
 The first four are about agent perception. The last two are about
 operational viability.
+
+Three of the six are not met today and two are unmeasured. The project
+is structured to reach them — each gap traces to a named follow-up in
+this tree — but it does not currently claim to deliver them. The
+[README Status section](../README.md#status) lists the gaps in shipped
+terms and points back here.
 
 ## 8. What this document is not
 

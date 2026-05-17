@@ -152,10 +152,18 @@ subsystem traces back to a property in §1.
 | Network-gated tests + bench                 | Honest measurement of the shape we claim to serve          | [`../bench/baseline.md`](../bench/baseline.md) |
 | Fetch coalescing *(planned)*                      | Read storms (§1.2) + tolerance for over-fetching (§1.4)    | [`fetch-coalescing.md`](fetch-coalescing.md)     |
 | Anticipatory body prefetch *(planned)*      | Predictable ordering (§1.3) + tolerance (§1.4)             | [`fetch-coalescing.md`](fetch-coalescing.md)     |
-| GVFS as first-class second backend *(planned)* | Multi-backend bench credibility, server-side batching (§1.6) | [`fetchers.md`](fetchers.md), [`fetch-coalescing.md`](fetch-coalescing.md) |
 
 If a planned subsystem doesn't trace cleanly to a property in §1,
 it probably isn't projgit's job.
+
+*Aside on `GvfsFetcher`:* an alternate fetcher backend exists in tree
+behind the `gvfs-fetcher` Cargo feature. It was useful while shaking out
+the `Fetcher` trait shape (second implementation forces the abstraction
+honest) but it does **not** trace to any §1 property — GitHub, GitLab,
+and Gitaly don't speak the GVFS protocol, so the motivating workload
+never exercises it. Per §6's discipline checklist it would not pass
+"is this projgit's job?" on its own merits. It's kept as a testbed for
+the trait, not as a planned production backend.
 
 ## 4. Two Properties Of The Architecture That Make Us Bold
 

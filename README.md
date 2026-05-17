@@ -11,7 +11,7 @@ immediately; file contents arrive on `open()` through the same partial-clone
 promisor protocol GitHub already speaks. One on-disk object store is shared
 across every mount on the host.
 
-The motivating use case is agent-evaluation infrastructure: many short-lived
+The primary motivating use case is agent-evaluation infrastructure: many short-lived
 containers each pointed at a different commit, exploring a monorepo with
 sparse, unpredictable access patterns. The longer motivation, prior-art
 comparison (VFS for Git / Scalar, EdenFS, sparse-checkout), and concrete
@@ -21,7 +21,7 @@ success criteria are in [docs/problem-statement.md](docs/problem-statement.md).
 
 ```text
 ┌──────────────────────────────────────────────────────────┐
-│  ls, cat, ripgrep, language servers, agent tool calls    │
+│       ls, cat, language servers, agent tool calls        │
 └────────────────────────────┬─────────────────────────────┘
                              │  POSIX syscalls
                              ▼
@@ -280,6 +280,10 @@ What is deliberately deferred:
 - A long-running daemon for many concurrent mounts sharing one upstream
   connection.
 - Writes. The MVP is read-only.
+
+Each of these four items maps to a criterion in
+[problem-statement §7](docs/problem-statement.md#7-success-criteria); see
+that section for the per-criterion design-target-vs-shipped-scope status.
 
 ## Project Layout
 
