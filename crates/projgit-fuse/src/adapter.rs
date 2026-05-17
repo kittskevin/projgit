@@ -62,16 +62,20 @@ impl<F: FsProvider + 'static> Filesystem for ProjgitFuse<F> {
         Ok(())
     }
 
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.provider.lookup(parent.0, name.as_bytes()) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_fuser_attr(&attr), GENERATION),
+            Ok(attr) => reply.entry(
+                &ATTR_TTL,
+                &to_fuser_attr(&attr, req.uid(), req.gid()),
+                GENERATION,
+            ),
             Err(e) => reply.error(errno_for(&e)),
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.provider.getattr(ino.0) {
-            Ok(attr) => reply.attr(&ATTR_TTL, &to_fuser_attr(&attr)),
+            Ok(attr) => reply.attr(&ATTR_TTL, &to_fuser_attr(&attr, req.uid(), req.gid())),
             Err(e) => reply.error(errno_for(&e)),
         }
     }
@@ -182,7 +186,7 @@ fn to_fuser_kind(k: FileType) -> FuserFileType {
     }
 }
 
-fn to_fuser_attr(a: &Attr) -> FileAttr {
+fn to_fuser_attr(a: &Attr, req_uid: u32, req_gid: u32) -> FileAttr {
     let kind = to_fuser_kind(a.kind);
     FileAttr {
         ino: INodeNo(a.inode),
@@ -197,8 +201,15 @@ fn to_fuser_attr(a: &Attr) -> FileAttr {
         kind,
         perm: a.mode,
         nlink: a.nlink,
-        uid: a.uid,
-        gid: a.gid,
+        // Mirror the requesting process's uid/gid back as file
+        // ownership. The provider has no OS-level concept of "the
+        // mounting user"; the FUSE adapter does. Echoing per-request
+        // makes the mount look owned by whoever is asking, which is
+        // what `git`'s `safe.directory` check, IDE repo detection,
+        // and `ls -la` all expect. The `a.uid` / `a.gid` from the
+        // provider are ignored today (they default to 0 anyway).
+        uid: req_uid,
+        gid: req_gid,
         rdev: 0,
         flags: 0,
         blksize: 4096,
