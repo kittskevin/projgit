@@ -16,6 +16,10 @@ containers each pointed at a different commit, exploring a monorepo with
 sparse, unpredictable access patterns. The longer motivation, prior-art
 comparison (VFS for Git / Scalar, EdenFS, sparse-checkout), and concrete
 success criteria are in [docs/problem-statement.md](docs/problem-statement.md).
+The container-deployment topology (projgit on the host, projgit in a sidecar,
+projgit per container) — what works today, what's blocked, and the
+empirical experiments behind each claim — is written up in
+[docs/design/container-deployment.md](docs/design/container-deployment.md).
 
 ## Architecture
 

@@ -267,6 +267,20 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   into `docs/implementation/`; README clarifies no support / not
   for production. `SUPPORTED` const semantics unified across the
   two backend crates.
+- **`--allow-other` for container deployment (2026-05-18).** CLI
+  flag `projgit mount --allow-other` passes the kernel `allow_other`
+  FUSE mount option (via `MountConfig.acl = SessionACL::All`), which
+  is the single blocker for every container topology: without it,
+  even `root` gets `EACCES` because the kernel-level FUSE check
+  fires before our adapter sees the request. Verified end-to-end
+  in the devcontainer (cross-UID and cross-mount-namespace reads
+  both work; `git log` succeeds inside the mount). Non-root users
+  additionally need `user_allow_other` in `/etc/fuse.conf`; the
+  flag's help text + the new design doc both call this out. Full
+  topology framing, experiment log, and open follow-ups (attribute
+  cache vs per-op uid echo; non-root container user; mount
+  propagation) in
+  [`docs/design/container-deployment.md`](../design/container-deployment.md).
 
 ### Deferred / archived
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
@@ -561,21 +575,30 @@ conversations); the actionable items below are its top open findings.
    doing on purpose with a "if the cache dir gets weird, nuke and
    retry" stance. Smaller now that `--scenario sequential` proved
    the harness shape works.
-3. **B3: CI bench job.** README + bench doc claim the bench
+3. **Container T1 non-root user smoke test**
+   ([`docs/design/container-deployment.md`](../design/container-deployment.md) §5.1).
+   One docker invocation against a `--allow-other` mount, container
+   running as a non-root UID, `git -C /repo log -n 3`. Settles
+   whether T1 needs a `--uid` flag for real container deployments
+   or `--allow-other` alone is enough. Small, concrete, decides the
+   shape of the next docs/recipe round.
+4. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
    bench and compares to the checked-in baseline. Moderate.
-4. **Phase 3d. Production `projgit-winfsp`** on top of the
+5. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-5. **`projgit mount --background` + `projgit umount`.** Today the
-   foreground process owns the mount; a PID-file flow plus an
-   `umount` companion would let scripts manage many mounts.
-   Designs need a small mount registry under `$XDG_RUNTIME_DIR`.
-6. **`tracing-subscriber` wiring for the existing `-v` flag.** The
+6. **`projgit mount --background` + `projgit umount`.** Today the
+   foreground process owns the mount; **this is required for any
+   real container deployment** (T1 via systemd unit on the host,
+   T2 via container entrypoint). A PID-file flow plus an `umount`
+   companion would let scripts manage many mounts. Designs need a
+   small mount registry under `$XDG_RUNTIME_DIR`.
+7. **`tracing-subscriber` wiring for the existing `-v` flag.** The
    verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
    it. Wiring `tracing-subscriber` (with optional crate feature)
    would surface fetcher/provider events at `-v` / `-vv`.
