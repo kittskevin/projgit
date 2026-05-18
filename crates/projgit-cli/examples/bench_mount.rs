@@ -1,9 +1,23 @@
 //! Network-gated benchmark: time representative access patterns through
 //! projgit vs. system git's partial-clone path.
 //!
-//! Runs against `https://github.com/rust-lang/log` by default; pass
-//! `--url <URL> --ref <NAME>` for a different target. Doubly gated:
-//! needs `git` on `PATH` and `PROJGIT_NETWORK_TESTS=1` set.
+//! Runs against `https://github.com/rust-lang/log` by default. Override
+//! with `--url`, `--ref`, `--files`, `--iterations`, `--scenario`.
+//! Doubly gated: needs `git` on `PATH` and `PROJGIT_NETWORK_TESTS=1` set.
+//!
+//! Two scenarios:
+//! - `--scenario single` (default): one mount, cold + warm passes. The
+//!   shape captured in `docs/bench/baseline.md`.
+//! - `--scenario sequential`: same as single, then mounts a *second*
+//!   freshly-constructed `ObjectStore` against the same on-disk cache
+//!   dir and re-measures cold cat. Falsifies (or confirms) the
+//!   workload-doc §1.6 amortisation claim: "the first mount pays the
+//!   network cost; every subsequent mount sees a warm hit." In-process
+//!   caches are empty for mount 2 by construction (fresh
+//!   `ObjectStore`/`Fetcher`/`Provider`); the on-disk CAS is warm from
+//!   mount 1's cold reads. *Cross-process concurrent* mounts (the audit's
+//!   Phase C) are deliberately NOT exercised here; see
+//!   `docs/bench/baseline.md` for why.
 //!
 //! ```sh
 //! PROJGIT_NETWORK_TESTS=1 \
@@ -15,32 +29,79 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 const DEFAULT_URL: &str = "https://github.com/rust-lang/log";
 const DEFAULT_REF: &str = "master";
-const FILES: &[&str] = &["Cargo.toml", "src/lib.rs", "LICENSE-APACHE"];
-const ITERATIONS: usize = 3;
+const DEFAULT_FILES: &[&str] = &["Cargo.toml", "src/lib.rs", "LICENSE-APACHE"];
+const DEFAULT_ITERATIONS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Single,
+    Sequential,
+}
 
 #[derive(Debug, Clone)]
 struct Args {
     url: String,
     ref_name: String,
+    files: Vec<String>,
+    iterations: usize,
+    scenario: Scenario,
 }
 
 fn parse_args() -> Args {
     let mut url = DEFAULT_URL.to_owned();
     let mut ref_name = DEFAULT_REF.to_owned();
+    let mut files: Vec<String> = DEFAULT_FILES.iter().map(|s| (*s).to_owned()).collect();
+    let mut iterations = DEFAULT_ITERATIONS;
+    let mut scenario = Scenario::Single;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--url" => url = it.next().expect("--url needs a value"),
             "--ref" => ref_name = it.next().expect("--ref needs a value"),
+            "--files" => {
+                let v = it.next().expect("--files needs a comma-separated list");
+                files = v
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if files.is_empty() {
+                    eprintln!("--files must contain at least one path");
+                    std::process::exit(2);
+                }
+            }
+            "--iterations" => {
+                let v = it.next().expect("--iterations needs a value");
+                iterations = v.parse().unwrap_or_else(|_| {
+                    eprintln!("--iterations must be a positive integer");
+                    std::process::exit(2)
+                });
+                if iterations == 0 {
+                    eprintln!("--iterations must be > 0");
+                    std::process::exit(2);
+                }
+            }
+            "--scenario" => {
+                let v = it.next().expect("--scenario needs a value");
+                scenario = match v.as_str() {
+                    "single" => Scenario::Single,
+                    "sequential" => Scenario::Sequential,
+                    other => {
+                        eprintln!("unknown scenario: {other} (expected: single, sequential)");
+                        std::process::exit(2);
+                    }
+                };
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bench_mount [--url <URL>] [--ref <NAME>]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}",
+                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single",
+                    DEFAULT_FILES.join(","),
                 );
                 std::process::exit(0);
             }
@@ -50,7 +111,13 @@ fn parse_args() -> Args {
             }
         }
     }
-    Args { url, ref_name }
+    Args {
+        url,
+        ref_name,
+        files,
+        iterations,
+        scenario,
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -70,15 +137,15 @@ fn main() -> anyhow::Result<()> {
     let args = parse_args();
 
     eprintln!(
-        "bench_mount: {} @ {} ({} iterations)\n",
-        args.url, args.ref_name, ITERATIONS
+        "bench_mount: {} @ {} ({} iterations, scenario={:?}, files={:?})\n",
+        args.url, args.ref_name, args.iterations, args.scenario, args.files,
     );
 
-    let mut projgit_samples: Vec<ProjgitSample> = Vec::with_capacity(ITERATIONS);
-    let mut git_samples: Vec<GitSample> = Vec::with_capacity(ITERATIONS);
+    let mut projgit_samples: Vec<ProjgitSample> = Vec::with_capacity(args.iterations);
+    let mut git_samples: Vec<GitSample> = Vec::with_capacity(args.iterations);
 
-    for i in 1..=ITERATIONS {
-        eprintln!("== iteration {i}/{ITERATIONS} ==");
+    for i in 1..=args.iterations {
+        eprintln!("== iteration {i}/{} ==", args.iterations);
 
         eprint!("  projgit...   ");
         let p = bench_projgit(&args)?;
@@ -100,8 +167,12 @@ fn main() -> anyhow::Result<()> {
 // projgit side
 // -----------------------------------------------------------------------------
 
-/// Wall-clock timings for a single projgit iteration (one fresh
-/// partial clone + one mount).
+/// Wall-clock timings for a single projgit iteration. In `single`
+/// scenario this is one fresh partial clone + one mount. In
+/// `sequential` scenario this is one fresh partial clone + one mount
+/// (recorded in the cold/warm fields) + a second mount of a fresh
+/// `ObjectStore` against the same on-disk cache dir (recorded in
+/// `mount2_cold_cat`).
 #[derive(Debug, Clone)]
 struct ProjgitSample {
     /// `git clone --filter=blob:none --no-checkout` time.
@@ -110,7 +181,7 @@ struct ProjgitSample {
     cold_readdir_root: Duration,
     /// First recursive walk via projgit.
     cold_walk: Duration,
-    /// First `read_to_string` of [`FILES`].
+    /// First `read_to_string` of `args.files`.
     cold_cat: Duration,
     /// Second `read_dir` of mountpoint root.
     warm_readdir_root: Duration,
@@ -118,22 +189,22 @@ struct ProjgitSample {
     warm_walk: Duration,
     /// Second `read_to_string` of the same files.
     warm_cat: Duration,
+    /// `Sequential` only: cold `read_to_string` of `args.files` from a
+    /// freshly-constructed `ObjectStore` mounted against the same
+    /// cache dir as the first mount. Empty in-process caches, warm
+    /// on-disk CAS. This is the workload-doc §1.6 amortisation
+    /// falsifier: if this approaches `warm_cat`, §1.6 holds; if it
+    /// approaches `cold_cat`, the on-disk store isn't amortising and
+    /// there's a real finding.
+    mount2_cold_cat: Option<Duration>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
-    use projgit_core::{
-        clone::{git_dir_for, partial_clone, CloneOptions},
-        GitCliFetcher, HydratingObjectStore, ObjectStore, Projection, ProjectionFsProvider,
-        RootOverlay,
-    };
-    use projgit_fuse::{mount_background, MountConfig};
-    use std::sync::Arc;
+    use projgit_core::clone::{partial_clone, CloneOptions};
 
     let cache_dir = make_temp("projgit-bench-cache");
     let _cache_guard = DirGuard(cache_dir.clone());
-    let mountpoint = make_temp("projgit-bench-mp");
-    let _mp_guard = DirGuard(mountpoint.clone());
 
     // Partial clone (counted separately so the table is honest about
     // where the time goes).
@@ -144,7 +215,50 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
             .map_err(anyhow::Error::from)
     })?;
 
-    let store = Arc::new(ObjectStore::open(git_dir_for(&cache_dir))?);
+    let mount1 = projgit_mount_once(args, &cache_dir)?;
+
+    let mount2_cold_cat = match args.scenario {
+        Scenario::Single => None,
+        Scenario::Sequential => Some(projgit_remount_cold_cat(args, &cache_dir)?),
+    };
+
+    Ok(ProjgitSample {
+        partial_clone: partial_clone_t,
+        cold_readdir_root: mount1.cold_readdir_root,
+        cold_walk: mount1.cold_walk,
+        cold_cat: mount1.cold_cat,
+        warm_readdir_root: mount1.warm_readdir_root,
+        warm_walk: mount1.warm_walk,
+        warm_cat: mount1.warm_cat,
+        mount2_cold_cat,
+    })
+}
+
+/// Cold + warm timings collected from one mount session.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct MountTimings {
+    cold_readdir_root: Duration,
+    cold_walk: Duration,
+    cold_cat: Duration,
+    warm_readdir_root: Duration,
+    warm_walk: Duration,
+    warm_cat: Duration,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn projgit_mount_once(args: &Args, cache_dir: &Path) -> anyhow::Result<MountTimings> {
+    use projgit_core::{
+        clone::git_dir_for, GitCliFetcher, HydratingObjectStore, ObjectStore, Projection,
+        ProjectionFsProvider, RootOverlay,
+    };
+    use projgit_fuse::{mount_background, MountConfig};
+    use std::sync::Arc;
+
+    let mountpoint = make_temp("projgit-bench-mp");
+    let _mp_guard = DirGuard(mountpoint.clone());
+
+    let store = Arc::new(ObjectStore::open(git_dir_for(cache_dir))?);
     let fetcher = GitCliFetcher::open(store.clone())?;
     let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
     let provider = Arc::new(ProjectionFsProvider::new(
@@ -166,7 +280,7 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
         Ok::<_, anyhow::Error>(())
     })?;
     let cold_cat = time_it(|| {
-        for f in FILES {
+        for f in &args.files {
             let _ = std::fs::read_to_string(mountpoint.join(f))?;
         }
         Ok::<_, anyhow::Error>(())
@@ -183,15 +297,14 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
         Ok::<_, anyhow::Error>(())
     })?;
     let warm_cat = time_it(|| {
-        for f in FILES {
+        for f in &args.files {
             let _ = std::fs::read_to_string(mountpoint.join(f))?;
         }
         Ok::<_, anyhow::Error>(())
     })?;
 
     drop(session);
-    Ok(ProjgitSample {
-        partial_clone: partial_clone_t,
+    Ok(MountTimings {
         cold_readdir_root,
         cold_walk,
         cold_cat,
@@ -199,6 +312,46 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
         warm_walk,
         warm_cat,
     })
+}
+
+/// Sequential-scenario second mount. Constructs a fresh
+/// `ObjectStore`/`Fetcher`/`Provider` against the same on-disk cache
+/// dir as the first mount, then measures only cold-cat of `args.files`.
+/// See `ProjgitSample::mount2_cold_cat` for the interpretation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn projgit_remount_cold_cat(args: &Args, cache_dir: &Path) -> anyhow::Result<Duration> {
+    use projgit_core::{
+        clone::git_dir_for, GitCliFetcher, HydratingObjectStore, ObjectStore, Projection,
+        ProjectionFsProvider, RootOverlay,
+    };
+    use projgit_fuse::{mount_background, MountConfig};
+    use std::sync::Arc;
+
+    let mountpoint = make_temp("projgit-bench-mp2");
+    let _mp_guard = DirGuard(mountpoint.clone());
+
+    let store = Arc::new(ObjectStore::open(git_dir_for(cache_dir))?);
+    let fetcher = GitCliFetcher::open(store.clone())?;
+    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+    let provider = Arc::new(ProjectionFsProvider::new(
+        Projection::Ref(args.ref_name.clone()),
+        hydrating,
+        RootOverlay::new(),
+        /* projection_id */ 2,
+    )?);
+
+    let session = mount_background(provider, &mountpoint, &MountConfig::default())?;
+    wait_for_mount(&mountpoint, Duration::from_secs(10))?;
+
+    let cold_cat = time_it(|| {
+        for f in &args.files {
+            let _ = std::fs::read_to_string(mountpoint.join(f))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    drop(session);
+    Ok(cold_cat)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -271,7 +424,7 @@ fn bench_git_baseline(args: &Args) -> anyhow::Result<GitSample> {
     let ls_tree_root = time_it(|| run_git(Some(&dir), &["ls-tree", &args.ref_name]))?;
     let walk_ls_tree_r = time_it(|| run_git(Some(&dir), &["ls-tree", "-r", &args.ref_name]))?;
     let cat_blobs = time_it(|| {
-        for f in FILES {
+        for f in &args.files {
             run_git(
                 Some(&dir),
                 &["cat-file", "blob", &format!("{}:{}", args.ref_name, f)],
@@ -324,8 +477,8 @@ fn print_report(args: &Args, projgit: &[ProjgitSample], git: &[GitSample]) {
 
     println!("# bench_mount: {} @ {}\n", args.url, args.ref_name);
     println!(
-        "Median of {} iterations. All times in milliseconds.\n",
-        ITERATIONS
+        "Median of {} iterations, scenario `{:?}`. All times in milliseconds.\n",
+        args.iterations, args.scenario,
     );
     println!("## One-time setup\n");
     println!(
@@ -351,11 +504,37 @@ fn print_report(args: &Args, projgit: &[ProjgitSample], git: &[GitSample]) {
     );
     println!(
         "| cat {} files | {} | {} | {} |",
-        FILES.len(),
+        args.files.len(),
         ms(p_cold_cat),
         ms(p_warm_cat),
         ms(g_cat)
     );
+
+    if args.scenario == Scenario::Sequential {
+        let mount2: Vec<Duration> = projgit
+            .iter()
+            .filter_map(|s| s.mount2_cold_cat)
+            .collect();
+        if !mount2.is_empty() {
+            let p_m2 = median(mount2);
+            println!();
+            println!("## Cross-process amortisation (workload-doc §1.6)\n");
+            println!(
+                "A second mount in the same process, against the same on-disk\ncache dir, with a freshly-constructed `ObjectStore` (in-process\ncaches empty, on-disk CAS warm from mount 1). If `mount 2 cold`\napproaches `mount 1 warm`, §1.6 holds; if it approaches\n`mount 1 cold`, the on-disk store isn't amortising.\n"
+            );
+            println!(
+                "| Operation | mount 1 cold | mount 1 warm | **mount 2 cold (cross-process)** |"
+            );
+            println!("|---|---:|---:|---:|");
+            println!(
+                "| cat {} files | {} | {} | **{}** |",
+                args.files.len(),
+                ms(p_cold_cat),
+                ms(p_warm_cat),
+                ms(p_m2),
+            );
+        }
+    }
 }
 
 fn ms(d: Duration) -> String {
