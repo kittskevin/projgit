@@ -63,27 +63,35 @@ architectural lever: N mounts of the same commit pay the network cost once.
 
 Captured by [crates/projgit-cli/examples/bench_mount.rs](crates/projgit-cli/examples/bench_mount.rs)
 against `https://github.com/rust-lang/log` at `master`, median of 3 iterations,
-times in milliseconds. Full methodology in
-[docs/bench/baseline.md](docs/bench/baseline.md).
+times in milliseconds. Full methodology, plus a second target
+(`rust-lang/cargo`, ~1,200 files) and the sequential two-mount scenario,
+in [docs/bench/baseline.md](docs/bench/baseline.md).
 
 | Operation              | projgit cold | projgit warm | git baseline |
 | ---------------------- | -----------: | -----------: | -----------: |
-| `readdir` of root      |        0.93 |        0.97 |        6.78 |
-| recursive walk         |        8.04 |        1.57 |        5.67 |
-| `cat` 3 files          |     8,754.7 |        0.48 |     2,904.3 |
+| `readdir` of root      |         0.27 |         0.16 |         4.14 |
+| recursive walk         |         2.12 |         0.93 |         4.32 |
+| `cat` 3 files          |      3,398.1 |         0.26 |      1,192.5 |
 
 `git baseline` is `git ls-tree` and `git cat-file blob` against a fresh
 `git clone --filter=blob:none --no-checkout` of the same repo.
 
-- `readdir` is **~7×** faster than `git ls-tree` even cold; tree objects
+- `readdir` is **~15×** faster than `git ls-tree` even cold; tree objects
   ship with the partial clone and projgit serves them in-process.
-- Warm reads are **~6,000×** faster than the git baseline because the
+- Warm reads are **~4,500×** faster than the git baseline because the
   bytes live in projgit's small-blob LRU cache.
+- **A second mount sees a warm hit on the on-disk CAS.** Cold cat of
+  the same files in a fresh `ObjectStore` mounted against the same
+  cache dir takes **~1 ms** vs ~3,400 ms for mount 1 cold — a ~3,000×
+  cross-mount speedup that backs up the "N mounts pay the network
+  cost once" claim above. Validates workload §1.6; see the sequential
+  scenario in [docs/bench/baseline.md](docs/bench/baseline.md).
 - Cold first-read of an uncached file is currently **slower** than
-  `git cat-file` cold; `GitCliFetcher` issues one promisor fetch per
-  fault and does not yet batch blob requests. This is the next fetcher
-  improvement (designed in [docs/design/fetch-coalescing.md](docs/design/fetch-coalescing.md));
-  the bench exists to catch when it changes.
+  `git cat-file` cold (~2.8× on `log`, ~6× on `cargo`); `GitCliFetcher`
+  issues one promisor fetch per fault. This cold path is treated as
+  structural per the fetch-coalescing retraction
+  ([docs/design/fetch-coalescing.md §9.5](docs/design/fetch-coalescing.md));
+  the bench exists to catch if it changes.
 
 Reproduce on Linux/macOS:
 
