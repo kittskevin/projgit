@@ -1,6 +1,12 @@
 # Design: Fetch Coalescing
 
-> Status 5/11/2026 Not implemented
+> Status 2026-05-18: **Investigated, deprioritized.** An earlier
+> implementation attempt tried several strategies from §6; none
+> measurably closed the cold 3-file `cat` gap from
+> [`../bench/baseline.md`](../bench/baseline.md). See §9.5 for the
+> empirical update and why the §7 recommended build order is
+> retracted. This doc is preserved as design-space exploration; do
+> not implement §7 as written without first revisiting §9.5.
 >
 > Companion to [`docs/design/workload.md`](workload.md) (the workload
 > shape this work serves), [`docs/design/fetchers.md`](fetchers.md),
@@ -371,6 +377,58 @@ this work:
   present and skip it.
 - **Adaptive window.** Worth experimenting with later, but not
   in the first cut.
+
+### 9.5 Empirical update (2026-05-18): investigated, deprioritized
+
+An earlier implementation attempt explored several strategies from
+§6 (reactive coalescing alone, anticipatory body prefetch alone, and
+combinations). **None measurably closed the cold 3-file `cat` gap**
+from [`../bench/baseline.md`](../bench/baseline.md). The most
+aggressive variant (high anticipatory-prefetch budget) destabilized
+the host badly enough to require a reboot before measurement could
+finish; that attempt's code is not in the repo.
+
+The central assumption of §1 — that "three OIDs = three serial
+protocol exchanges" and therefore that batching shrinks the cold
+path — did not hold against modern GitHub's promisor protocol.
+Likely reasons (any combination):
+
+1. **The existing long-lived `git cat-file --batch-check` child
+   already amortizes** TLS handshake and process-fork costs across
+   all OIDs in a mount session. The "per-OID overhead" the doc
+   anchored on was already paid once, not per-fault.
+2. **Server-side per-OID work scales linearly** with `#OIDs`
+   regardless of how the client requests them. The wire shape
+   (one `git fetch` for N OIDs vs N `git fetch` for 1 OID each)
+   doesn't change the total work GitHub does to resolve and stream
+   the objects.
+3. **Local pack-creation overhead is incurred per fetch.** Each
+   batch lands a new pack on disk; this is the dominant local cost
+   for many small fetches. Batching reduces pack count but doesn't
+   eliminate it, and anticipatory prefetch *amplifies* it — which
+   is probably what destabilized the host (§9 "pack proliferation"
+   risk surfacing as the primary failure mode rather than as a
+   background concern).
+
+**§7's recommended Design C build order is retracted.**
+Re-implementing it as written re-discovers the same negative result
+and risks the same instability. If the cold gap from
+[`../bench/baseline.md`](../bench/baseline.md) ever needs closing,
+the lever is not batching — it is cost attribution of a single
+cold fetch (network transfer vs server response vs client-side
+pack write vs `gix`-side decompression), followed by addressing the
+actual bottleneck.
+
+Downstream consequences captured elsewhere:
+
+- [`../problem-statement.md`](../problem-statement.md) §7 criterion
+  #3 is treated as **"Partially met (cold path is structural)."**
+  Warm reads stay fast; cold reads are network-bound by design
+  given the partial-clone-promisor backend, and projgit does not
+  currently claim a path to "Met."
+- The session audit log drops fetch coalescing from its actionable
+  list. Other audit items (multi-process / larger-repo bench;
+  ref-visibility A2; Windows de-emphasis) carry higher leverage.
 
 ## 10. De-risking Spike Before Coding
 
