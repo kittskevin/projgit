@@ -75,12 +75,24 @@ that can land any time without disturbing the engine.
 
 Each variant is a strict superset of the previous one.
 
+> **Note added 2026-05-17:** building A1 and using it in practice surfaced
+> that the original A0→A1→A2→A3 sequence conflates two orthogonal axes:
+> **ref visibility** (A2's domain) and **working-tree comparison
+> cleanliness** (which the doc had bundled into A3 because it tied "index"
+> to "*writable* index"). A read-only `.git/index` matching HEAD with
+> `ASSUME_VALID` set fixes the read verbs (`git status`, `git diff`,
+> `git ls-files`) without taking on any of the writable-illusion
+> machinery. That rung is **A1+** below; the full design is in
+> [`dotgit-index.md`](dotgit-index.md). The original A1/A2/A3 ordering is
+> preserved as historical record.
+
 | Variant | Contents of `.git/` | Tools enabled by this rung |
 |---|---|---|
-| **A0 \u2014 Marker only** | `HEAD` containing the commit OID (detached form) | "Is this a repo?" detection (`rg`, `cargo`, IDE root detection) |
-| **A1 \u2014 Minimal repo** | A0 + `config`, `objects/info/alternates` \u2192 shared store, empty `refs/`, empty `packed-refs` | `git rev-parse HEAD`, `git log`, `git cat-file`, `git show`, `git diff <ref>..<ref>` |
-| **A2 \u2014 Refs visible** | A1 + symbolic `HEAD` \u2192 `refs/heads/<name>`, plus `refs/heads/<name>` file with the OID, when projection is a `Ref` | A1 + `git branch --show-current`, IDE branch indicator, `git log --all` (sees the one ref) |
-| **A3 \u2014 Writable illusion** | A2 + writable `index`, `ORIG_HEAD`, reflog, hooks dir | A2 + `git status`, `git diff` against working tree, IDE file-level VCS decoration |
+| **A0 — Marker only** | `HEAD` containing the commit OID (detached form) | "Is this a repo?" detection (`rg`, `cargo`, IDE root detection) |
+| **A1 — Minimal repo** | A0 + `config`, `objects/info/alternates` → shared store, empty `refs/`, empty `packed-refs` | `git rev-parse HEAD`, `git log`, `git cat-file`, `git show`, `git diff <ref>..<ref>` |
+| **A1+ — Clean index** | A1 + `index` populated from HEAD's tree, every entry `ASSUME_VALID` | A1 + `git status` ("nothing to commit"), `git diff` empty, `git diff --cached` empty, `git ls-files` populated. See [`dotgit-index.md`](dotgit-index.md). |
+| **A2 — Refs visible** | A1 + symbolic `HEAD` → `refs/heads/<name>`, plus `refs/heads/<name>` file with the OID, when projection is a `Ref` | A1 + `git branch --show-current`, IDE branch indicator, `git log --all` (sees the one ref). Independent of A1+; composes. |
+| **A3 — Writable illusion** | A2 + writable `index`, `ORIG_HEAD`, reflog, hooks dir | A2 + `git add`, `git commit` (against a discarded scratch overlay), IDE file-level VCS decoration |
 
 ### 4.2 Within "no `.git/`" \u2014 the B variants
 
@@ -116,6 +128,12 @@ Two asymmetries dominate:
    matrix \u2014 looks like a repo, breaks on common verbs. Only A3 fixes
    them; B / B+ avoid them by being honestly not-a-repo.
 
+> **A1+ note:** the A1+ rung introduced in §4 fixes the `git status` /
+> `git diff --cached` / `git ls-files` cells without making them writable.
+> An A1+ column would turn the four ❌ / ⚠️ cells for those three rows
+> (under A0 / A1) into ✅; cells outside those rows are unchanged from A1.
+> Full per-cell deltas live in [`dotgit-index.md`](dotgit-index.md) §2.
+
 ## 6. Implementation complexity
 
 Rough LOC estimates including tests; assumes `RootOverlay` already
@@ -125,8 +143,9 @@ exists.
 |---|---|---|---|
 | A0 | ~50 | none | none |
 | A1 | ~250 | virtual subdir tree under `.git/`; alternates path resolution | path normalization on Windows |
-| A2 | ~400 | A1 + ref \u2194 commit awareness in projection state | same as A1 |
-| A3 | ~2000+ | writable scratch overlay per mount, lock-file emulation, index synthesis | significant; index format is fiddly, lock files behave differently across OSes |
+| A1+ | A1 + ~200 | tree-walk via `gix_index::State::from_tree`; serialize with `ASSUME_VALID` flag set per entry | none beyond A1 |
+| A2 | A1 + ~150 | ref ↔ commit awareness in projection state; orthogonal to A1+ | same as A1 |
+| A3 | A2 + ~1700 | writable scratch overlay per mount, lock-file emulation, writable index, reflog | significant; lock files behave differently across OSes |
 | B | 0 | none | none |
 | B+ | ~80 | one synthetic file in `RootOverlay` | none |
 
@@ -307,6 +326,21 @@ failures, alternates path leak in `git config --list`). They are
 acceptable given the read-only contract is the same one the rest of
 projgit advertises. The R1 sentinel design and A2 / A3 variants stay
 deferred per §9.2 and §9.4.
+
+### 9.6 Planned next: A1+ (clean read-only index)
+
+The original A0→A1→A2→A3 sequence conflated **ref visibility** (A2's
+domain) and **working-tree comparison cleanliness** (which the doc had
+bundled into A3 because it tied "index" to "*writable* index"). They are
+actually independent axes. A1+ is the read-only-index rung that closes
+the `git status` / `git diff --cached` / `git ls-files` cells without
+taking on any of the writable-illusion machinery.
+
+The full design — mechanism (`gix_index::State::from_tree` plus the
+`ASSUME_VALID` flag), risk analysis, test plan — lives in
+[`dotgit-index.md`](dotgit-index.md). When A1+ ships, this section will
+be updated to record what landed; A2 (ref visibility) stays
+independently deferred.
 
 ## 10. `RootOverlay` mechanism \u2014 the architectural commitment
 
