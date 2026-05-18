@@ -142,6 +142,66 @@ the object store with the first mount. See [docs/EXAMPLES.md](docs/EXAMPLES.md)
 for more command examples, and `projgit mount --help` for the full flag
 surface (refs, commits, subtrees, `--offline`, alternate fetchers).
 
+## What works inside a projgit mount
+
+The mount looks like a real checkout of the projection's commit. By default
+`.git/` is synthesized at the mount root — detached `HEAD` pointing at the
+commit, a populated `index` with `ASSUME_VALID` set on every entry, and
+`objects/info/alternates` reaching the shared partial-clone objects:
+
+```text
+.git/
+├── HEAD                       (detached: "<commit-oid>\n")
+├── config                     (minimal [core] config)
+├── index                      (matches HEAD; ASSUME_VALID per entry)
+├── packed-refs                (empty)
+├── refs/{heads,tags}/         (empty)
+└── objects/info/alternates    (absolute path to the shared objects/ dir)
+```
+
+Tools that walk upward for `.git/` treat the mount as a normal repository.
+The FUSE adapter echoes the requesting process's `uid`/`gid` back as file
+ownership, so git's `safe.directory` check passes without any user setup.
+
+**Works with no user setup:**
+
+| Command (inside the mount)              | Result                                                                |
+| --------------------------------------- | --------------------------------------------------------------------- |
+| `git rev-parse HEAD`                    | Returns the projection's commit OID                                   |
+| `git log`, `git log -- <path>`          | Walks history through the alternates objects                          |
+| `git cat-file -p HEAD`, `git show <oid>`| Inspects any object reachable from the partial clone                  |
+| `git status` / `git status --porcelain` | "nothing to commit, working tree clean" / empty                       |
+| `git diff` / `git diff --cached`        | Both empty                                                            |
+| `git ls-files`                          | Returns the projection's file list                                    |
+| `cargo build` source-control stamping   | Picks up the commit OID                                               |
+| `ripgrep`, `fd`, IDE repo detection     | Treat the mount as a repo; respect the projection's `.gitignore`      |
+
+**Deliberately doesn't work** (the mount is a read-only view of one commit):
+
+- Any write verb — `git add`, `git commit`, `git stash`, `git update-index`
+  fail with "permission denied". The mount has no writable working tree.
+- Branch-aware output — `git branch --show-current` prints `HEAD` rather
+  than the branch name; IDE branch indicators show "detached HEAD". This
+  needs **A2** ref visibility (deferred — see
+  [docs/design/dotgit-synthesis.md](docs/design/dotgit-synthesis.md) §4).
+- `git log --all` sees only `HEAD` (same reason — no refs visible).
+- `git push`, `git fetch`, `git checkout <other>` — projection identity is
+  fixed at mount time; switching commits means mounting a different
+  projection.
+
+**Opt-outs:**
+
+- `projgit mount … --no-dotgit` — pure projected tree, no `.git/` at all.
+- `--subtree <path>` mounts skip `.git/` synthesis automatically; a `HEAD`
+  describing the full commit while the user browses only a subtree would
+  create surprising `git log <path>` semantics.
+
+The design ladder (A0 / A1 / A1+ / A2 / A3), why A1+ is the current
+shipped default, and what's still deferred all live in
+[docs/design/dotgit-synthesis.md](docs/design/dotgit-synthesis.md) (parent
+ladder) and [docs/design/dotgit-index.md](docs/design/dotgit-index.md)
+(A1+ index synthesis specifically).
+
 ## Engineering Highlights
 
 Pieces worth pointing at if you're skimming the code:
