@@ -1,10 +1,10 @@
 # Design: Container Deployment Topology
 
-> Status: **T1 verified end-to-end as of 2026-05-18**; T2 follows the
-> same shape; T3 unverified pending the Phase C bench. Captures the
-> deployment shapes projgit's workload pitch implicitly relies on,
-> what's actually shipped today, what's blocked, and the empirical
-> evidence behind each claim.
+> Status: **T1 verified end-to-end (including non-root container user)
+> as of 2026-05-18**; T2 follows the same shape; T3 unverified pending
+> the Phase C bench. Captures the deployment shapes projgit's workload
+> pitch implicitly relies on, what's actually shipped today, what's
+> blocked, and the empirical evidence behind each claim.
 >
 > Read this alongside [`workload.md`](workload.md) §1.6 (the
 > "many short-lived processes per host" claim that motivates
@@ -203,49 +203,95 @@ subsequent readers regardless of UID.
 
 For containers, the practical implication: in a shared mount, the
 first reader after the mount comes up effectively defines the apparent
-owner of every touched file for `ATTR_TTL`. For T1 with a stable
-`projgit-svc` user this is fine (the mount appears owned by
-`projgit-svc` for everyone, and containers configure their `git
-safe.directory` once). For multi-tenant T3 it would be weird and
-worth a follow-up.
+owner of every touched file for `ATTR_TTL`. In the canonical T1
+deployment this is fine — see §5.1 below, where the empirical smoke
+test shows the in-container UID is the first reader of nested inodes
+and gets the cache populated correctly for its own use.
 
-Possible future fixes, in roughly increasing complexity:
+Possible future fixes if a multi-reader-different-UID scenario ever
+surfaces, in roughly increasing complexity:
 
 - **`--uid <N> --gid <N>` flag** that bypasses per-op echo and sets
-  fixed ownership. Trivial. Best matches the T1 sysadmin model
-  ("mount as `projgit-svc`, files appear owned by `projgit-svc`,
-  containers run as `projgit-svc`").
+  fixed ownership. Trivial. Best matches a sysadmin model where
+  multiple consumers want to see the same owner regardless of who
+  asked first.
 - **Shorter `ATTR_TTL`.** Cheap. Trades cache hit rate for ownership
   freshness. Projections are immutable, so the cache buys a lot —
   trimming it has real performance cost.
 - **Custom kernel-cache invalidation** via fuser's notify channel
   when we see access from a new UID. Most correct, most complex.
 
-Not blocking T1 today, but the doc that ships container deployment
-needs to call this out so a sysadmin isn't surprised.
+Not blocking T1 today.
 
 ## 5. Open issues and follow-ups
 
 ### 5.1 Non-root user inside the container (untested)
 
-Every test in §2 ran as root or `vscode`. A common Docker security
-practice is to run containers as a non-root UID (often 1000 or some
-service-account UID). With `--allow-other`, the in-container reader's
-UID asks the FUSE driver, which now lets them in — but the attr-cache
-behaviour from §4 still applies, and `git`'s `safe.directory` check
-will care about whether the mount's `.git/` appears owned by the
-in-container UID.
+### 5.1 Non-root user inside the container — **RESOLVED 2026-05-18**
 
-Concrete test we should run before claiming T1 works in production:
+Originally an open question: would `--allow-other` alone be enough
+for the typical Docker security practice of running containers as a
+non-root UID, or would we also need a `--uid` flag (the hypothesis
+from §4)?
 
-```sh
-projgit mount … --allow-other &   # as svc user
-docker run --rm -u 1000:1000 -v /tmp/mp-exp:/repo:ro,bind-propagation=rslave \
-  alpine sh -c 'apk add git && git -C /repo log --oneline -n 3'
+**Empirically resolved with a non-root smoke test inside a fresh
+mount namespace.** `unshare --mount + mount --bind /tmp/mp-exp` is the
+exact kernel mechanism Docker's `-v` uses; `setpriv --reuid=5000
+--regid=5000 --clear-groups` proxies for the in-container UID. The
+mount was established by `vscode` (uid 1000) with `--allow-other`;
+UID 5000 was the first reader of any nested inode.
+
+```text
+--- whoami as UID 5000 ---
+uid=5000 gid=5000 groups=5000
+
+--- ls -la Cargo.toml as UID 5000 ---
+-rw-r--r-- 1 5000 5000 1122 May 18 05:13 /mnt/repo/Cargo.toml
+
+--- ls -la .git as UID 5000 (safe.directory cares about this) ---
+-rw-r--r-- 1 5000 5000   93 May 18 05:13 config
+-rw-r--r-- 1 5000 5000   41 May 18 05:13 HEAD
+-rw-r--r-- 1 5000 5000 6560 May 18 05:13 index
+drwxr-xr-x 2 5000 5000    0 May 18 05:13 objects
+
+--- git rev-parse HEAD as UID 5000 ---
+c3c3c79f62de8aa939b8fe1d01992f7fed3aefde
+
+--- git log -n 3 as UID 5000 ---
+c3c3c79 (HEAD) docs(design): container deployment topology + experiment results
+9441265 feat(cli): add --allow-other for cross-UID / container access
+56babe6 docs(handoff): close B1+B2 + add Phase C to next-up list
 ```
 
-If `safe.directory` trips, the `--uid` flag from §4 is probably the
-right fix.
+`.git/HEAD`, `.git/config`, `.git/index`, and `.git/objects/` all
+appear owned by `5000:5000`. `safe.directory` does *not* trip.
+`git rev-parse HEAD` and `git log` both succeed.
+
+**Why it works in this case:** §4's attr-cache observation is "the
+first reader's UID wins for ATTR_TTL." In a real container
+deployment, the typical sequence is: projgit mounts (as some
+`projgit-svc` UID, no nested reads yet), the container starts and
+reads via the bind, the container *is* the first reader of those
+inodes. The cache populates with the container's UID and serves it
+back to that container for the rest of its short life. The §4 finding
+is a non-issue for the canonical T1 deployment.
+
+**Caveats this resolution does NOT cover:**
+
+- **Multiple containers as different UIDs reading the same mount.**
+  The first reader still wins ATTR_TTL-wide; the second container
+  (different UID) would see files owned by the first. For a single
+  shared service account this is a non-issue. For multi-tenant T3
+  it would matter — but T3 has bigger open questions (Phase C).
+- **`projgit-svc` reading the mount itself** (e.g. a monitoring
+  script that `ls` the mount). That would populate the cache as
+  `projgit-svc`-owned and the container would see those attrs
+  until `ATTR_TTL` expires. Easy operational rule: the supervising
+  process should not stat the mount contents itself.
+
+**Implication:** the `--uid` flag hypothesized in §4 is not needed
+for the canonical T1 deployment. Keep it in the future-fixes list
+only if a multi-reader scenario surfaces.
 
 ### 5.2 Mount propagation if projgit restarts
 
@@ -307,16 +353,17 @@ text is enough to make the decision.
 ## 7. Recommendation: smallest credible "deploy projgit in containers" path
 
 1. **`--allow-other` flag** — done (commit 9441265, 2026-05-18).
-2. **`projgit mount --background` + `projgit umount`** — already on
+2. **Non-root container user smoke test** — done (§5.1, resolved
+   2026-05-18). `--allow-other` alone is sufficient; the `--uid`
+   flag from §4 is not needed for the canonical T1 case.
+3. **`projgit mount --background` + `projgit umount`** — already on
    the [handoff](../implementation/handoff.md) "What I'd do next" list.
    Required for any real deployment because the foreground process
    currently owns the mount.
-3. **Smoke-test non-root container user end-to-end** (§5.1). One
-   docker invocation. Decides whether the `--uid` flag from §4 is
-   needed for T1 or just nice-to-have.
-4. **Document deployment recipe** in `docs/` once the smoke test
-   passes: `/etc/fuse.conf`, `bind-propagation`, a sample systemd
-   unit, an example Docker invocation.
+4. **Document deployment recipe** in `docs/`:
+   `/etc/fuse.conf`, `bind-propagation`, a sample systemd unit, an
+   example Docker invocation. Sensible after `--background` lands so
+   the recipe references a real supervised mount path.
 5. **Phase C bench** — settles whether T3 is viable as-is or needs
    A3.
 6. **Cross-process single-flight (A3) or `projgitd`** — only if
