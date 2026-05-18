@@ -23,9 +23,12 @@ repository = "https://github.com/KittsKevin/projgit"
 [workspace.dependencies]
 # Pinned to the same major version Phase 0a validated. The default
 # transport features stay off here; only the crates that actually drive
-# network I/O (the Fetcher in Phase 2) opt them in.
+# network I/O (the Fetcher in Phase 2) opt them in. The `index` feature
+# is needed by `projgit-core::dotgit` for `.git/index` synthesis (see
+# `docs/design/dotgit-index.md`); it adds no runtime cost when unused.
 gix = { version = "0.66", default-features = false, features = [
     "max-performance-safe",
+    "index",
 ] }
 bstr = "1"
 thiserror = "1"

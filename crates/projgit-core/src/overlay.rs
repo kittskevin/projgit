@@ -122,6 +122,15 @@ impl RootOverlay {
         self.entries.get(BStr::new(name))
     }
 
+    /// Look up a top-level entry by name, returning a mutable
+    /// reference. Used by content-shipping helpers that compose on top
+    /// of a base overlay (e.g. [`crate::dotgit::a1_plus_overlay`]
+    /// splicing a synthetic `.git/index` into the `.git/` directory
+    /// produced by [`crate::dotgit::a1_overlay`]).
+    pub fn get_mut(&mut self, name: &[u8]) -> Option<&mut SyntheticEntry> {
+        self.entries.get_mut(BStr::new(name))
+    }
+
     /// Iterate over (name, entry) pairs in sorted order.
     pub fn iter(&self) -> impl Iterator<Item = (&BString, &SyntheticEntry)> {
         self.entries.iter()

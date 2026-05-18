@@ -327,7 +327,7 @@ acceptable given the read-only contract is the same one the rest of
 projgit advertises. The R1 sentinel design and A2 / A3 variants stay
 deferred per §9.2 and §9.4.
 
-### 9.6 Planned next: A1+ (clean read-only index)
+### 9.6 Shipped (2026-05-18): A1+ clean read-only index
 
 The original A0→A1→A2→A3 sequence conflated **ref visibility** (A2's
 domain) and **working-tree comparison cleanliness** (which the doc had
@@ -336,11 +336,23 @@ actually independent axes. A1+ is the read-only-index rung that closes
 the `git status` / `git diff --cached` / `git ls-files` cells without
 taking on any of the writable-illusion machinery.
 
-The full design — mechanism (`gix_index::State::from_tree` plus the
-`ASSUME_VALID` flag), risk analysis, test plan — lives in
-[`dotgit-index.md`](dotgit-index.md). When A1+ ships, this section will
-be updated to record what landed; A2 (ref visibility) stays
-independently deferred.
+Shipped as:
+
+- **`crate::dotgit::a1_plus_overlay(store, commit_oid, objects_dir)`**
+  in `projgit-core` builds an A1 overlay then splices in a synthetic,
+  read-only `.git/index` matching HEAD with every entry's
+  `ASSUME_VALID` flag set.
+- **`projgit mount` synthesizes A1+ by default** for `Ref` / `Commit`
+  projections (was A1; `Subtree` and `--no-dotgit` still opt out).
+- **5 unit/integration tests** in
+  `crates/projgit-core/tests/dotgit_index.rs` + **1 live e2e test**
+  in `crates/projgit-fuse/tests/mount_real_remote.rs` (network-gated)
+  that asserts `git status` reports "nothing to commit, working tree
+  clean" inside the mount.
+
+A2 (ref visibility) stays independently deferred; the axis split made
+it a cleaner standalone decision than it was when bundled. Full design
+in [`dotgit-index.md`](dotgit-index.md).
 
 ## 10. `RootOverlay` mechanism \u2014 the architectural commitment
 

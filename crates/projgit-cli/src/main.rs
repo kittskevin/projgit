@@ -419,9 +419,10 @@ fn looks_like_url(s: &str) -> bool {
 }
 
 /// Construct the `RootOverlay` for the mount based on the user's flags
-/// and the projection kind. Default behavior synthesizes an A1 `.git/`
-/// pointing at the commit and the shared object store; `--no-dotgit` or
-/// a `Subtree` projection yields an empty overlay.
+/// and the projection kind. Default behavior synthesizes an A1+ `.git/`
+/// (A1 plus a clean read-only `.git/index` matching HEAD) pointing at
+/// the commit and the shared object store; `--no-dotgit` or a `Subtree`
+/// projection yields an empty overlay.
 fn build_root_overlay(
     args: &MountArgs,
     projection: &projgit_core::Projection,
@@ -447,7 +448,7 @@ fn build_root_overlay(
     let objects_dir = git_dir.join("objects");
     let objects_dir = std::fs::canonicalize(&objects_dir)
         .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    Ok(dotgit::a1_overlay(commit_oid, &objects_dir))
+    dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")
 }
 
 /// Default cache root. Honours `XDG_CACHE_HOME`; falls back to

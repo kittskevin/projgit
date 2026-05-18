@@ -260,7 +260,8 @@ e:\repos\gitfs\
 │       ├── winfsp-implementation-plan.md  Windows backend resume plan
 │       ├── prefetch.md              T1 implemented; later tiers designed
 │       ├── windows-symlinks.md      decided
-│       └── dotgit-synthesis.md      A1 variant shipped 2026-05-17
+│       ├── dotgit-synthesis.md      parent ladder; A2/A3 still deferred
+│       └── dotgit-index.md          A1+ index synthesis shipped 2026-05-18
 └── .github/
     ├── workflows/ci.yml             fmt + clippy + tests
     └── skills/commit-work/          preferred commit workflow

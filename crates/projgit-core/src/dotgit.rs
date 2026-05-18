@@ -26,11 +26,16 @@
 //! `.git/objects/info/alternates`. Acceptable for the local per-eval-
 //! container use case but worth noting before sharing logs from a mount.
 //!
-//! Per the design ladder in `docs/design/dotgit-synthesis.md`, this is
-//! variant A1. The richer A2 (symbolic HEAD pointing at a real ref + the
-//! ref file populated) and A3 (writable illusion) are deferred follow-ups.
+//! Per the design ladder in `docs/design/dotgit-synthesis.md`, this module
+//! ships **A1** ([`a1_overlay`]) and **A1+** ([`a1_plus_overlay`], which
+//! adds a clean read-only `.git/index` matching HEAD; see
+//! `docs/design/dotgit-index.md`). The richer A2 (symbolic HEAD pointing
+//! at a real ref + the ref file populated) and A3 (writable illusion)
+//! are deferred follow-ups.
 
+use crate::object_store::ObjectStore;
 use crate::overlay::{RootOverlay, SyntheticEntry};
+use bstr::BString;
 use gix::ObjectId;
 use std::path::Path;
 
@@ -97,6 +102,111 @@ pub fn a1_overlay(commit_oid: ObjectId, objects_dir: &Path) -> RootOverlay {
     let mut overlay = RootOverlay::new();
     overlay.insert(".git", dotgit);
     overlay
+}
+
+/// Build an **A1+** `.git/` overlay for a projection.
+///
+/// A1+ is A1 plus a synthetic, read-only `.git/index` matching HEAD's
+/// tree, with every entry's `ASSUME_VALID` flag set. Tools that look
+/// at the index (`git status`, `git diff`, `git diff --cached`,
+/// `git ls-files`) treat the mount as a clean checkout instead of
+/// showing the entire tree as "staged for deletion" (which is what
+/// happens at A1, where the index is missing and git defaults to an
+/// empty index).
+///
+/// The serialized bytes are deterministic per `commit_oid`: the on-disk
+/// index format only records (path, mode, OID, zero-stat) per entry,
+/// none of which depend on wall-clock time. Two mounts of the same
+/// projection produce byte-identical index bytes — useful for tests
+/// and for a future cross-mount index byte cache.
+///
+/// See `docs/design/dotgit-index.md` for the full design, including
+/// the axis-split rationale that motivates A1+ as a separate rung
+/// between A1 and A2 rather than a slice of A3.
+pub fn a1_plus_overlay(
+    store: &ObjectStore,
+    commit_oid: ObjectId,
+    objects_dir: &Path,
+) -> Result<RootOverlay, IndexBuildError> {
+    let mut overlay = a1_overlay(commit_oid, objects_dir);
+    let index_bytes = build_index_bytes(store, commit_oid)?;
+    splice_dotgit_child(&mut overlay, "index", index_bytes);
+    Ok(overlay)
+}
+
+/// Splice a single file into the `.git/` directory of an overlay that
+/// was returned by [`a1_overlay`]. Panics if the overlay doesn't have
+/// a `.git/` directory at the top level (only the in-tree
+/// `a1_overlay` / `a1_plus_overlay` produce such overlays today, so a
+/// missing `.git/` would mean we plumbed the wrong overlay in).
+fn splice_dotgit_child(overlay: &mut RootOverlay, name: &str, content: Vec<u8>) {
+    let dotgit = overlay.get_mut(b".git").expect("overlay missing .git/");
+    let SyntheticEntry::Directory { children } = dotgit else {
+        panic!(".git entry is not a directory");
+    };
+    children.insert(BString::from(name), SyntheticEntry::file(content));
+}
+
+/// Build the `.git/index` byte payload for the A1+ overlay.
+///
+/// Walks HEAD's tree once via [`gix::Repository::index_from_tree`]
+/// (which internally calls `gix_index::State::from_tree`), sets
+/// `ASSUME_VALID` on every entry so git doesn't try to stat the
+/// worktree, and serializes via `gix::index::File::write_to` (which
+/// adds the trailing SHA1 trailer git expects).
+///
+/// The `ASSUME_VALID` flag is what makes this safe to ship without
+/// real stat info per entry: git would otherwise see uid/gid skew
+/// (the FUSE adapter echoes the requesting process's identity, which
+/// will differ from any baked-in identity) and force a per-file
+/// re-hash on every `git status`. With the flag set, git short-
+/// circuits to "clean" without touching the worktree.
+fn build_index_bytes(
+    store: &ObjectStore,
+    commit_oid: ObjectId,
+) -> Result<Vec<u8>, IndexBuildError> {
+    let tree_oid = store
+        .commit_tree(commit_oid)
+        .map_err(IndexBuildError::Store)?;
+
+    let repo = store.handle();
+    let file = repo
+        .index_from_tree(&tree_oid)
+        .map_err(|e| IndexBuildError::FromTree(Box::new(e)))?;
+    let (mut state, _path) = file.into_parts();
+
+    for entry in state.entries_mut() {
+        entry.flags |= gix::index::entry::Flags::ASSUME_VALID;
+    }
+
+    // Wrap the mutated state back in a File so `File::write_to` adds
+    // the trailing SHA1 trailer git expects; the path is bogus
+    // (the bytes never touch disk).
+    let file = gix::index::File::from_state(state, std::path::PathBuf::new());
+    let mut bytes = Vec::new();
+    file.write_to(&mut bytes, gix::index::write::Options::default())
+        .map_err(IndexBuildError::Write)?;
+    Ok(bytes)
+}
+
+/// Errors from [`a1_plus_overlay`] / `build_index_bytes`.
+#[derive(Debug, thiserror::Error)]
+pub enum IndexBuildError {
+    /// The shared object store rejected a read needed during the build
+    /// (peeling the commit to a tree, or a tree walked by
+    /// `gix_index::State::from_tree`).
+    #[error("object store error while building index: {0}")]
+    Store(#[from] crate::error::ObjectStoreError),
+    /// [`gix::Repository::index_from_tree`] rejected the input
+    /// (invalid path component, unreadable tree object, config
+    /// boolean error, etc.). Boxed to keep this enum small — the
+    /// underlying type is a multi-variant gix error with its own
+    /// nested source chain.
+    #[error("gix index_from_tree failed: {0}")]
+    FromTree(Box<gix::repository::index_from_tree::Error>),
+    /// Serializing the index to bytes failed.
+    #[error("gix_index::File::write_to failed: {0}")]
+    Write(#[from] std::io::Error),
 }
 
 #[cfg(test)]

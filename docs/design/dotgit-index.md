@@ -1,6 +1,6 @@
 # Design: dotgit `.git/index` synthesis (A1+)
 
-> Status: **planned 2026-05-17**. Companion to
+> Status: **shipped 2026-05-18**. Companion to
 > [`dotgit-synthesis.md`](dotgit-synthesis.md) (the parent design and the
 > A0/A1/A2/A3 ladder). This doc covers the A1+ rung specifically: a
 > synthetic, read-only `.git/index` matching HEAD that makes `git status`,
@@ -200,21 +200,24 @@ lifetime of the mount. Acceptable for the workload (mounts last
 minutes-to-hours; even the 1M-file extreme is one tenth of typical
 container memory limits). No cap; users hitting it can `--no-dotgit`.
 
-## 5. Determinism: timestamp canonicalization
+## 5. Determinism: same commit, same bytes
 
-`gix_index::State::from_tree` defaults to `filetime::FileTime::now()` for
-the State's `timestamp` field, which feeds into the index file header.
-Two mounts of the same projection at different wall-clock times would
-otherwise produce slightly different index bytes. Setting it to the
-projection's `commit_time` instead gives byte-identical output for the
-same `(tree_oid, commit_time)` pair, which:
+The on-disk index format records only `(path, mode, OID, zero-stat)`
+per entry plus a 12-byte header and a SHA1 trailer; none of those
+fields depend on wall-clock time when entries come from
+`from_tree` + `ASSUME_VALID`. Two mounts of the same projection
+produce **byte-identical** index bytes — the test
+`build_is_byte_deterministic` in `crates/projgit-core/tests/dotgit_index.rs`
+asserts this.
 
-1. Lets tests assert on the bytes directly.
-2. Opens the door to cross-mount caching (future optimization: key by
-   `tree_oid`, store the bytes once, share across mounts of the same
-   projection on the same host).
-3. Matches the rest of projgit's behavior — `mtime` on every entry
-   already comes from `commit_time`.
+The `gix_index::State::set_timestamp` field exists but feeds
+in-memory staleness comparisons only; it is not serialized to the
+on-disk format. (A draft of this design predicted we'd need to
+canonicalize it; that turned out to be a no-op once the counter-test
+revealed the field doesn't reach the bytes.)
+
+This opens a future cross-mount cache keyed by `commit_oid` alone:
+the `(tree_oid → index bytes)` mapping is referentially transparent.
 
 ## 6. What A1+ deliberately doesn't do
 
@@ -277,42 +280,42 @@ reports "nothing to commit, working tree clean." No special case needed.
 
 ## 8. Test plan
 
-### 8.1 Unit tests (`crates/projgit-core/src/dotgit.rs`)
+All three landed with the shipping commit:
 
-- `index_round_trips`: build via `build_index_bytes`, parse back via
-  `gix_index::State::from_bytes`, assert entry count and paths match
-  HEAD's tree.
-- `index_has_assume_valid_on_every_entry`: every entry in the parsed
-  state has the bit set.
-- `index_timestamp_equals_commit_time`: two builds with the same
-  `(tree_oid, commit_time)` produce byte-identical output.
-- `executable_file_entry_has_mode_file_executable`.
-- `symlink_entry_has_mode_symlink`.
-- `empty_tree_produces_empty_index`: header + signature only; parses
-  cleanly with zero entries.
+### 8.1 Unit / integration tests
 
-### 8.2 Integration test
+`crates/projgit-core/tests/dotgit_index.rs` (5 tests, no network):
 
-In `crates/projgit-core/tests/projection_fs.rs` (or sibling): build an
-A1+ overlay against a small fixture repo, walk `.git/index` through
-the projection layer, parse the resulting bytes, assert entries.
+- `a1_plus_overlay_adds_dotgit_index_file` — the new `.git/index`
+  parses back through `gix::index::File::at`.
+- `synthesized_index_carries_every_fixture_path` — entries match
+  HEAD's 6 fixture paths exactly.
+- `every_synthesized_entry_has_assume_valid_set` — the bit that
+  matters.
+- `executable_and_symlink_modes_are_preserved` —
+  `Mode::FILE_EXECUTABLE` for `run.sh`, `Mode::SYMLINK` for
+  `link-to-readme`, `Mode::FILE` for regular blobs.
+- `build_is_byte_deterministic` — two builds against the same
+  `commit_oid` produce byte-identical index bytes.
 
-### 8.3 Live end-to-end test
+### 8.2 Live end-to-end test
 
-`crates/projgit-fuse/tests/mount_real_remote.rs::mount_real_remote_with_dotgit_a1_plus_shows_clean_status`:
+`crates/projgit-fuse/tests/mount_real_remote.rs::mount_real_remote_with_dotgit_a1_plus_shows_clean_status`
+(network-gated by `PROJGIT_NETWORK_TESTS=1`, `#[ignore]`-flagged):
 
-1. Partial-clone `rust-lang/log` (same fixture as the existing test).
+1. Partial-clone `rust-lang/log`.
 2. Mount via FUSE with `a1_plus_overlay`.
-3. Run `git status --porcelain` — assert exit 0, empty stdout.
-4. Run `git status` — assert "nothing to commit, working tree clean"
-   appears.
-5. Run `git diff` — assert exit 0, empty stdout.
-6. Run `git diff --cached` — assert exit 0, empty stdout.
-7. Run `git ls-files` — assert exit 0, non-empty stdout.
-8. Re-run the existing A1 assertions (`git rev-parse HEAD`, `git log`)
-   to confirm A1+ is a strict superset.
+3. `git status --porcelain` — asserts exit 0, empty stdout.
+4. `git status` — asserts "nothing to commit, working tree clean".
+5. `git diff` — asserts exit 0, empty stdout.
+6. `git diff --cached` — asserts exit 0, empty stdout.
+7. `git ls-files` — asserts non-empty and contains `Cargo.toml`.
+8. `git rev-parse HEAD` — confirms A1 invariants still hold
+   (A1+ is a strict superset).
 
-Network-gated by `PROJGIT_NETWORK_TESTS=1`, `#[ignore]` like the rest.
+Runs in ~1 second after the partial clone caches. The existing
+`mount_real_remote_with_dotgit_supports_git_log` (the A1 test)
+still passes too.
 
 ## 9. Documentation updates landing with the implementation
 

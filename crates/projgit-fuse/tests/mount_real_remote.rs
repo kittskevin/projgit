@@ -340,3 +340,135 @@ fn mount_real_remote_with_dotgit_supports_git_log() {
 
     drop(_session);
 }
+
+/// A1+ companion: same setup, but the overlay is built with
+/// `dotgit::a1_plus_overlay` (A1 + `.git/index` matching HEAD, every
+/// entry `ASSUME_VALID`). Asserts the things the new index unlocks:
+/// `git status` reports a clean working tree, `git diff` and
+/// `git diff --cached` are both empty, and `git ls-files` returns the
+/// real file list. See `docs/design/dotgit-index.md`.
+#[test]
+#[ignore = "requires FUSE and network; opt in with PROJGIT_NETWORK_TESTS=1"]
+fn mount_real_remote_with_dotgit_a1_plus_shows_clean_status() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    if !network_enabled() {
+        eprintln!("SKIP: set PROJGIT_NETWORK_TESTS=1 to enable network tests");
+        return;
+    }
+
+    let (cache_dir, _cache_guard) = make_temp_dir("a1plus-cache");
+    let opts = CloneOptions::new(TARGET_URL.to_owned(), cache_dir.clone());
+    partial_clone(&opts).expect("partial_clone of TARGET_URL");
+
+    let git_dir = git_dir_for(&cache_dir);
+    let store = Arc::new(ObjectStore::open(&git_dir).expect("ObjectStore::open"));
+
+    let projection = Projection::Ref(TARGET_REF.to_owned());
+    let commit_oid = projection.resolve_commit(&store).expect("resolve_commit");
+    let objects_dir = std::fs::canonicalize(git_dir.join("objects")).expect("canonicalize objects");
+
+    let overlay = dotgit::a1_plus_overlay(&store, commit_oid, &objects_dir)
+        .expect("a1_plus_overlay builds successfully");
+
+    let fetcher = GitCliFetcher::open(store.clone()).expect("GitCliFetcher::open");
+    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+    let provider = Arc::new(
+        ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 3)
+            .expect("ProjectionFsProvider::new"),
+    );
+
+    let (mountpoint, _mountpoint_guard) = make_temp_dir("a1plus-mp");
+    let _session =
+        mount_background(provider, &mountpoint, &MountConfig::default()).expect("mount_background");
+
+    assert!(
+        wait_for_mount(&mountpoint, Duration::from_secs(10)),
+        "mountpoint never became a FUSE mount within 10s"
+    );
+
+    // `git status --porcelain` should produce zero lines.
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("spawn git status --porcelain");
+    assert!(
+        status.status.success(),
+        "git status --porcelain failed: stderr={:?}",
+        String::from_utf8_lossy(&status.stderr),
+    );
+    let porcelain = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        porcelain.is_empty(),
+        "git status --porcelain must be empty (working tree clean); got:\n{porcelain}",
+    );
+
+    // Full `git status` output should declare the working tree clean.
+    let status_full = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .arg("status")
+        .output()
+        .expect("spawn git status");
+    let out = String::from_utf8_lossy(&status_full.stdout);
+    assert!(
+        out.contains("nothing to commit, working tree clean"),
+        "expected 'nothing to commit, working tree clean' in git status; got:\n{out}",
+    );
+
+    // `git diff` and `git diff --cached` both empty.
+    for args in [&["diff"][..], &["diff", "--cached"][..]] {
+        let diff = Command::new("git")
+            .arg("-C")
+            .arg(&mountpoint)
+            .args(args)
+            .output()
+            .expect("spawn git diff");
+        assert!(
+            diff.status.success(),
+            "git {args:?} failed: stderr={:?}",
+            String::from_utf8_lossy(&diff.stderr),
+        );
+        assert!(
+            diff.stdout.is_empty(),
+            "git {args:?} must be empty; got {} bytes",
+            diff.stdout.len(),
+        );
+    }
+
+    // `git ls-files` must return the real file list.
+    let ls_files = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .arg("ls-files")
+        .output()
+        .expect("spawn git ls-files");
+    assert!(ls_files.status.success());
+    let listing = String::from_utf8_lossy(&ls_files.stdout);
+    assert!(
+        !listing.is_empty(),
+        "git ls-files must return entries when index is populated"
+    );
+    assert!(
+        listing.lines().any(|l| l == "Cargo.toml"),
+        "expected Cargo.toml in git ls-files output; got:\n{listing}",
+    );
+
+    // A1 invariants still hold (A1+ is a strict superset).
+    let rev_parse = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("spawn git rev-parse");
+    assert_eq!(
+        String::from_utf8_lossy(&rev_parse.stdout).trim(),
+        commit_oid.to_string(),
+    );
+
+    drop(_session);
+}

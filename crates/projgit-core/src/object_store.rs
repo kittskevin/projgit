@@ -101,8 +101,20 @@ impl ObjectStore {
         })
     }
 
-    /// Internal: cheap per-call thread-local handle for hot-path reads.
-    fn handle(&self) -> gix::Repository {
+    /// Per-call thread-local handle on the underlying repository.
+    ///
+    /// Returns a fresh [`gix::Repository`] derived from the shared
+    /// [`gix::ThreadSafeRepository`] this store owns. Cheap (no I/O,
+    /// no extra locks), but does allocate, so call once per operation
+    /// that needs a handle rather than per inner loop iteration.
+    ///
+    /// Used by:
+    /// - The internal hot-path readers (`read_blob`, `read_tree`, …).
+    /// - [`Self::handle_for_fetch`] for the [`crate::Fetcher`] impls
+    ///   that need to drive gix's `Remote` lifecycle.
+    /// - [`crate::dotgit::a1_plus_overlay`] to walk HEAD's tree via
+    ///   `gix_index::State::from_tree`.
+    pub fn handle(&self) -> gix::Repository {
         self.repo.to_thread_local()
     }
 
