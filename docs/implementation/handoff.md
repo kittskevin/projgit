@@ -184,15 +184,24 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
 - **Reproducible mount benchmark.**
   `crates/projgit-cli/examples/bench_mount.rs` times `readdir`, recursive
   walk, and 3-file reads cold and warm against a fresh
-  `git clone --filter=blob:none --no-checkout` baseline. Headlines on
-  `rust-lang/log` (median of 3, AMD Ryzen 7800X3D, WSL2):
-  - `readdir` of root: **~7×** faster than `git ls-tree`, even cold.
-  - Warm reads of 3 files: **~6,000×** faster than `git cat-file`.
-  - **Cold first-read of 3 uncached files is currently ~3× *slower***
-    than `git cat-file` cold (~8.7 s vs ~2.9 s on this target);
-    `GitCliFetcher` hydrates one blob per fault and does not yet pipeline
-    blob bytes the way native `git`'s promisor fetch does. The bench
-    exists to catch this when it changes.
+  `git clone --filter=blob:none --no-checkout` baseline. Two scenarios:
+  `--scenario single` (one mount) and `--scenario sequential` (mount,
+  unmount, fresh `ObjectStore` against the same cache dir). Two
+  targets shipped: `rust-lang/log` and `rust-lang/cargo`. Headlines
+  on `rust-lang/log` (median of 3, AMD Ryzen 7800X3D, WSL2):
+  - `readdir` of root: **~15×** faster than `git ls-tree`, even cold.
+  - Warm reads of 3 files: **~4,500×** faster than `git cat-file`.
+  - **Cold first-read of 3 uncached files is currently ~2.8×
+    *slower*** than `git cat-file` cold (~3.4 s vs ~1.2 s on `log`,
+    ~6× / ~6.9 s vs ~1.1 s on `cargo`); `GitCliFetcher` hydrates
+    one blob per fault and does not pipeline blob bytes the way
+    native `git`'s promisor fetch does. Treated as structural per
+    the fetch-coalescing retraction; the bench exists to catch if
+    it changes.
+  - **`--scenario sequential`: mount 2 cold cat is ~1 ms on both
+    targets, a ~3,000–4,750× cross-mount speedup vs mount 1 cold.**
+    Validates workload-doc §1.6 amortisation empirically for the
+    first time.
 
   Methodology and full numbers in
   [`docs/bench/baseline.md`](../bench/baseline.md); README links the headline
@@ -536,38 +545,37 @@ Reprioritized 2026-05-18 after the project audit. The audit lives in
 repo-scoped session memory at `/memories/repo/audit.md` (persists across
 conversations); the actionable items below are its top open findings.
 
-1. **Multi-process / larger-repo bench** (audit B1 + B2 + D3).
-   Highest-leverage credibility item now that the cold-cat path is
-   treated as structural. The crown jewel claim from
-   [`docs/design/workload.md`](../design/workload.md) §1.6 — "first
-   mount pays, subsequent mounts amortise" — has zero empirical
-   backing today. Plan: add a second target to `bench_mount.rs`
-   (e.g. `tokio-rs/tokio`) and a multi-process scenario (spawn 2–3
-   concurrent mounts of the same URL, verify the second's cold
-   reads are faster than the first). Updates
-   [`docs/bench/baseline.md`](../bench/baseline.md) headline numbers.
-2. **A2 ref visibility** (audit A2 row, dotgit ladder).
+1. **A2 ref visibility** (audit A2 row, dotgit ladder).
    Symbolic `HEAD` → `refs/heads/<name>` + the ref file populated
    when the projection is a `Ref`. Enables `git branch
    --show-current`, IDE branch indicators, `git log --all` seeing
    the one ref. ~150 LOC per [`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) §6;
    cleanly orthogonal to A1+ now that the axis-split insight
    landed.
-4. **B3: CI bench job.** README + bench doc claim the bench
+2. **Phase C concurrent bench** (audit A3, the remaining open
+   piece of the bench audit). Two simultaneous mounts of the same
+   URL racing to cold-fetch the same blob. Would put a number on
+   the cross-process single-flight gap. Deferred from this round
+   because it's the highest-risk scenario (concurrent `git fetch`
+   children writing into the same `.git/objects/pack/`); worth
+   doing on purpose with a "if the cache dir gets weird, nuke and
+   retry" stance. Smaller now that `--scenario sequential` proved
+   the harness shape works.
+3. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
    bench and compares to the checked-in baseline. Moderate.
-5. **Phase 3d. Production `projgit-winfsp`** on top of the
+4. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-6. **`projgit mount --background` + `projgit umount`.** Today the
+5. **`projgit mount --background` + `projgit umount`.** Today the
    foreground process owns the mount; a PID-file flow plus an
    `umount` companion would let scripts manage many mounts.
    Designs need a small mount registry under `$XDG_RUNTIME_DIR`.
-7. **`tracing-subscriber` wiring for the existing `-v` flag.** The
+6. **`tracing-subscriber` wiring for the existing `-v` flag.** The
    verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
    it. Wiring `tracing-subscriber` (with optional crate feature)
    would surface fetcher/provider events at `-v` / `-vv`.
