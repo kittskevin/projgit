@@ -41,7 +41,7 @@ The decision separates cleanly:
 
 Half (1) is load-bearing on Phase 1's data model and cannot be
 retrofitted without touching `lookup`, `readdir`, and the inode
-allocator. Half (2) is ~80\u20132000 LOC of glue (depending on variant)
+allocator. Half (2) is ~80-200 LOC of glue (depending on variant)
 that can land any time without disturbing the engine.
 
 ## 3. Goals & non-goals

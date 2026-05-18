@@ -8,9 +8,9 @@
 > code.
 >
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-05-12, after GVFS backend finalization, network-gated
-> end-to-end mount test, and reproducible mount benchmark with checked-in
-> baseline numbers.
+> Last updated: 2026-05-18, after a full project audit, the dotgit A1
+> and A1+ shipping, the fetch-coalescing retraction, and a README
+> restructure / 'What works inside a projgit mount' documentation pass.
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -33,24 +33,36 @@ The architectural killer feature: many simultaneous projections share
 **one** object store, so blob deduplication is free.
 
 Core decisions, design docs, and the phased plan all live in
-[`docs/initial-plan.md`](initial-plan.md). Focused design docs go deeper on
+[`docs/implementation/initial-plan.md`](initial-plan.md). Focused design docs go deeper on
 specific subsystems: [`docs/design/fetchers.md`](../design/fetchers.md),
-[`docs/design/windows-symlinks.md`](../design/windows-symlinks.md), and
-[`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md).
+[`docs/design/windows-symlinks.md`](../design/windows-symlinks.md),
+[`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) (parent ladder),
+and [`docs/design/dotgit-index.md`](../design/dotgit-index.md) (the A1+ rung
+shipped 2026-05-18).
 
 ## Where we are right now
 
 ```
-  HEAD    fix(cli, core): finish GVFS plumbing missed by f62efe4   ← latest committed
+  HEAD    docs(coalescing): retract recommendation; reframe §7 #3 as structural   ← latest committed
+23bffba  docs(readme): add 'What works inside a projgit mount' section
+e9d5f45  feat(dotgit): synthesize a clean .git/index matching HEAD (A1+)
+453f17d  docs(design): plan dotgit A1+ (clean read-only .git/index)
+60699a4  feat: synthesize a default .git/ at the mount root (dotgit A1)
+e127c5b  fix(fuse): echo request uid/gid as file ownership
+825c8e8  docs: legitimize GvfsFetcher as the backend for Azure DevOps remotes
+3b6e53d  fix(cli): normalize URL for cache-dir hashing; clarify SUPPORTED semantics
+ab17659  docs: annotate problem-statement §7 with shipped status; reframe GVFS scope
+6fbb6d9  docs(readme): clarify no support and not for production
+5126a87  docs: move handoff and initial-plan into docs/implementation/
+5e2699b  docs: restructure README and polish crate-level rustdoc
+92e3ccb  docs(design): rename batch-fault.md to fetch-coalescing.md
+6b6b496  docs(design): name the workload shape and explore batch-fault hydration
+b6adab9  docs(handoff): refresh for GVFS, e2e mount test, and bench baseline
+4547df0  fix(cli, core): finish GVFS plumbing missed by f62efe4
 8fd7b19  docs(readme): clarify small-blob LRU as a cache in Measured Behavior
 a564f2c  bench: reproducible mount benchmark vs. git partial-clone
 a12eeb7  test(fuse): add network-gated end-to-end mount test against real remote
 f62efe4  feat(fetcher): add optional GVFS backend
-c2ec5b0  chore: enforce LF line endings
-dbdc96a  docs(handoff): refresh open-source polish status
-19436f1  docs(winfsp): archive Windows prototype plan
-799bbf4  ci: add Rust verification workflow
-1590b61  docs: add public README and examples
 ff2138c  feat(core): prefetch headers after readdir
 8bc74b8  feat(cli): --ref + --subtree resolution and --stats flag
 5e1f518  feat(core): add small-blob LRU to ObjectStore
@@ -187,7 +199,65 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   table.
 - **License decision.** Project is dual-licensed **MIT OR Apache-2.0**.
   We hand-roll WinFsp FFI bindings (no GPL-3.0 `winfsp-rs`).
-  See repo memory + [`docs/initial-plan.md` §10](initial-plan.md).
+  See repo memory + [`docs/implementation/initial-plan.md` §10](initial-plan.md).
+- **dotgit A1 synthesized at the mount root (2026-05-17).**
+  `crate::dotgit::a1_overlay(commit_oid, objects_dir)` produces a
+  minimal `.git/` (detached `HEAD`, `[core]` config, empty `refs/`,
+  empty `packed-refs`, `objects/info/alternates` pointing at the
+  shared store). `projgit mount` synthesizes it by default for `Ref`
+  and `Commit` projections (`Subtree` and `--no-dotgit` opt out).
+  Closes problem-statement §7 #4 (`git log <path>` works inside the
+  mount). Network-gated e2e test
+  `mount_real_remote_with_dotgit_supports_git_log` exercises it
+  against `rust-lang/log`. Full rationale + the axis-split insight
+  in [`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) §9.5.
+- **dotgit A1+ clean read-only index (2026-05-18).**
+  `crate::dotgit::a1_plus_overlay(store, commit_oid, objects_dir)`
+  wraps A1 and splices in a synthetic `.git/index` matching HEAD with
+  every entry's `ASSUME_VALID` flag set. CLI defaults to A1+; same
+  opt-outs. Before A1+, `git status` inside the mount showed 36 fake
+  deletions and `git diff --cached` was 2,897 lines of phantom diff;
+  after A1+, `git status` reports "nothing to commit, working tree
+  clean" with zero user configuration. 5 unit tests in
+  `crates/projgit-core/tests/dotgit_index.rs` + 1 network-gated e2e
+  test. Full design in [`docs/design/dotgit-index.md`](../design/dotgit-index.md).
+- **FUSE adapter echoes the requesting process's uid/gid as file
+  ownership (2026-05-17).** Previously every file in a mount showed
+  as `root`-owned regardless of who was running `projgit`, which
+  tripped git's `safe.directory` check for any non-root user. Now
+  the FUSE adapter uses `req.uid()`/`req.gid()` per operation, so
+  the mount looks owned by whoever's asking. Same shape as Gotcha
+  #9 below — the WinFsp backend will need its own version of this
+  for the same reason.
+- **GvfsFetcher reframed as the Azure DevOps backend.** `Fetcher`
+  trait is now explicitly multi-backend: `GitCliFetcher` (default)
+  for stock Git remotes; `GvfsFetcher` for Azure DevOps Server /
+  Azure Repos. Replaces the earlier "testbed for trait honesty"
+  framing that didn't pass the workload-doc §6 discipline check.
+- **URL cache canonicalisation.** `cache_subdir_for_url` now folds
+  trivial URL variations (`https://x/y`, `https://x/y.git`,
+  `https://x/y/`, case-only) into the same cache directory so the
+  README's "one on-disk object store is shared across every mount"
+  promise is actually delivered. HTTPS vs SSH stay deliberately
+  distinct.
+- **Fetch coalescing investigated, deprioritized.** Prior
+  implementation attempt (not in repo) tried several strategies from
+  [`docs/design/fetch-coalescing.md`](../design/fetch-coalescing.md) §6;
+  none closed the cold 3-file `cat` gap, and the most aggressive
+  variant destabilized the host badly enough to require a reboot.
+  §9.5 of that doc captures the post-mortem and retracts §7's
+  recommended build order. Cold path is now treated as structural
+  (network-bound by design); problem-statement §7 #3 reframed as
+  "Partially met (cold path is structural)" rather than a stepping
+  stone to a met state.
+- **Project audit + presentation pass (2026-05-17/18).** README
+  restructured to lead with engineering before the prototype
+  disclaimer; "What works inside a projgit mount" added as a
+  consolidated reference; problem-statement §7 turned from a flat
+  bullet list into a status table; handoff + initial-plan moved
+  into `docs/implementation/`; README clarifies no support / not
+  for production. `SUPPORTED` const semantics unified across the
+  two backend crates.
 
 ### Deferred / archived
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
@@ -462,33 +532,60 @@ two design docs.)
 
 ## What I'd do next
 
-In rough order of "smallest unit of work that yields the most
-visible progress":
+Reprioritized 2026-05-18 after the project audit. The audit lives in
+session memory at `/memories/session/audit.md`; the actionable items
+below are its top open findings.
 
-1. **Close the cold-cat gap surfaced by the bench.** Today
-   `GitCliFetcher` services one blob per fault. A small fetch-coalescing
-   scheme — e.g. cluster faults observed within a short window and
-   shuttle them through `git cat-file --batch` (the bytes variant)
-   — would close the ~3× cold gap to the `git cat-file` baseline. The
-   benchmark in `crates/projgit-cli/examples/bench_mount.rs` will
-   directly measure the win and protect it from regressing.
-2. **Asciinema for the README.** A 30-second clip showing
-   `projgit mount`, `ls`, `cat`, and `Ctrl-C` against
-   `rust-lang/log`, embedded under "Measured Behavior." Cheap, and
-   it makes the project feel real to a portfolio reader in a way
-   the table alone does not.
-3. **Phase 3d.** Production `projgit-winfsp` on top of the
-   `FspService*` lifecycle. Consume `ProjectionFsProvider` directly,
-   exactly like Phase 4's CLI does on Linux. The riskiest remaining
-   piece. Best done in a fresh focused session on the Windows host.
-4. **`projgit mount --background` + `projgit umount`.** Today the
+1. **Multi-process / larger-repo bench** (audit B1 + B2 + D3).
+   Highest-leverage credibility item now that the cold-cat path is
+   treated as structural. The crown jewel claim from
+   [`docs/design/workload.md`](../design/workload.md) §1.6 — "first
+   mount pays, subsequent mounts amortise" — has zero empirical
+   backing today. Plan: add a second target to `bench_mount.rs`
+   (e.g. `tokio-rs/tokio`) and a multi-process scenario (spawn 2–3
+   concurrent mounts of the same URL, verify the second's cold
+   reads are faster than the first). Updates
+   [`docs/bench/baseline.md`](../bench/baseline.md) headline numbers.
+2. **A2 ref visibility** (audit A2 row, dotgit ladder).
+   Symbolic `HEAD` → `refs/heads/<name>` + the ref file populated
+   when the projection is a `Ref`. Enables `git branch
+   --show-current`, IDE branch indicators, `git log --all` seeing
+   the one ref. ~150 LOC per [`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) §6;
+   cleanly orthogonal to A1+ now that the axis-split insight
+   landed.
+3. **C1: drop Windows from the README architecture diagram.**
+   Parallel to the GVFS reframe but in the opposite direction.
+   Today the diagram shows "FUSE • WinFsp (planned)" and
+   Engineering Highlights claims "the FUSE and WinFsp adapters
+   both consume it" — only one exists. Workload is Linux
+   containers; Windows has no current pull. Small docs change.
+4. **B3: CI bench job.** README + bench doc claim the bench
+   protects against regression; CI runs only fmt/clippy/test.
+   Add a perf job to `.github/workflows/ci.yml` that runs the
+   bench and compares to the checked-in baseline. Moderate.
+5. **Phase 3d. Production `projgit-winfsp`** on top of the
+   `FspService*` lifecycle. Consume `ProjectionFsProvider`
+   directly, exactly like Phase 4's CLI does on Linux. The
+   riskiest remaining piece. Best done in a fresh focused session
+   on the Windows host; first decide whether the Linux-focused
+   workload makes this worth the cost (C1 leans "no").
+6. **`projgit mount --background` + `projgit umount`.** Today the
    foreground process owns the mount; a PID-file flow plus an
    `umount` companion would let scripts manage many mounts.
    Designs need a small mount registry under `$XDG_RUNTIME_DIR`.
-5. **`tracing-subscriber` wiring for the existing `-v` flag.** The
+7. **`tracing-subscriber` wiring for the existing `-v` flag.** The
    verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
    it. Wiring `tracing-subscriber` (with optional crate feature)
    would surface fetcher/provider events at `-v` / `-vv`.
+
+**Explicitly off the actionable list** (recorded so they don't sneak
+back in by accident):
+
+- *Fetch coalescing.* Tried; doesn't close the cold gap; cold path
+  is structural. See `docs/design/fetch-coalescing.md` §9.5.
+- *Asciinema / video demo for the README.* User preference; the
+  static captured terminal session in README's Quick Start is the
+  no-recording substitute.
 
 Whichever path you take, **commit per the
 [`commit-work` skill](../../.github/skills/commit-work/SKILL.md)** —
