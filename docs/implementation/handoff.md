@@ -553,12 +553,6 @@ conversations); the actionable items below are its top open findings.
    the one ref. ~150 LOC per [`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) §6;
    cleanly orthogonal to A1+ now that the axis-split insight
    landed.
-3. **C1: drop Windows from the README architecture diagram.**
-   Parallel to the GVFS reframe but in the opposite direction.
-   Today the diagram shows "FUSE • WinFsp (planned)" and
-   Engineering Highlights claims "the FUSE and WinFsp adapters
-   both consume it" — only one exists. Workload is Linux
-   containers; Windows has no current pull. Small docs change.
 4. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
