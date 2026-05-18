@@ -533,8 +533,8 @@ two design docs.)
 ## What I'd do next
 
 Reprioritized 2026-05-18 after the project audit. The audit lives in
-session memory at `/memories/session/audit.md`; the actionable items
-below are its top open findings.
+repo-scoped session memory at `/memories/repo/audit.md` (persists across
+conversations); the actionable items below are its top open findings.
 
 1. **Multi-process / larger-repo bench** (audit B1 + B2 + D3).
    Highest-leverage credibility item now that the cold-cat path is
