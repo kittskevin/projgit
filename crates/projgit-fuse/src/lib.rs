@@ -44,6 +44,14 @@ pub use mount::{mount, mount_background, MountConfig};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use fuser::BackgroundSession;
 
+/// Re-export of [`fuser::SessionACL`] so callers can configure
+/// `MountConfig::acl` without taking a direct dependency on `fuser`.
+/// `SessionACL::All` enables the kernel `allow_other` mount option
+/// (required for any cross-UID access, including bind-mounts into
+/// containers).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use fuser::SessionACL;
+
 /// Marker constant: `true` when the FUSE backend is built for this
 /// target and `mount`/`mount_background` actually work; `false`
 /// elsewhere. Mirrored by `projgit_winfsp::SUPPORTED` on Windows,

@@ -115,6 +115,27 @@ struct MountArgs {
     #[arg(long)]
     no_dotgit: bool,
 
+    /// Pass the `allow_other` FUSE mount option, so users other than
+    /// the one running `projgit mount` can read the mount.
+    ///
+    /// Required for the "projgit on the host, containers consume the
+    /// mount via bind-mount" deployment topology (and the equivalent
+    /// sidecar-container shape). Without this flag, even `root` gets
+    /// `EACCES` on the mount because FUSE's default security check
+    /// only allows the mounting UID.
+    ///
+    /// Non-root users additionally need `user_allow_other` enabled in
+    /// `/etc/fuse.conf` on the host; without it, `fusermount` will
+    /// refuse the mount entirely.
+    ///
+    /// **Security note:** with this on, any local user (or anyone
+    /// with a bind-mount into a container) can read the projection.
+    /// Right default for single-tenant agent-eval rigs where every
+    /// consumer is "yours"; wrong for a multi-tenant host where
+    /// projections may contain private code.
+    #[arg(long)]
+    allow_other: bool,
+
     /// Fetch backend for URL-backed mounts.
     #[arg(long, value_enum, default_value = "git")]
     fetcher: FetcherChoice,
@@ -234,7 +255,10 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     //    clone configured (typically `origin`).
     let _remote_hint = &args.remote;
     let overlay = build_root_overlay(&args, &projection, &store, &git_dir)?;
-    let cfg = MountConfig::default();
+    let mut cfg = MountConfig::default();
+    if args.allow_other {
+        cfg.acl = projgit_fuse::SessionACL::All;
+    }
     let mp = args.mountpoint.clone();
     let print_stats = args.stats;
 
