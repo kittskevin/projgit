@@ -588,7 +588,10 @@ Reprioritized 2026-05-20 after the `projgitd` design landing. The audit
 lives in repo-scoped session memory at `/memories/repo/audit.md`
 (persists across conversations); the actionable items below are its top
 open findings plus the staged plan from
-[`docs/design/projgitd.md`](../design/projgitd.md).
+[`docs/design/projgitd.md`](../design/projgitd.md). Stage-by-stage
+implementation steps, commit boundaries, and decision points live in
+[`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
+the working doc that gets updated as each stage lands.
 
 1. **`projgitd` Stage 0 — FUSE fd-passing spike**
    ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 0).
