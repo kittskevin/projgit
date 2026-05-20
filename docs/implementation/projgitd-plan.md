@@ -5,7 +5,7 @@
 > stage by stage. Updated as each stage lands or surfaces something
 > that changes downstream stages.
 >
-> Last updated: 2026-05-20 (Stage 0 done, GREEN; Stages 1–5 not
+> Last updated: 2026-05-20 (Stages 0 and 1 done; Stages 2–5 not
 > started).
 >
 > Architecture lives in [`docs/design/projgitd.md`](../design/projgitd.md);
@@ -228,7 +228,7 @@ exists so future-us can re-run the demo if our environment changes.
 One focused session if fuser already exposes what we need; two if
 we need a hand-rolled shim.
 
-## Stage 1 — Multi-projection in one process
+## Stage 1 — Multi-projection in one process — **DONE 2026-05-20**
 
 ### 1.1 Goal
 
@@ -257,71 +257,123 @@ Specific places likely affected:
 Output: a short notes file in the PR description listing what
 needs to change vs what already supports multi-projection.
 
-### 1.3 Design points to settle
+### 1.3 Design decision (settled 2026-05-20: many mounts, shared store)
 
-These are not pre-decided. They come out of §1.2's inventory:
+The inventory (§1.2) surfaced two relevant facts:
 
-- **Inode space.** Each provider has its own inode allocator
-  today. Either (a) keep that and add a "projection routing bit" in
-  the top of the inode value, or (b) move to a single shared
-  allocator keyed by (projection_id, intra-projection-inode). (a) is
-  the smaller change.
-- **FUSE adapter dispatch.** Today's `ProjgitFuse<F>` holds one
-  provider. Either generalise to `ProjgitFuse<R: FsProvider>` where
-  `R` is a router that holds many providers and dispatches by
-  inode prefix, or build a dedicated `MultiProjectionProvider` that
-  *is* an `FsProvider` and contains many `ProjectionFsProvider`s.
-  The second is less invasive.
-- **Mountpoint shape.** In Stage 1 we don't need multiple FUSE
-  mounts — we can serve all projections under one mountpoint as
-  `/mp/<projection-id>/...`. Stage 3+ revisits when sidecars hold
-  their own fds.
-- **`.git/` synthesis per projection.** Today's dotgit overlay is
-  per-projection; needs to live under each projection's subdir, not
-  at the mount root.
+- `projection_id`, `InodeAllocator`, and `ProjectionFsProvider`
+  already accommodate multiple projections in one process. The only
+  thing single-projection about the codebase is `/* projection_id */
+  1` hardcoded in callers.
+- **`ROOT_INODE = 1` is per-projection.** Each `InodeAllocator`
+  treats inode 1 as its own root. Two `ProjectionFsProvider`s
+  behind one `FsProvider` dispatcher both claim inode 1; the
+  dispatcher would need either an inode-layout change (carve
+  high bits for projection ID) or a per-op HashMap reverse map.
 
-### 1.4 Implementation outline
+Given that, two paths to "multi-projection in one process":
+
+| | Path A: one mount + dispatcher | Path B: many mounts, shared store |
+|---|---|---|
+| Cache sharing | ✅ | ✅ |
+| Fetch coalescing | ✅ | ✅ |
+| Code change | medium-large (inode-layout work or HashMap routing) | small (CLI + plumbing) |
+| Per-projection failure isolation | dispatcher could affect all | each mount independent |
+| Stage 3 fit (sidecar holds fd) | dispatcher splits oddly | natural — each sidecar one fd |
+| Stage 4 fit (T4 per-namespace) | each sidecar a dispatcher slice | natural — each sidecar one mount |
+| Inode-collision bug risk | real | none |
+| UX for agents | identical (bind subdir) | identical (bind sub-mount) |
+
+**Picked Path B.** Same observable behaviour at a fraction of the
+implementation cost, and naturally matches Stages 3–4. The "one big
+mount" version's only advantage was "ls /var/projgit/ shows all
+projections" — which is also true of many mounts (kernel shows
+mountpoint directories like normal dirs).
+
+Consequences of Path B:
+
+- **Inode layout: unchanged.** Each `ProjectionFsProvider` keeps
+  its own `InodeAllocator` with `ROOT_INODE = 1`.
+- **FUSE adapter dispatch: unchanged.** Each provider gets its own
+  `ProjgitFuse<F>` and its own `/dev/fuse` fd.
+- **Mountpoint shape: many mountpoints, one per projection.**
+  `projgit mount-multi --mount main=/mp-a --mount v1=/mp-b SOURCE`
+  produces two distinct FUSE mounts.
+- **`.git/` synthesis per projection: unchanged.** Each provider's
+  overlay is built per-projection, no cross-projection coordination
+  needed.
+- **What's shared:** `Arc<ObjectStore>` (so the tree / header /
+  blob LRUs are shared), `Arc<HydratingObjectStore<F>>` (so the
+  in-flight fetch coalescer is shared), `Arc<F>` (one batch-check
+  child per host instead of per projection).
+
+### 1.4 Implementation outline (Path B)
 
 In rough order:
 
-1. **`MultiProjectionProvider`** in `projgit-core`. Holds
-   `Vec<(name, Arc<ProjectionFsProvider<F>>)>`. Implements
-   `FsProvider` by dispatching on the top-level path component.
-   Root directory listing returns the projection names.
-2. **Unit tests** in `projgit-core/tests/` exercising:
-   - readdir of root returns projection names.
-   - readdir into projection A returns A's tree.
-   - lookups don't bleed across projections.
-   - shared `ObjectStore` is used (only one open per repo on disk).
-3. **CLI extension**: `projgit mount-multi` subcommand accepting
-   `--projection <name>:<ref> --projection <name>:<commit> …
-   <mountpoint>`. All projections share one underlying repo
-   (specified by `<source>` arg).
+1. **CLI: `projgit mount-multi`** subcommand. Same flags as
+   `mount` (source, cache_dir, remote, offline, stats, no_dotgit,
+   allow_other, fetcher, gvfs_url) plus repeated
+   `--mount REF=PATH` for the projection list. `--commit` and
+   `--subtree` deferred (`mount` retains them for single-projection
+   use).
+2. **`cmd_mount_multi` in `projgit-cli`.** Resolves source once,
+   opens store once, builds one shared `HydratingObjectStore`,
+   then loops over `--mount` entries creating one
+   `ProjectionFsProvider` (sequential `projection_id` 1..N) and
+   one `mount_background` per entry. Holds all
+   `BackgroundSession` handles until Ctrl-C, then drops them all
+   (unmounting cleanly in fuser's drop impl).
+3. **No changes to `projgit-core` or `projgit-fuse`.** The
+   substrate is already correct.
 4. **Integration test** in `projgit-fuse/tests/`: mount two
-   projections of the same local repo, walk each, verify isolation.
+   projections of the same local repo in one process sharing an
+   `Arc<HydratingObjectStore>`. Verify (a) isolation — files read
+   from mount A match projection A's content, (b) shared cache —
+   reading a blob via mount B after reading it via mount A produces
+   a `blob_cache` hit (proves cache state is shared).
 
-### 1.5 Decision point
+### 1.5 Decision point — **CLEAR 2026-05-20**
 
-After Stage 1 lands, two things are true that weren't before:
+Outcome: Stage 1 landed cleanly via Path B (many mounts, shared
+store). Both predictions from the plan held:
 
-- We've proven multi-projection works in our type system. The
-  daemon scaffold in Stage 2 just has to expose it over a socket.
-- We have a concrete sense of where cache locality bites — if
-  two projections of the same repo end up duplicating cache
-  state, Stage 2's design needs to address that.
+- **Multi-projection works in our type system.** No changes to
+  `projgit-core` or `projgit-fuse` were needed. Stage 1 was pure
+  CLI plumbing and a Ctrl-C handler. The substrate was already
+  correct (`projection_id` already plumbed through
+  `InodeAllocator`, `ProjgitFuse<F: FsProvider>` already generic,
+  `Arc<ObjectStore>` already shared-friendly).
+- **Cache locality works.** The integration test verifies the
+  shared `blob_cache` records a hit when mount B reads the same
+  OID that mount A read first. Manual CLI test with `--stats`
+  shows tree/header/blob caches all aggregate correctly across
+  mounts; one tree-cache miss seeds the cache for both mounts'
+  subsequent reads. **§1.6-in-memory amortisation works in
+  process; Stage 2 inherits it for free.**
 
-Update this doc with whatever surfaced.
+Implications for Stage 2:
 
-### 1.6 Commit boundary
+- No need to re-design the cache architecture. The daemon just
+  hosts the same `Arc<ObjectStore>` + `Arc<HydratingObjectStore>`
+  with N providers behind it (or with the daemon directly hosting
+  the mount, depending on T1.5 vs sidecar deployment).
+- Per-provider prefetch workers (one per projection) are
+  duplicative on cold paths — each worker walks the tree of its
+  projection independently. Not a correctness issue, but worth
+  noting for Stage 2: a per-host prefetch worker would be more
+  efficient. Defer until measurement says it matters.
 
-Per the [`commit-work`](../../.github/skills/commit-work/SKILL.md)
-skill: probably 3–4 commits.
+### 1.6 Commit boundary — actual
 
-- `feat(core): MultiProjectionProvider for multi-projection dispatch`
-- `feat(cli): projgit mount-multi subcommand`
-- `test(fuse): network-gated multi-projection mount test` (if
-  the integration test needs the network)
-- `docs(handoff): Stage 1 landed; update next-up list`
+Per Path B, no `projgit-core` changes were needed; only two
+commits actually landed:
+
+- `feat(cli): mount-multi subcommand + Stage 1 integration test`
+  (the code change + the integration test, which doesn't need the
+  network because it uses a local fixture repo).
+- `docs(projgitd): Stage 1 done; update plan, handoff, audit`
+  (this doc, handoff Done bullet, audit memory snapshot).
 
 ### 1.7 Time estimate
 

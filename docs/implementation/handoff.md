@@ -325,6 +325,25 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   NOT wrap fd in fuser or it would consume INIT), clean teardown
   via external `fusermount3 -u`. Full writeup in the spike's README
   and in [`docs/design/projgitd.md`](../design/projgitd.md) §8.
+- **`projgitd` Stage 1 — multi-projection in one process (2026-05-20).**
+  `projgit mount-multi <SOURCE> --mount REF=PATH [--mount …]`
+  hosts N projections in one process sharing one `Arc<ObjectStore>`,
+  one `Arc<HydratingObjectStore<F>>`, one `Fetcher`. Each projection
+  gets its own FUSE mount (Path B from the plan §1.3 — "many mounts
+  shared store", chosen over the dispatcher-based "one mount many
+  subdirs" because the substrate was already there and it matches
+  Stage 3/4 naturally). Verified by `mount_multi.rs` integration
+  test (isolation: each mount sees its own ref's content; sharing:
+  mount B's read of the same OID hits the cache mount A populated)
+  and CLI smoke run (two mounts of `main` at distinct paths; `--stats`
+  shows shared tree/header/blob caches across both mounts).
+  No changes to `projgit-core` or `projgit-fuse` needed — the
+  substrate was already correct: `projection_id` plumbed through
+  `InodeAllocator`, `ProjgitFuse<F: FsProvider>` generic, `Arc<ObjectStore>`
+  shared-friendly. Means **§1.6-in-memory amortisation now works
+  in process**; Stage 2 inherits it for free when wrapping the
+  daemon. Full design decision + commit boundary in
+  [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) §1.3–1.6.
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
@@ -531,7 +550,7 @@ peel.
 3. **`projgit-fuse` cross-checks need the Linux target installed**
    (above). Without it, `cargo check --target x86_64-unknown-linux-gnu`
    fails with a target-not-installed error, not a real compile error.
-3. **`projgit-core`'s `gix-fetcher` feature is default-on**, but
+4. **`projgit-core`'s `gix-fetcher` feature is default-on**, but
   `projgit-cli` and `projgit-fuse` depend on `projgit-core` with
   `default-features = false`. Reason: gix's network deps pull
   reqwest + rustls + ring + a C compiler at build time, which would
@@ -540,22 +559,22 @@ peel.
   `GitCliFetcher` and partial-clone helper are **not** behind this
   feature — they shell out to the system `git` and have no extra
   build deps.
-4. **`ObjectStore` is `Send + Sync`** because it holds a
+5. **`ObjectStore` is `Send + Sync`** because it holds a
    `gix::ThreadSafeRepository` and creates per-call thread-local
    `Repository` handles. Don't "fix" it by going back to
    `gix::Repository`; the `Fetcher: Send + Sync` bound transitively
    needs `ObjectStore: Sync`.
-5. **`MissingObject(oid)` is the only error variant the Fetcher hot
+6. **`MissingObject(oid)` is the only error variant the Fetcher hot
    path matches on.** Don't bury it inside a generic
    `Backend(String)`; consumers depend on the discriminant.
-6. **Spikes are NOT workspace members** (`exclude = ["spikes"]` in
+7. **Spikes are NOT workspace members** (`exclude = ["spikes"]` in
    the root `Cargo.toml`). They are deliberately throwaway. Don't
    promote spike code into a `crates/` member without rewriting it.
-7. **WinFsp DLL on PATH at runtime.** Any binary that links WinFsp
+8. **WinFsp DLL on PATH at runtime.** Any binary that links WinFsp
   (eventually `projgit-winfsp`) needs
    `C:\Program Files (x86)\WinFsp\bin` on PATH or the process exits
    with `0xC06D007E` (delay-load failure).
-8. **Modern `git`'s `safe.directory` check fails inside our future
+9. **Modern `git`'s `safe.directory` check fails inside our future
    WinFsp mount** because the FSD reports volume ownership as
    `BUILTIN\Administrators`. Phase 3d step 15 must synthesize per-user
    ownership in `get_security_by_name` / `get_security`. (Surfaced in
@@ -606,19 +625,15 @@ implementation steps, commit boundaries, and decision points live in
 [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
 the working doc that gets updated as each stage lands.
 
-1. **`projgitd` Stage 1 — multi-projection in one process**
-   ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 1).
-   Largest internal refactor in the plan, ships value even as a
-   single-process tool (one `ObjectStore` + `Fetcher` hosting N
-   `ProjectionFsProvider`s, sharing in-memory caches across
-   mounts). Substrate for the daemon scaffold in Stage 2.
-2. **`projgitd` Stage 2 — daemon scaffold + `DaemonFetcher`**
+1. **`projgitd` Stage 2 — daemon scaffold + `DaemonFetcher`**
    ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 2).
    First shippable version of the daemon: single-tenant T1.5
-   deployment (daemon hosts the FUSE mount; agents consume via
-   `-v`). Closes A1 + A3 architecturally; the Phase C bench then
-   measures the gain.
-3. **A2 ref visibility** (audit A2 row, dotgit ladder).
+   deployment (daemon hosts the multi-projection mount; agents
+   consume via `-v`). Stage 1's multi-projection plumbing is the
+   substrate; this stage adds the unix-socket control plane and
+   the `DaemonFetcher` Fetcher impl. Closes A1 + A3 architecturally;
+   the Phase C bench then measures the gain.
+2. **A2 ref visibility** (audit A2 row, dotgit ladder).
    Symbolic `HEAD` → `refs/heads/<name>` + the ref file populated
    when the projection is a `Ref`. Enables `git branch
    --show-current`, IDE branch indicators, `git log --all` seeing
@@ -626,27 +641,27 @@ the working doc that gets updated as each stage lands.
    cleanly orthogonal to A1+ now that the axis-split insight
    landed. Independent of the `projgitd` plan; pick up between
    stages when a self-contained piece is desired.
-4. **Phase C concurrent bench** (audit A3 measurement).
+3. **Phase C concurrent bench** (audit A3 measurement).
    Two simultaneous mounts of the same URL racing to cold-fetch
    the same blob. Puts a number on the cross-process single-flight
    gap. Higher-leverage *after* Stage 2 lands because then we can
    measure the gain from the daemon's coalescer directly; less
    useful before. Highest-risk to run on the host (concurrent
    `git fetch` children writing the same `.git/objects/pack/`).
-5. **`projgitd` Stages 3–5** (sidecar holds fd; T4 last mile;
+4. **`projgitd` Stages 3–5** (sidecar holds fd; T4 last mile;
    production polish). Sequenced after Stage 2; specifics in
    [`docs/design/projgitd.md`](../design/projgitd.md) §8.
-6. **B3: CI bench job.** README + bench doc claim the bench
+5. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
    bench and compares to the checked-in baseline. Moderate.
-7. **Phase 3d. Production `projgit-winfsp`** on top of the
+6. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-8. **Container deployment recipe doc.** User-facing `docs/` page
+7. **Container deployment recipe doc.** User-facing `docs/` page
    covering `/etc/fuse.conf`, `bind-propagation`, a sample
    systemd unit, an example Docker invocation. Architectural
    framing already in
@@ -654,7 +669,7 @@ the working doc that gets updated as each stage lands.
    this is the cookbook side. Best after `projgitd` Stage 2 lands
    so the recipe documents the supervised-daemon path that is the
    intended production shape.
-9. **`tracing-subscriber` wiring for the existing `-v` flag.** The
+8. **`tracing-subscriber` wiring for the existing `-v` flag.** The
     verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
     it. Wiring `tracing-subscriber` (with optional crate feature)
     would surface fetcher/provider events at `-v` / `-vv`. Mostly
