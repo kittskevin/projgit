@@ -5,6 +5,7 @@ members = [
     "crates/projgit-cli",
     "crates/projgit-fuse",
     "crates/projgit-winfsp",
+    "crates/projgit-daemon",
 ]
 # Spikes are intentionally NOT workspace members. They are throwaway,
 # self-contained crates with their own dependency sets. Phase 0 spikes will

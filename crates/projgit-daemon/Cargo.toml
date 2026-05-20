@@ -1,0 +1,42 @@
+[package]
+name = "projgit-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Long-lived projgit daemon: hosts a shared ObjectStore + Fetcher + caches and serves multi-projection FUSE mounts on a unix-socket control plane (Stage 2 of the projgitd plan)."
+
+[lib]
+name = "projgit_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "projgitd"
+path = "src/main.rs"
+
+[dependencies]
+# The protocol module is platform-agnostic (it's pure serde over a
+# Read/Write pair); keep projgit-core off the always-compile path so
+# the protocol crate can be depended on by future Windows clients
+# without dragging in the server.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = { workspace = true }
+
+# The daemon server (cfg-gated to Linux/macOS) needs the projection
+# stack and the FUSE backend. Everything outside `cfg(...)` blocks
+# must stay platform-agnostic so the protocol module compiles on
+# Windows for future client work.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+projgit-core = { path = "../projgit-core", default-features = false }
+projgit-fuse = { path = "../projgit-fuse" }
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+nix = { version = "0.29", features = ["fs", "user"] }
+
+[features]
+default = []
+gvfs-fetcher = ["projgit-core/gvfs-fetcher"]
