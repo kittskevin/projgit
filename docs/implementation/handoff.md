@@ -344,6 +344,25 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   in process**; Stage 2 inherits it for free when wrapping the
   daemon. Full design decision + commit boundary in
   [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) §1.3–1.6.
+- **`projgitd` Stage 2 — daemon scaffold + Mount/Umount + client (2026-05-20).**
+  New crate `projgit-daemon` (workspace member) plus a `projgit attach`
+  client subcommand. The daemon binary `projgitd` listens on a unix
+  socket, accepts JSON-framed control-plane RPCs (`ping`, `status`,
+  `mount`, `umount`, `shutdown`), and hosts the FUSE mounts itself
+  (the Stage 2 / T1.5 model; Stage 3 will move the FUSE fd to a
+  per-container sidecar). V1 is **one source per daemon** — the first
+  `Mount` request fixes the source, subsequent mounts must use the
+  same source. All mounts share `Arc<ObjectStore>` and
+  `Arc<HydratingObjectStore<F>>`, so the §1.6-in-memory amortisation
+  from Stage 1 now also works over the wire (verified by the
+  mount_smoke integration test: mount B’s read of the same OID
+  produces a shared-cache `blob_cache` hit). Means audit **A1
+  (no daemon)** and **A3 (cross-process single-flight gap) are now
+  architecturally closed**; Phase C bench measures the actual gain.
+  Three commits (2a/2b/2c — f33601e, 8291a05, cb98d5a) shipped in
+  one focused session, vs the plan’s two-to-three-session estimate.
+  Full sub-stage notes in
+  [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) §2.
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
@@ -625,14 +644,16 @@ implementation steps, commit boundaries, and decision points live in
 [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
 the working doc that gets updated as each stage lands.
 
-1. **`projgitd` Stage 2 — daemon scaffold + `DaemonFetcher`**
-   ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 2).
-   First shippable version of the daemon: single-tenant T1.5
-   deployment (daemon hosts the multi-projection mount; agents
-   consume via `-v`). Stage 1's multi-projection plumbing is the
-   substrate; this stage adds the unix-socket control plane and
-   the `DaemonFetcher` Fetcher impl. Closes A1 + A3 architecturally;
-   the Phase C bench then measures the gain.
+1. **`projgitd` Stage 3 — sidecar holds the FUSE fd**
+   ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 3).
+   Move the FUSE mount from the daemon to per-container sidecars.
+   The daemon becomes pure data plane; sidecars run the protocol
+   loop locally (via `fuser::Session::from_fd` — proven in Stage
+   0). Failure-mode upgrade: daemon crash degrades to a brief
+   cold-path EAGAIN window rather than killing every mount on the
+   host. Needs the `DaemonFetcher` impl (the new Fetcher that
+   talks to the daemon over the wire) the Stage 2 plan-text
+   mistakenly placed in Stage 2.
 2. **A2 ref visibility** (audit A2 row, dotgit ladder).
    Symbolic `HEAD` → `refs/heads/<name>` + the ref file populated
    when the projection is a `Ref`. Enables `git branch
@@ -648,8 +669,9 @@ the working doc that gets updated as each stage lands.
    measure the gain from the daemon's coalescer directly; less
    useful before. Highest-risk to run on the host (concurrent
    `git fetch` children writing the same `.git/objects/pack/`).
-4. **`projgitd` Stages 3–5** (sidecar holds fd; T4 last mile;
-   production polish). Sequenced after Stage 2; specifics in
+4. **`projgitd` Stages 4–5** (T4 last mile via per-namespace
+   fd-passing; production polish via systemd unit / persistent
+   daemon state). Sequenced after Stage 3 above; specifics in
    [`docs/design/projgitd.md`](../design/projgitd.md) §8.
 5. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.

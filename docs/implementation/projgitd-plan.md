@@ -5,8 +5,7 @@
 > stage by stage. Updated as each stage lands or surfaces something
 > that changes downstream stages.
 >
-> Last updated: 2026-05-20 (Stages 0 and 1 done; Stages 2–5 not
-> started).
+> Last updated: 2026-05-20 (Stages 0–2 done; Stages 3–5 not started).
 >
 > Architecture lives in [`docs/design/projgitd.md`](../design/projgitd.md);
 > this doc is one level down: concrete steps, file layout, commit
@@ -379,15 +378,21 @@ commits actually landed:
 
 Two to three focused sessions. Largest single piece in the plan.
 
-## Stage 2 — Daemon scaffold + DaemonFetcher
+## Stage 2 — Daemon scaffold + control-plane RPC — **DONE 2026-05-20**
 
-### 2.1 Goal (high level)
+### 2.1 Goal
 
 Single-tenant T1.5 deployment end-to-end. `projgitd` daemon hosts
 the multi-projection mount; `projgit attach` is a client that asks
 the daemon to mount a projection at a given mountpoint.
-`DaemonFetcher` is a new `Fetcher` impl that talks over the unix
-socket.
+
+(`DaemonFetcher` is **not** a Stage 2 deliverable — in Stage 2 the
+daemon owns the FUSE mount and has direct access to its own
+`Fetcher`, so there’s nothing for a socket-Fetcher to talk to.
+`DaemonFetcher` first earns its keep in Stage 3 when the sidecar
+needs to coordinate cold fetches with a remote daemon. The
+original plan text overstated this; see the design doc §8 for the
+correct staging.)
 
 ### 2.2 Open questions to settle here (not now)
 
@@ -406,19 +411,69 @@ socket.
 - Smoke test: daemon + two clients with different projections of
   the same repo; verify shared cache state.
 
-### 2.4 Decision point
+### 2.4 Decision point — **CLEAR 2026-05-20**
 
-After Stage 2:
-- We can measure §1.6-in-memory amortisation. **Phase C bench from
-  the audit becomes runnable here.**
-- We have a daemon process that can be supervised, restarted, and
-  monitored. Stage 5 polish (systemd unit) becomes the path to
-  production.
-- We know whether the protocol design is awkward or natural.
+Stage 2 shipped in three sub-stages (commits f33601e, 8291a05,
+cb98d5a) over one focused session.
 
-### 2.5 Time estimate
+Outcomes against the predictions:
 
-Two to three focused sessions.
+- **Protocol design is natural.** JSON over length-prefixed unix
+  socket, tagged enums for Request/Response, stable error code
+  constants — no awkwardness surfaced. Total protocol module is
+  ~200 LOC plus tests; serde derive handled the wire format with
+  zero hand-rolling. If perf ever motivates it, swapping JSON for
+  MessagePack is a localised change in `protocol::write_message`
+  / `read_message`.
+- **§1.6-in-memory amortisation works over the wire.** The Stage
+  2b integration test asserts mount B’s read of an OID that mount A
+  populated produces a `blob_cache` hit. The Stage 1 in-process
+  amortisation now also covers the daemon-mediated case. **Phase C
+  bench is now runnable** — it just needs to spawn two `projgit
+  attach mount` clients against one daemon and time the cold reads.
+- **Daemon is supervisable.** `projgitd` binary parses `--socket`
+  and `--socket-mode`; signal handler in `main.rs` (not in the
+  library) self-connects and sends `Shutdown` so SIGINT/SIGTERM
+  exit cleanly. Stage 5 polish (systemd unit, PID file, persistent
+  state for fast restart) is straightforward from here.
+
+Things noted for Stage 3+:
+
+- Mutex held across whole mount/umount op. Not ideal for
+  concurrency but correctness-trivial; revisit if profiling cares.
+- V1 is one source per daemon (first Mount fixes it). Multi-source
+  per daemon is a Stage 5+ extension; current single-tenant
+  agent-eval rigs don’t need it.
+- Each `ProjectionFsProvider` still spawns its own prefetch worker
+  (per Stage 1 finding). A per-host prefetch worker in the daemon
+  is a Stage 5+ optimisation.
+
+### 2.5 Sub-stage breakdown (as shipped)
+
+Stage 2 landed in three commits, in the order originally planned:
+
+- **2a** (commit f33601e) — `projgit-daemon` crate scaffold:
+  protocol module (always-compile, no platform deps), Linux/macOS
+  server module with `Ping`/`Status`/`Shutdown` end-to-end,
+  `projgitd` binary with `--socket` / `--socket-mode` args. Signal
+  handler lives in the binary (not the library) so tests can run
+  multiple daemon instances in one process. 14 tests
+  (11 unit + 3 integration).
+- **2b** (commit 8291a05) — real `Mount`/`Umount` handlers and
+  cache-stat status. `ActiveRepo` + `ActiveBackend` enum
+  (Noop / GitCli variants) hosting one Arc<ObjectStore> and one
+  Arc<HydratingObjectStore<F>>. V1 one-source-per-daemon. Stable
+  error codes (`mount_failed`, `source_mismatch`, etc.).
+  +2 FUSE-gated integration tests.
+- **2c** (commit cb98d5a) — `projgit attach` client subcommand
+  (`ping`/`status`/`shutdown`/`mount`/`umount`) +
+  `attach_smoke.rs` test that spawns the daemon in-thread and
+  exercises the CLI as a real subprocess via
+  `env!("CARGO_BIN_EXE_projgit")`. End-to-end manual smoke
+  also confirmed against `/workspaces/projgit`.
+
+Total wall-clock: one focused session (originally estimated two
+to three).
 
 ## Stages 3–5 (outline only)
 
