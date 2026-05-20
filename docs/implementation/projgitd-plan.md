@@ -5,7 +5,8 @@
 > stage by stage. Updated as each stage lands or surfaces something
 > that changes downstream stages.
 >
-> Last updated: 2026-05-20 (initial plan, no stages started).
+> Last updated: 2026-05-20 (Stage 0 done, GREEN; Stages 1–5 not
+> started).
 >
 > Architecture lives in [`docs/design/projgitd.md`](../design/projgitd.md);
 > this doc is one level down: concrete steps, file layout, commit
@@ -34,7 +35,19 @@ speculation — Stage 0's outcome may reshape what Stage 4 looks
 like. We plan one stage in depth, sketch the next, and bullet the
 rest.
 
-## Stage 0 — Spike: prove FUSE fd passing works
+## Stage 0 — Spike: prove FUSE fd passing works — **DONE 2026-05-20, GREEN**
+
+[`spikes/fuse-fd-passing/`](../../spikes/fuse-fd-passing/README.md)
+(not a workspace member). Decisive outcome: `fuser::Session::from_fd`
+is the production-ready primitive; a process that did NOT open
+`/dev/fuse` and did NOT call `mount(2)` can fully serve the FUSE
+protocol on the resulting fd received via `SCM_RIGHTS`. Stage 4 (T4
+last-mile via Harbor + fd-passing) is now green-lit; Stages 1–3
+proceed as planned without modification.
+
+The original plan for this stage (sub-steps, code layout, decision
+points) is preserved below for reference — future stages can use it
+as a template for risk-elimination spikes.
 
 ### 0.1 Goal
 

@@ -1,13 +1,17 @@
 # Design: `projgitd` — Daemon + Sidecar Topology
 
-> Status: **under design 2026-05-20**. No code yet; this doc is the
-> architecture commitment we want to align on before any code lands.
-> Extends [`container-deployment.md`](container-deployment.md) with the
+> Status: **architecture committed 2026-05-20; Stage 0 spike done
+> GREEN 2026-05-20; Stages 1–5 not started.** Extends
+> [`container-deployment.md`](container-deployment.md) with the
 > next-step topology that closes audit items A1 (no daemon) and A3
-> (cross-process single-flight gap). Tenancy (T1.5 vs T4 last-mile) is
-> **deliberately deferred** here — the architecture supports both;
-> the choice only changes how the sidecar exposes its mount to the
-> agent.
+> (cross-process single-flight gap). Tenancy (T1.5 vs T4 last-mile)
+> is **deliberately deferred** here — the architecture supports
+> both; the choice only changes how the sidecar exposes its mount
+> to the agent.
+>
+> Implementation progress, stage-by-stage steps, and decision points
+> live in
+> [`docs/implementation/projgitd-plan.md`](../implementation/projgitd-plan.md).
 >
 > Read alongside [`workload.md`](workload.md) §1.6 (the headline
 > amortisation claim this design moves from "the on-disk CAS amortises"
@@ -509,39 +513,55 @@ Risk-ordered. Each stage either eliminates a load-bearing assumption
 or ships incremental value (or both). Stop-anywhere safe: if a
 stage's outcome surprises us, we redesign before committing further.
 
-### Stage 0 — Spike: prove FUSE fd passing is possible
+### Stage 0 — Spike: prove FUSE fd passing is possible — **DONE 2026-05-20, GREEN**
 
-**Throwaway code** in `spikes/fuse-fd-passing/`. Smallest possible
-program:
+**Throwaway code** in
+[`spikes/fuse-fd-passing/`](../../spikes/fuse-fd-passing/README.md).
+The spike demonstrated end-to-end:
 
-1. Process A opens `/dev/fuse`, calls `mount(... "fuse" ... fd=N)`
-   to attach it to a test mountpoint.
-2. Process A passes the fd to process B via `SCM_RIGHTS` over a
-   unix socket pair.
-3. Process B runs a hand-rolled minimal FUSE protocol loop:
-   `INIT`, `LOOKUP("hello")`, `READ` returning "world".
-4. Verify `cat /tmp/test/hello` from process C returns "world".
+1. Process A (`spike open`, as root) opens `/dev/fuse`, calls
+   `nix::mount::mount(... "fuse" ... fd=N ...)` directly, sends fd via
+   `SCM_RIGHTS`, exits.
+2. Process B (`spike serve`, as the regular user) receives the fd
+   via `recvmsg` + `ControlMessageOwned::ScmRights`, wraps it with
+   `fuser::Session::from_fd(...)`, and drives the protocol loop via
+   `Session::spawn() -> BackgroundSession::join()`.
+3. From a third shell, `ls /tmp/spike-mp` and
+   `cat /tmp/spike-mp/hello` both succeed and return the expected
+   "world" content.
+4. `fusermount3 -u` from outside cleanly tears down: the
+   `BackgroundSession::join()` in `serve` returns `Ok(())`, the
+   serve process exits.
 
-**Why first.** Three load-bearing questions only this can answer:
+**Findings (all green for Stage 4):**
 
-- Does `fuser` expose a "session from existing fd" API? (Or do we
-  drop to libfuse / hand-roll the protocol layer?)
-- Are there kernel-version or capability surprises in this
-  devcontainer?
-- What's the wire-format overhead?
+- `fuser::Session::from_fd` is a public API and works exactly as
+  documented. No fork of fuser, no libfuse FFI, no hand-rolled
+  protocol layer needed.
+- The mount is decoupled from the opener — once `mount(2)` returns,
+  the mount sits in the kernel mount namespace regardless of the
+  opener's lifetime, as long as some userspace holds the
+  `/dev/fuse` fd and reads from it.
+- `FUSE_INIT` is read-on-demand (kernel emits it on the first
+  `read()`), so passing the fd before any read happens means the
+  receiving process consumes `FUSE_INIT` as its first op. This
+  works as long as the opener does NOT wrap the fd in fuser
+  (which would consume INIT). The spike's `open` uses raw
+  `nix::mount::mount` and never touches fuser.
+- Clean teardown semantics — external `fusermount3 -u` makes the
+  background session join return cleanly. Makes systemd-style
+  supervision straightforward.
 
-Stage 4 cannot be designed honestly without Stage 0's answer. If
-fuser doesn't expose this, Stage 4's complexity goes up
-significantly.
+**What this does not validate** (deferred to Stage 4):
 
-**Stage 0 also has a fallback value:** even if we never reach Stage
-4 (pure T1.5 deployment), the spike is the de facto documentation
-for how FUSE-in-container actually works at the kernel layer.
+- `setns(CLONE_NEWNS)` into the agent's mount namespace before
+  `mount(2)`. The spike mounted in the current namespace. Stage 4
+  needs to put the mount somewhere only the agent can see.
+- Rootless / Podman.
 
-**Stop conditions:** if the spike reveals something fundamentally
-incompatible (e.g. fuser's session model can't be split, libfuse
-FFI is prohibitively complex), pause and redesign T4 path before
-Stages 1–3.
+Full writeup with captured output, lessons, and dispose-of-spike
+notes in
+[`spikes/fuse-fd-passing/README.md`](../../spikes/fuse-fd-passing/README.md).
 
 ### Stage 1 — Multi-projection within one process
 

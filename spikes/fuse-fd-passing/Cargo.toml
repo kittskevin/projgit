@@ -1,0 +1,14 @@
+[package]
+name = "fuse-fd-passing-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Throwaway spike for projgitd Stage 0; see docs/implementation/projgitd-plan.md.
+# NOT a workspace member.
+
+[dependencies]
+anyhow = "1"
+fuser = "0.17"
+libc = "0.2"
+nix = { version = "0.29", features = ["mount", "socket", "fs", "user"] }
