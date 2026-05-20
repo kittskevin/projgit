@@ -41,7 +41,7 @@ sidecars own the FUSE mount fd and run the protocol loop locally;
 the agent is a pure read-only consumer.
 
 We commit to this architecture, but we deliberately do *not* commit
-yet to the multi-tenancy posture (T1.5 vs T4) — see §5.
+yet to the multi-tenancy posture (T1.5 vs T4) — see §6.
 
 ## 1. The architecture
 
@@ -257,7 +257,184 @@ In practice the sidecar's `ProjectionFsProvider` only needs to
 cache inode-level metadata, since pack data is served from the OS
 page cache anyway. Detail to settle at Stage 2.
 
-## 5. Last-mile delivery: deferred (T1.5 vs T4)
+## 5. Data path: who copies what to whom
+
+The §4.2 claim "bytes do not flow over the unix socket" deserves a
+concrete walkthrough — both because the design rests on it and
+because the answer is non-obvious if you haven't internalised how
+FUSE actually shuttles data through the kernel.
+
+### 5.1 Who gets the kernel callbacks
+
+**The sidecar.** It holds the `/dev/fuse` fd, so when the kernel
+posts a `FUSE_READ` (or `FUSE_LOOKUP`, `FUSE_GETATTR`, …), only the
+sidecar can read it from that fd. The daemon never sees a
+kernel-side FUSE op — it doesn't even know which agent is asking,
+or that the agent exists at all.
+
+The daemon's API surface is `(projection, oid) → "make this OID
+resident on disk"`. No notion of "which kernel request, which
+agent buffer."
+
+### 5.2 Warm path walkthrough
+
+OID is already in the shared on-disk CAS. By §1.6 this is the vast
+majority of reads after the first container touches each OID.
+
+```
+agent: read(/repo/Cargo.toml, buf, 4096)
+  │
+  ▼ kernel VFS → FUSE driver
+  │
+  ▼ kernel posts FUSE_READ to /dev/fuse
+  │
+  ▼ sidecar reads request from /dev/fuse
+  │
+  ▼ sidecar's ObjectStore reads the pack file
+  │   (gix has it mmap'd; bytes are in the OS page cache)
+  │
+  ▼ sidecar writes FUSE response (containing the bytes)
+  │   back to /dev/fuse
+  │
+  ▼ kernel copies bytes from response → agent's buf
+  │
+  ▼ agent's read() returns
+```
+
+**The daemon is not involved at all.** The sidecar is structurally
+identical to today's `projgit mount` process on this path: same
+FUSE adapter, same mmap'd pack reads, no IPC. Warm-path latency
+is unchanged from today.
+
+### 5.3 Cold path walkthrough
+
+OID not yet on disk; sidecar needs to coordinate with daemon to
+make it resident.
+
+```
+agent: read(/repo/new-file)
+  │
+  ▼ kernel → /dev/fuse → sidecar (as above)
+  │
+  ▼ sidecar's ObjectStore → "not in CAS"
+  │
+  ▼ sidecar's DaemonFetcher sends {op: "fetch", oid: X}
+  │   over unix socket (~tens of bytes)
+  │
+  ▼ daemon receives; coalescer asks: anyone else fetching X?
+  │   YES → wait on the in-flight fetch's completion notification
+  │   NO  → spawn git fetch; write pack to shared CAS
+  │
+  ▼ daemon sends "OK, X is resident" back to sidecar (tiny ack)
+  │
+  ▼ sidecar's ObjectStore now reads X from disk (pack is there)
+  │
+  ▼ sidecar writes FUSE response → /dev/fuse → kernel → agent buf
+```
+
+**Bytes still don't cross the unix socket.** The socket carries
+only `{op, oid}` requests and `{ok|err}` responses — coordination
+only. Data gets to the sidecar because the daemon wrote it to the
+shared pack file on disk, and the sidecar reads from the same
+disk.
+
+The whole point of the daemon: that one cold fetch is shared. If
+sidecar 2 asks for the same OID a millisecond later, the coalescer
+parks it on the first fetch instead of spawning a second
+`git fetch`. That's §1.6 amortisation extended from on-disk CAS to
+in-memory cache state.
+
+### 5.4 Why the daemon can't directly copy into the agent's buffer
+
+Two related reasons:
+
+1. **It doesn't hold the FUSE fd.** Only the holder of `/dev/fuse`
+   can write the response that the kernel will deliver to the
+   agent.
+2. **It doesn't know the agent exists.** Its only contract is
+   "ensure this OID is on disk." It has no kernel handle on the
+   requesting process.
+
+The closest thing to "daemon directly into agent buffer" would be
+the **daemon-holds-fd** alternative rejected in §3. Even there,
+the data path is still:
+
+```
+daemon reads pack → daemon's userspace buffer → write to /dev/fuse
+  → kernel copies into agent's buffer
+```
+
+There's always a kernel-mediated final copy. We don't escape it
+without going to kernel-mode, and even then the kernel does a
+`memcpy`.
+
+### 5.5 The zero-copy property we do have for free
+
+What actually keeps the warm path fast isn't "no IPC" — it's
+**`mmap` on the pack files**:
+
+- The shared on-disk pack file is mapped into the sidecar's
+  address space (gix does this transparently).
+- "Reading" a pack page is a TLB load + page-cache hit, not a
+  syscall, not a copy.
+- The sidecar's FUSE response points at the mmap'd pages; the
+  kernel copies straight from those pages to the agent's buffer.
+
+For hot data the effective data path is **one** kernel copy:
+page cache → agent buf. That's roughly as fast as a userspace
+filesystem can go without abandoning POSIX semantics.
+
+The daemon doesn't make this faster. It also doesn't make it
+slower — its contribution is making sure the data is *in the page
+cache for everyone simultaneously*, not just for one container at
+a time.
+
+This is also why explicit shared-memory IPC between daemon and
+sidecar isn't on the table: the OS page cache mediating the shared
+pack files already gives us cross-process zero-copy access, for
+free, with the kernel handling coherency.
+
+### 5.6 Optimisations considered and ruled out
+
+For the record, so a future reader doesn't re-derive these:
+
+- **Shared memory for the FUSE response.** Daemon places bytes in
+  a `memfd_create`'d region, signals sidecar, sidecar's FUSE
+  response uses `FUSE_BUFVEC` to point at the shmem.
+  **Verdict: redundant** — `mmap`'d pack files already give us
+  this for any on-disk-backed data, which is all of ours.
+
+- **`splice()` from pack-file fd into `/dev/fuse`.** Sidecar uses
+  `splice(pack_fd, off, fuse_fd, …)` to move bytes inside the
+  kernel without round-tripping through userspace.
+  **Verdict: viable, ~10–20% latency win on big reads, but adds
+  complexity** and our typical reads are small (single source
+  files). Revisit if bench data ever shows the response-write
+  copy is the bottleneck.
+
+- **Pass the FUSE fd through to the daemon per-request.** Sidecar
+  reads the FUSE request, sends `{request, fd}` to daemon via
+  `SCM_RIGHTS`, daemon writes the response.
+  **Verdict: hugely complex** (fd passing on every op), eliminates
+  the sidecar-holds-fd resilience property from §3, no perf gain
+  over the disk-shared-via-page-cache model.
+
+### 5.7 The practical summary
+
+- **Sidecar local for everything that can be served locally** (the
+  vast majority of bytes once anything's been fetched).
+- **One small coordination roundtrip to the daemon** when something
+  has to be fetched from upstream.
+- **The shared on-disk CAS + OS page cache is the actual
+  high-bandwidth channel between daemon and sidecar** — not the
+  unix socket.
+- **The daemon never touches an agent's buffer.** It coordinates
+  fetches; it doesn't serve reads.
+
+The unix-socket protocol gets to stay small and uncomplicated
+precisely because the data plane lives outside it.
+
+## 6. Last-mile delivery: deferred (T1.5 vs T4)
 
 The sidecar holds a FUSE fd. **How that fd becomes a mount visible
 to the agent** is the only piece of this design that differs
@@ -303,7 +480,7 @@ ship T1.5 first (Stage 3 below); when multi-tenant lands as a real
 requirement, add the T4 `MountSource` impl (Stage 4). The rest of
 the daemon stays unchanged.
 
-## 6. How this closes audit items
+## 7. How this closes audit items
 
 This design closes or substantially closes several open items from
 [/memories/repo/audit.md](/memories/repo/audit.md):
@@ -326,7 +503,7 @@ It does *not* close:
 - **B3 (CI bench).** Separate work.
 - **Phase 3d (Windows).** Linux-only.
 
-## 7. Staged build plan
+## 8. Staged build plan
 
 Risk-ordered. Each stage either eliminates a load-bearing assumption
 or ships incremental value (or both). Stop-anywhere safe: if a
@@ -476,7 +653,7 @@ shape, persistent daemon state for fast restart, health-check
 endpoints, structured logging via `tracing-subscriber`. Out of
 scope for the design; in scope for the deliverable.
 
-## 8. Open questions to resolve in later stages
+## 9. Open questions to resolve in later stages
 
 These are deliberately not answered here. Each will be settled by
 the data Stages 0–3 produce, not by speculation now.
@@ -508,7 +685,7 @@ the data Stages 0–3 produce, not by speculation now.
   daemon's "knowledge of who's reading what" is incomplete.
   Probably fine. Worth measuring.
 
-## 9. What this document is not
+## 10. What this document is not
 
 - A protocol spec. Stage 2's PR will include the protocol
   document.

@@ -591,7 +591,7 @@ open findings plus the staged plan from
 [`docs/design/projgitd.md`](../design/projgitd.md).
 
 1. **`projgitd` Stage 0 — FUSE fd-passing spike**
-   ([`docs/design/projgitd.md`](../design/projgitd.md) §7 Stage 0).
+   ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 0).
    Smallest possible throwaway program in `spikes/fuse-fd-passing/`
    that proves an fd opened by process A and the FUSE protocol loop
    run by process B can serve a kernel-side `cat`. Settles the
@@ -600,13 +600,13 @@ open findings plus the staged plan from
    layer? Until this is answered every estimate downstream is a
    guess.
 2. **`projgitd` Stage 1 — multi-projection in one process**
-   ([`docs/design/projgitd.md`](../design/projgitd.md) §7 Stage 1).
+   ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 1).
    Largest internal refactor in the plan, ships value even as a
    single-process tool (one `ObjectStore` + `Fetcher` hosting N
    `ProjectionFsProvider`s, sharing in-memory caches across
    mounts). Substrate for the daemon scaffold in Stage 2.
 3. **`projgitd` Stage 2 — daemon scaffold + `DaemonFetcher`**
-   ([`docs/design/projgitd.md`](../design/projgitd.md) §7 Stage 2).
+   ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 2).
    First shippable version of the daemon: single-tenant T1.5
    deployment (daemon hosts the FUSE mount; agents consume via
    `-v`). Closes A1 + A3 architecturally; the Phase C bench then
@@ -628,7 +628,7 @@ open findings plus the staged plan from
    `git fetch` children writing the same `.git/objects/pack/`).
 6. **`projgitd` Stages 3–5** (sidecar holds fd; T4 last mile;
    production polish). Sequenced after Stage 2; specifics in
-   [`docs/design/projgitd.md`](../design/projgitd.md) §7.
+   [`docs/design/projgitd.md`](../design/projgitd.md) §8.
 7. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
