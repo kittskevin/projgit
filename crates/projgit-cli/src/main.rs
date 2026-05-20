@@ -55,6 +55,9 @@ enum Command {
     /// Stage 1 of the `projgitd` plan
     /// (see `docs/implementation/projgitd-plan.md`).
     MountMulti(MountMultiArgs),
+    /// Talk to a running `projgitd` (Stage 2c). Subcommands send
+    /// individual control-plane RPCs over the daemon's unix socket.
+    Attach(AttachArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -243,6 +246,51 @@ fn parse_mount_spec(s: &str) -> Result<MountSpec, String> {
     })
 }
 
+#[derive(Debug, clap::Args)]
+struct AttachArgs {
+    /// Unix socket the daemon is listening on. Defaults to
+    /// `$XDG_RUNTIME_DIR/projgitd.sock` (fall back to
+    /// `/tmp/projgitd-<uid>.sock`), matching `projgitd --socket`.
+    #[arg(long, value_name = "PATH", global = true)]
+    socket: Option<PathBuf>,
+
+    #[command(subcommand)]
+    op: AttachOp,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum AttachOp {
+    /// Liveness check.
+    Ping,
+    /// Snapshot of the daemon's mount registry + cache counters.
+    Status,
+    /// Graceful daemon shutdown.
+    Shutdown,
+    /// Ask the daemon to mount a projection.
+    Mount {
+        /// Source repo (URL or local path).
+        source: String,
+        /// Ref name to project.
+        #[arg(long = "ref", value_name = "REF")]
+        ref_name: String,
+        /// Existing empty directory the daemon should mount on.
+        #[arg(long, value_name = "PATH")]
+        mountpoint: PathBuf,
+        /// Skip the synthesised `.git/` overlay.
+        #[arg(long)]
+        no_dotgit: bool,
+        /// Set `allow_other` on the FUSE mount.
+        #[arg(long)]
+        allow_other: bool,
+    },
+    /// Ask the daemon to unmount a previously-mounted projection.
+    Umount {
+        /// Mountpoint passed to the prior `mount` request.
+        #[arg(long, value_name = "PATH")]
+        mountpoint: PathBuf,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -250,6 +298,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Mount(args) => cmd_mount(args),
         Command::MountMulti(args) => cmd_mount_multi(args),
+        Command::Attach(args) => cmd_attach(args),
     }
 }
 
@@ -1007,4 +1056,109 @@ mod tests {
         assert_ne!(https, ssh);
         assert_ne!(https, sshlong);
     }
+}
+
+// ---------------------------------------------------------------------------
+// `attach` (Stage 2c of the projgitd plan)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cmd_attach(args: AttachArgs) -> Result<()> {
+    use projgit_daemon::protocol::{read_message, write_message, Request, Response};
+    use std::os::unix::net::UnixStream;
+
+    let socket = args.socket.unwrap_or_else(default_daemon_socket);
+    let request = match args.op {
+        AttachOp::Ping => Request::Ping,
+        AttachOp::Status => Request::Status,
+        AttachOp::Shutdown => Request::Shutdown,
+        AttachOp::Mount {
+            source,
+            ref_name,
+            mountpoint,
+            no_dotgit,
+            allow_other,
+        } => Request::Mount {
+            source,
+            ref_name,
+            mountpoint,
+            no_dotgit,
+            allow_other,
+        },
+        AttachOp::Umount { mountpoint } => Request::Umount { mountpoint },
+    };
+
+    let mut stream = UnixStream::connect(&socket).with_context(|| {
+        format!(
+            "connecting to projgitd socket at {} (is the daemon running?)",
+            socket.display()
+        )
+    })?;
+    write_message(&mut stream, &request).context("write request")?;
+    let response: Response = read_message(&mut stream).context("read response")?;
+
+    print_response(&response);
+    match response {
+        Response::Err { code, .. } => bail!("daemon returned error: {code}"),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn default_daemon_socket() -> PathBuf {
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(rt).join("projgitd.sock");
+    }
+    let uid = nix::unistd::geteuid().as_raw();
+    PathBuf::from(format!("/tmp/projgitd-{uid}.sock"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn print_response(r: &projgit_daemon::protocol::Response) {
+    use projgit_daemon::protocol::Response;
+    match r {
+        Response::Pong => println!("pong"),
+        Response::Ok => println!("ok"),
+        Response::Status(s) => {
+            println!("uptime    : {}s", s.uptime_secs);
+            match &s.source {
+                Some(src) => println!("source    : {src}"),
+                None => println!("source    : (no Mount request yet)"),
+            }
+            println!("mounts    : {}", s.mounts.len());
+            for m in &s.mounts {
+                println!(
+                    "  [{}] {} -> {}",
+                    m.projection_id,
+                    m.ref_name,
+                    m.mountpoint.display()
+                );
+            }
+            if let Some(c) = &s.cache {
+                println!(
+                    "tree cache  hits={} misses={}",
+                    c.tree_hits, c.tree_misses
+                );
+                println!(
+                    "header cache hits={} misses={}",
+                    c.header_hits, c.header_misses
+                );
+                println!(
+                    "blob cache   hits={} misses={}",
+                    c.blob_hits, c.blob_misses
+                );
+            }
+        }
+        Response::Err { code, message } => {
+            eprintln!("err: {code}: {message}");
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn cmd_attach(_args: AttachArgs) -> Result<()> {
+    bail!(
+        "`projgit attach` requires the daemon, which is Linux/macOS only today. \
+         Windows support is deferred to the planned projgit-winfsp backend."
+    );
 }

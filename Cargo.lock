@@ -1959,7 +1959,9 @@ dependencies = [
  "clap",
  "ctrlc",
  "gix",
+ "nix 0.29.0",
  "projgit-core",
+ "projgit-daemon",
  "projgit-fuse",
 ]
 

@@ -32,7 +32,17 @@ gix = { workspace = true }
 # a friendly "use projgit-winfsp once Phase 3d lands" message.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 projgit-fuse = { path = "../projgit-fuse" }
+# `projgit attach` (Stage 2c of the projgitd plan) speaks the daemon's
+# unix-socket protocol. The daemon crate is Linux/macOS-only so the
+# dep is target-gated too.
+projgit-daemon = { path = "../projgit-daemon" }
+nix = { version = "0.29", features = ["user"] }
 
 [features]
 default = []
 gvfs-fetcher = ["projgit-core/gvfs-fetcher"]
+
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+projgit-daemon = { path = "../projgit-daemon" }
+anyhow = "1"
