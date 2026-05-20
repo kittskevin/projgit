@@ -292,6 +292,24 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   flag the design doc hypothesized in §4 is **not needed** for the
   canonical T1 case. Full data in
   [`docs/design/container-deployment.md`](../design/container-deployment.md) §5.1.
+- **`projgitd` daemon + sidecar topology designed (2026-05-20).**
+  Architecture commitment for the next major piece of work: a
+  per-host `projgitd` daemon owns the shared `ObjectStore` /
+  `Fetcher` / in-memory caches / fetch coalescer; per-container
+  sidecars hold the FUSE fd and run the protocol loop locally
+  (so a daemon crash degrades to a brief cold-path outage instead
+  of killing every mount); the agent is a pure read-only consumer.
+  Closes audit A1 (no daemon) and A3 (cross-process single-flight
+  gap) when shipped. Reuses the existing `Fetcher` trait as the
+  daemon-sidecar wire (a new `DaemonFetcher` impl); bytes flow
+  through the shared on-disk CAS via the OS page cache, not over
+  the socket. Last-mile tenancy choice (T1.5 bind-subdirs vs T4
+  per-namespace fd-passing) deliberately deferred — contained to
+  one trait impl per Stage 4. Five-stage build plan, risk-ordered
+  (Stage 0 spike to de-risk FUSE fd passing; Stage 1 multi-projection
+  refactor; Stage 2 daemon scaffold; Stage 3 sidecar holds fd;
+  Stage 4 T4 last mile; Stage 5 production polish). No code yet;
+  full design in [`docs/design/projgitd.md`](../design/projgitd.md).
 
 ### Deferred / archived
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
@@ -566,52 +584,84 @@ two design docs.)
 
 ## What I'd do next
 
-Reprioritized 2026-05-18 after the project audit. The audit lives in
-repo-scoped session memory at `/memories/repo/audit.md` (persists across
-conversations); the actionable items below are its top open findings.
+Reprioritized 2026-05-20 after the `projgitd` design landing. The audit
+lives in repo-scoped session memory at `/memories/repo/audit.md`
+(persists across conversations); the actionable items below are its top
+open findings plus the staged plan from
+[`docs/design/projgitd.md`](../design/projgitd.md).
 
-1. **A2 ref visibility** (audit A2 row, dotgit ladder).
+1. **`projgitd` Stage 0 — FUSE fd-passing spike**
+   ([`docs/design/projgitd.md`](../design/projgitd.md) §7 Stage 0).
+   Smallest possible throwaway program in `spikes/fuse-fd-passing/`
+   that proves an fd opened by process A and the FUSE protocol loop
+   run by process B can serve a kernel-side `cat`. Settles the
+   load-bearing question for Stage 4: does `fuser` expose an
+   fd-attach API, or do we drop to libfuse / a hand-rolled protocol
+   layer? Until this is answered every estimate downstream is a
+   guess.
+2. **`projgitd` Stage 1 — multi-projection in one process**
+   ([`docs/design/projgitd.md`](../design/projgitd.md) §7 Stage 1).
+   Largest internal refactor in the plan, ships value even as a
+   single-process tool (one `ObjectStore` + `Fetcher` hosting N
+   `ProjectionFsProvider`s, sharing in-memory caches across
+   mounts). Substrate for the daemon scaffold in Stage 2.
+3. **`projgitd` Stage 2 — daemon scaffold + `DaemonFetcher`**
+   ([`docs/design/projgitd.md`](../design/projgitd.md) §7 Stage 2).
+   First shippable version of the daemon: single-tenant T1.5
+   deployment (daemon hosts the FUSE mount; agents consume via
+   `-v`). Closes A1 + A3 architecturally; the Phase C bench then
+   measures the gain.
+4. **A2 ref visibility** (audit A2 row, dotgit ladder).
    Symbolic `HEAD` → `refs/heads/<name>` + the ref file populated
    when the projection is a `Ref`. Enables `git branch
    --show-current`, IDE branch indicators, `git log --all` seeing
    the one ref. ~150 LOC per [`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) §6;
    cleanly orthogonal to A1+ now that the axis-split insight
-   landed.
-2. **Phase C concurrent bench** (audit A3, the remaining open
-   piece of the bench audit). Two simultaneous mounts of the same
-   URL racing to cold-fetch the same blob. Would put a number on
-   the cross-process single-flight gap. Deferred from this round
-   because it's the highest-risk scenario (concurrent `git fetch`
-   children writing into the same `.git/objects/pack/`); worth
-   doing on purpose with a "if the cache dir gets weird, nuke and
-   retry" stance. Smaller now that `--scenario sequential` proved
-   the harness shape works.
-3. **B3: CI bench job.** README + bench doc claim the bench
+   landed. Independent of the `projgitd` plan; pick up between
+   stages when a self-contained piece is desired.
+5. **Phase C concurrent bench** (audit A3 measurement).
+   Two simultaneous mounts of the same URL racing to cold-fetch
+   the same blob. Puts a number on the cross-process single-flight
+   gap. Higher-leverage *after* Stage 2 lands because then we can
+   measure the gain from the daemon's coalescer directly; less
+   useful before. Highest-risk to run on the host (concurrent
+   `git fetch` children writing the same `.git/objects/pack/`).
+6. **`projgitd` Stages 3–5** (sidecar holds fd; T4 last mile;
+   production polish). Sequenced after Stage 2; specifics in
+   [`docs/design/projgitd.md`](../design/projgitd.md) §7.
+7. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
    bench and compares to the checked-in baseline. Moderate.
-4. **Phase 3d. Production `projgit-winfsp`** on top of the
+8. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-5. **`projgit mount --background` + `projgit umount`.** Today the
-   foreground process owns the mount; **this is required for any
-   real container deployment** (T1 via systemd unit on the host,
-   T2 via container entrypoint). A PID-file flow plus an `umount`
-   companion would let scripts manage many mounts. Designs need a
-   small mount registry under `$XDG_RUNTIME_DIR`.
-6. **Container deployment recipe doc.** Once `--background` lands,
-   write up a user-facing `docs/` page covering `/etc/fuse.conf`,
-   `bind-propagation`, a sample systemd unit, an example Docker
-   invocation. The architectural framing is already in
+9. **Container deployment recipe doc.** User-facing `docs/` page
+   covering `/etc/fuse.conf`, `bind-propagation`, a sample
+   systemd unit, an example Docker invocation. Architectural
+   framing already in
    [`docs/design/container-deployment.md`](../design/container-deployment.md);
-   this would be the cookbook side.
-7. **`tracing-subscriber` wiring for the existing `-v` flag.** The
-   verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
-   it. Wiring `tracing-subscriber` (with optional crate feature)
-   would surface fetcher/provider events at `-v` / `-vv`.
+   this is the cookbook side. Best after `projgitd` Stage 2 lands
+   so the recipe documents the supervised-daemon path that is the
+   intended production shape.
+10. **`tracing-subscriber` wiring for the existing `-v` flag.** The
+    verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
+    it. Wiring `tracing-subscriber` (with optional crate feature)
+    would surface fetcher/provider events at `-v` / `-vv`. Mostly
+    cosmetic until the daemon lands; then it's table stakes for
+    production diagnostics.
+
+**Items folded into the projgitd plan and removed from the
+standalone list:**
+
+- *`projgit mount --background` + `projgit umount`.* In the
+  projgitd world the daemon is the supervised long-lived process;
+  per-mount background management becomes Harbor's / kubelet's
+  job. Useful in pre-daemon T1 deployments; reconsider only if
+  the projgitd plan slips significantly.
 
 **Explicitly off the actionable list** (recorded so they don't sneak
 back in by accident):
