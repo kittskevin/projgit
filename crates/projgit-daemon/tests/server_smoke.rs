@@ -34,6 +34,7 @@ fn spawn_daemon(label: &str) -> (PathBuf, thread::JoinHandle<anyhow::Result<()>>
     let config = DaemonConfig {
         socket_path: socket_path.clone(),
         socket_mode: 0o600,
+        cache_dir: None,
     };
     let handle = thread::spawn(move || run(config));
 
@@ -98,22 +99,26 @@ fn ping_status_shutdown_roundtrip() {
 }
 
 #[test]
-fn mount_returns_not_implemented_in_stage_2a() {
-    let (sock, handle) = spawn_daemon("mount-stub");
+fn mount_rejects_nonexistent_source() {
+    // Stage 2b: Mount is no longer a stub. A bad mountpoint surfaces
+    // as `mount_failed` (canonicalize fails before we even touch the
+    // source).
+    let (sock, handle) = spawn_daemon("mount-bad-mp");
 
     let req = Request::Mount {
-        source: "/nonexistent".into(),
+        source: "/nonexistent/path/to/repo".into(),
         ref_name: "main".into(),
-        mountpoint: PathBuf::from("/tmp/never"),
+        mountpoint: PathBuf::from("/tmp/this/path/never/exists"),
         no_dotgit: false,
         allow_other: false,
     };
     match rpc(&sock, &req) {
-        Response::Err { code, .. } => assert_eq!(code, "not_implemented"),
+        Response::Err { code, .. } => {
+            assert_eq!(code, "mount_failed", "mountpoint canonicalize should fail first");
+        }
         other => panic!("got {other:?}"),
     }
 
-    // Teardown.
     let _ = rpc(&sock, &Request::Shutdown);
     handle.join().unwrap().unwrap();
 }

@@ -20,13 +20,21 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use crate::protocol::{
-    codes, read_message, write_message, FrameError, MountInfo, Request, Response, StatusReport,
+    codes, read_message, write_message, CacheStats, FrameError, MountInfo, Request, Response,
+    StatusReport,
 };
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use projgit_core::{
+    clone::{git_dir_for, partial_clone, CloneOptions},
+    GitCliFetcher, HydratingObjectStore, NoopFetcher, ObjectStore, Projection,
+    ProjectionFsProvider, RootOverlay,
+};
+use projgit_fuse::{mount_background, BackgroundSession, MountConfig, SessionACL};
+use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Configuration for [`run`].
@@ -42,6 +50,10 @@ pub struct DaemonConfig {
     /// `docs/implementation/projgitd-plan.md` §2.2). Multi-user hosts
     /// will want this widened only deliberately.
     pub socket_mode: u32,
+    /// Where to keep partial clones of URL sources. `None` means
+    /// "the user defaults" (XDG_CACHE_HOME etc.). Used only the first
+    /// time a URL source is mounted.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -49,6 +61,7 @@ impl Default for DaemonConfig {
         Self {
             socket_path: default_socket_path(),
             socket_mode: 0o600,
+            cache_dir: None,
         }
     }
 }
@@ -69,57 +82,109 @@ fn default_socket_path() -> PathBuf {
 /// real `ObjectStore`/`Fetcher`/sessions wiring.
 struct DaemonState {
     started_at: Instant,
-    /// Path the listener is bound to. Used by `request_shutdown` to
-    /// self-connect and wake the accept loop — `accept(2)` blocks
-    /// otherwise, so setting the atomic alone wouldn\'t reach the
-    /// loop until the next genuine client connects.
     socket_path: PathBuf,
-    /// Signalled when a `Shutdown` request arrives. The accept loop
-    /// checks this on every iteration after the wake-up connection
-    /// returns.
+    cache_dir: Option<PathBuf>,
     shutdown_requested: AtomicBool,
+    next_projection_id: AtomicU64,
+    active: Mutex<Option<ActiveRepo>>,
+}
+
+/// State once the daemon has been bound to a source by its first
+/// `Mount` request.
+struct ActiveRepo {
+    source: String,
+    git_dir: PathBuf,
+    store: Arc<ObjectStore>,
+    backend: ActiveBackend,
+    mounts: HashMap<PathBuf, MountEntry>,
+}
+
+/// Variant per concrete `Fetcher` type. `ProjectionFsProvider<F>` is
+/// generic over `F`, so we dispatch on the variant when building a
+/// provider instead of trying to type-erase Fetcher itself.
+enum ActiveBackend {
+    Noop(Arc<HydratingObjectStore<NoopFetcher>>),
+    GitCli(Arc<HydratingObjectStore<GitCliFetcher>>),
+}
+
+struct MountEntry {
+    ref_name: String,
+    projection_id: u64,
+    #[allow(dead_code)] // held for its Drop side effect: unmounts via fuser.
+    /// Dropping this unmounts via fuser's Drop impl.
+    session: BackgroundSession,
 }
 
 impl DaemonState {
-    fn new(socket_path: PathBuf) -> Self {
+    fn new(socket_path: PathBuf, cache_dir: Option<PathBuf>) -> Self {
         Self {
             started_at: Instant::now(),
             socket_path,
+            cache_dir,
             shutdown_requested: AtomicBool::new(false),
+            next_projection_id: AtomicU64::new(1),
+            active: Mutex::new(None),
         }
     }
 
     fn status(&self) -> StatusReport {
+        let active = self.active.lock().unwrap();
+        let (source, mounts, cache) = match &*active {
+            None => (None, Vec::new(), None),
+            Some(repo) => {
+                let mut mounts: Vec<MountInfo> = repo
+                    .mounts
+                    .iter()
+                    .map(|(mp, m)| MountInfo {
+                        ref_name: m.ref_name.clone(),
+                        mountpoint: mp.clone(),
+                        projection_id: m.projection_id,
+                    })
+                    .collect();
+                mounts.sort_by_key(|m| m.projection_id);
+                let t = repo.store.tree_cache_stats();
+                let h = repo.store.header_cache_stats();
+                let b = repo.store.blob_cache_stats();
+                let cache = CacheStats {
+                    tree_hits: t.hits,
+                    tree_misses: t.misses,
+                    header_hits: h.hits,
+                    header_misses: h.misses,
+                    blob_hits: b.hits,
+                    blob_misses: b.misses,
+                };
+                (Some(repo.source.clone()), mounts, Some(cache))
+            }
+        };
         StatusReport {
             uptime_secs: self.started_at.elapsed().as_secs(),
-            // Stage 2b fills these in for real.
-            source: None,
-            mounts: Vec::<MountInfo>::new(),
-            cache: None,
+            source,
+            mounts,
+            cache,
         }
     }
 
     fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::SeqCst);
-        // Self-connect to wake the listener\'s accept() call.
-        // Errors are intentionally ignored: if the listener has
-        // already dropped (e.g. we\'re mid-shutdown anyway), there\'s
-        // nothing useful to do.
         let _ = UnixStream::connect(&self.socket_path);
     }
 
     fn should_shut_down(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
     }
+
+    fn next_projection_id(&self) -> u64 {
+        self.next_projection_id.fetch_add(1, Ordering::SeqCst)
+    }
 }
 
 /// Run the daemon. Blocks until shutdown.
 ///
 /// Returns `Ok(())` on graceful shutdown (via `Request::Shutdown` over
-/// the socket), `Err(_)` if the listener can\'t be bound. Signal
-/// handling is **not** installed here — it\'s a process-wide resource
+/// the socket), `Err(_)` if the listener can't be bound. Signal
+/// handling is **not** installed here — it's a process-wide resource
 /// (`ctrlc` can only be set once per process) and belongs in the
-/// binary\'s `main()`. Tests that drive `run` directly trigger shutdown
+/// binary's `main()`. Tests that drive `run` directly trigger shutdown
 /// by sending [`Request::Shutdown`] over the socket; the daemon binary
 /// (`src/main.rs`) wires SIGINT/SIGTERM to the same effect by
 /// self-connecting and sending `Shutdown`.
@@ -149,7 +214,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         config.socket_mode
     );
 
-    let state = Arc::new(DaemonState::new(config.socket_path.clone()));
+    let state = Arc::new(DaemonState::new(config.socket_path.clone(), config.cache_dir.clone()));
 
     // Accept loop. Non-blocking would be cleaner but a self-connect
     // wakeup on shutdown is good enough for V1 and matches what most
@@ -229,13 +294,268 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
             state.request_shutdown();
             Response::Ok
         }
-        Request::Mount { .. } | Request::Umount { .. } => Response::Err {
-            code: "not_implemented".into(),
-            message: "Mount / Umount land in Stage 2b — see \
-                      docs/implementation/projgitd-plan.md §2"
-                .into(),
-        },
+        Request::Mount {
+            source,
+            ref_name,
+            mountpoint,
+            no_dotgit,
+            allow_other,
+        } => handle_mount(state, source, ref_name, mountpoint, no_dotgit, allow_other),
+        Request::Umount { mountpoint } => handle_umount(state, mountpoint),
     }
+}
+
+/// Mount handler. Acquires the state mutex once for the whole
+/// operation; not ideal for concurrency but trivially correct, and
+/// mount/umount are not hot paths.
+fn handle_mount(
+    state: &Arc<DaemonState>,
+    source: String,
+    ref_name: String,
+    mountpoint: PathBuf,
+    no_dotgit: bool,
+    allow_other: bool,
+) -> Response {
+    let mountpoint = match std::fs::canonicalize(&mountpoint) {
+        Ok(p) => p,
+        Err(e) => {
+            return err(
+                codes::MOUNT_FAILED,
+                format!("canonicalize mountpoint {}: {e}", mountpoint.display()),
+            )
+        }
+    };
+
+    let mut active = match state.active.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return err(codes::INTERNAL, "daemon state mutex poisoned (prior panic)")
+        }
+    };
+
+    // First mount: attach the daemon to this source.
+    if active.is_none() {
+        match attach_source(&source, state.cache_dir.as_deref()) {
+            Ok(repo) => *active = Some(repo),
+            Err(e) => return err(codes::SOURCE_OPEN_FAILED, format!("{e:#}")),
+        }
+    }
+    let repo = active.as_mut().expect("just attached");
+    if repo.source != source {
+        return err(
+            codes::SOURCE_MISMATCH,
+            format!(
+                "daemon is bound to source `{}`; this Mount asked for `{source}`.                  V1 is one source per daemon.",
+                repo.source
+            ),
+        );
+    }
+    if repo.mounts.contains_key(&mountpoint) {
+        return err(
+            codes::MOUNTPOINT_BUSY,
+            format!("{} already mounted by this daemon", mountpoint.display()),
+        );
+    }
+
+    let projection = Projection::Ref(ref_name.clone());
+    let overlay = match build_overlay(no_dotgit, &projection, &repo.store, &repo.git_dir) {
+        Ok(o) => o,
+        Err(e) => return err(codes::REF_RESOLVE_FAILED, format!("{e:#}")),
+    };
+
+    let projection_id = state.next_projection_id();
+    let mut cfg = MountConfig::default();
+    if allow_other {
+        cfg.acl = SessionACL::All;
+    }
+
+    let session_result = match &repo.backend {
+        ActiveBackend::Noop(h) => ProjectionFsProvider::new(
+            projection, h.clone(), overlay, projection_id,
+        )
+        .map_err(anyhow::Error::from)
+        .and_then(|p| {
+            mount_background(Arc::new(p), &mountpoint, &cfg).map_err(anyhow::Error::from)
+        }),
+        ActiveBackend::GitCli(h) => ProjectionFsProvider::new(
+            projection, h.clone(), overlay, projection_id,
+        )
+        .map_err(anyhow::Error::from)
+        .and_then(|p| {
+            mount_background(Arc::new(p), &mountpoint, &cfg).map_err(anyhow::Error::from)
+        }),
+    };
+
+    match session_result {
+        Ok(session) => {
+            repo.mounts.insert(
+                mountpoint,
+                MountEntry { ref_name, projection_id, session },
+            );
+            Response::Ok
+        }
+        Err(e) => err(codes::MOUNT_FAILED, format!("{e:#}")),
+    }
+}
+
+fn handle_umount(state: &Arc<DaemonState>, mountpoint: PathBuf) -> Response {
+    let mountpoint = match std::fs::canonicalize(&mountpoint) {
+        Ok(p) => p,
+        Err(e) => {
+            return err(
+                codes::NO_SUCH_MOUNT,
+                format!("canonicalize mountpoint {}: {e}", mountpoint.display()),
+            )
+        }
+    };
+    let mut active = match state.active.lock() {
+        Ok(g) => g,
+        Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+    };
+    let Some(repo) = active.as_mut() else {
+        return err(codes::NO_SUCH_MOUNT, "daemon has no active source yet");
+    };
+    match repo.mounts.remove(&mountpoint) {
+        Some(_entry) => Response::Ok,
+        None => err(
+            codes::NO_SUCH_MOUNT,
+            format!("no mount registered at {}", mountpoint.display()),
+        ),
+    }
+}
+
+fn err(code: &str, message: impl Into<String>) -> Response {
+    Response::Err {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Source attachment + overlay helpers
+// -----------------------------------------------------------------------------
+
+fn looks_like_url(s: &str) -> bool {
+    s.contains("://") || s.starts_with("git@")
+}
+
+/// Open the source repo (URL -> partial clone into cache; local path
+/// -> open in place), choose the matching backend, and return a
+/// freshly-constructed `ActiveRepo`.
+fn attach_source(source: &str, cache_dir_override: Option<&Path>) -> Result<ActiveRepo> {
+    if looks_like_url(source) {
+        let cache_dir = resolve_cache_dir(cache_dir_override)?;
+        let dest = cache_dir.join(cache_subdir_for_url(source));
+        if !dest.exists() {
+            eprintln!("projgitd: partial-cloning {} into {}", source, dest.display());
+            std::fs::create_dir_all(&cache_dir)
+                .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+            let opts = CloneOptions::new(source.to_owned(), dest.clone());
+            partial_clone(&opts).with_context(|| format!("cloning {source}"))?;
+        } else {
+            eprintln!("projgitd: reusing cached clone at {}", dest.display());
+        }
+        let git_dir = git_dir_for(&dest);
+        let store = Arc::new(
+            ObjectStore::open(&git_dir)
+                .with_context(|| format!("opening object store at {}", git_dir.display()))?,
+        );
+        let fetcher = GitCliFetcher::open(store.clone())
+            .context("opening GitCliFetcher (needs `git` on PATH)")?;
+        let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
+        Ok(ActiveRepo {
+            source: source.to_owned(),
+            git_dir,
+            store,
+            backend: ActiveBackend::GitCli(hydrating),
+            mounts: HashMap::new(),
+        })
+    } else {
+        let path = PathBuf::from(source);
+        if !path.exists() {
+            return Err(anyhow!("source path {} does not exist", path.display()));
+        }
+        let git_dir = git_dir_for(&path);
+        let store = Arc::new(
+            ObjectStore::open(&git_dir)
+                .with_context(|| format!("opening object store at {}", git_dir.display()))?,
+        );
+        let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), NoopFetcher));
+        Ok(ActiveRepo {
+            source: source.to_owned(),
+            git_dir,
+            store,
+            backend: ActiveBackend::Noop(hydrating),
+            mounts: HashMap::new(),
+        })
+    }
+}
+
+fn resolve_cache_dir(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        return Ok(PathBuf::from(xdg).join("projgit"));
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow!("HOME not set; pass --cache-dir explicitly"))?;
+    Ok(PathBuf::from(home).join(".cache").join("projgit"))
+}
+
+/// Stable filesystem-safe subdir name for a URL. Mirrors the helper
+/// in `projgit-cli/src/main.rs`; duplicated because lifting the
+/// CLI helper would mean a new shared crate or making the CLI a
+/// library too.
+fn cache_subdir_for_url(url: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let canonical = canonicalize_url_for_hash(url);
+    let mut h = DefaultHasher::new();
+    canonical.hash(&mut h);
+    let hash = h.finish();
+    let basename = url
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("repo")
+        .trim_end_matches(".git");
+    format!("{basename}-{hash:016x}")
+}
+
+fn canonicalize_url_for_hash(url: &str) -> String {
+    let mut s = url.trim().to_ascii_lowercase();
+    while s.ends_with('/') {
+        s.pop();
+    }
+    if s.ends_with(".git") {
+        s.truncate(s.len() - 4);
+    }
+    s
+}
+
+fn build_overlay(
+    no_dotgit: bool,
+    projection: &Projection,
+    store: &Arc<ObjectStore>,
+    git_dir: &Path,
+) -> Result<RootOverlay> {
+    use projgit_core::dotgit;
+
+    if no_dotgit {
+        return Ok(RootOverlay::new());
+    }
+    if matches!(projection, Projection::Subtree { .. }) {
+        return Ok(RootOverlay::new());
+    }
+    let commit_oid = projection
+        .resolve_commit(store)
+        .with_context(|| "resolving projection commit for .git/ synthesis")?;
+    let objects_dir = git_dir.join("objects");
+    let objects_dir = std::fs::canonicalize(&objects_dir)
+        .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
+    dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
+        .context("building A1+ overlay")
 }
 
 // -----------------------------------------------------------------------------
@@ -249,7 +569,7 @@ mod tests {
 
     #[test]
     fn ping_dispatches_to_pong() {
-        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock")));
+        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock"), None));
         match dispatch(&state, Request::Ping) {
             Response::Pong => {}
             other => panic!("got {other:?}"),
@@ -258,7 +578,7 @@ mod tests {
 
     #[test]
     fn status_reports_uptime_and_empty_state() {
-        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock")));
+        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock"), None));
         match dispatch(&state, Request::Status) {
             Response::Status(r) => {
                 assert!(r.mounts.is_empty());
@@ -271,7 +591,7 @@ mod tests {
 
     #[test]
     fn shutdown_sets_flag_and_returns_ok() {
-        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock")));
+        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock"), None));
         assert!(!state.should_shut_down());
         match dispatch(&state, Request::Shutdown) {
             Response::Ok => {}
@@ -280,19 +600,4 @@ mod tests {
         assert!(state.should_shut_down());
     }
 
-    #[test]
-    fn mount_returns_not_implemented_stub() {
-        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock")));
-        let req = Request::Mount {
-            source: "x".into(),
-            ref_name: "main".into(),
-            mountpoint: PathBuf::from("/tmp/x"),
-            no_dotgit: false,
-            allow_other: false,
-        };
-        match dispatch(&state, req) {
-            Response::Err { code, .. } => assert_eq!(code, "not_implemented"),
-            other => panic!("got {other:?}"),
-        }
-    }
 }
