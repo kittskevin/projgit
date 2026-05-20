@@ -50,6 +50,11 @@ struct Cli {
 enum Command {
     /// Mount a projection of a repository at a local path.
     Mount(MountArgs),
+    /// Mount many projections of one repository in a single process,
+    /// sharing the `ObjectStore`, `Fetcher`, and in-memory caches.
+    /// Stage 1 of the `projgitd` plan
+    /// (see `docs/implementation/projgitd-plan.md`).
+    MountMulti(MountMultiArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -156,12 +161,95 @@ enum FetcherChoice {
     Gvfs,
 }
 
+#[derive(Debug, clap::Args)]
+struct MountMultiArgs {
+    /// Source repository: a URL or a path to a local checkout /
+    /// bare repository. The repo is opened **once**; every
+    /// `--mount` projection of it shares the same `ObjectStore`,
+    /// `Fetcher`, and in-memory caches.
+    source: String,
+
+    /// One projection to mount, formatted as `REF=PATH`. The ref is
+    /// resolved against the source repo; the path must already
+    /// exist as a directory. Repeat to host multiple projections
+    /// in this process. `--commit` and `--subtree` are not yet
+    /// supported in `mount-multi`; use single-mount for those.
+    #[arg(long = "mount", value_name = "REF=PATH",
+          value_parser = parse_mount_spec, required = true,
+          num_args = 1.., action = clap::ArgAction::Append)]
+    mounts: Vec<MountSpec>,
+
+    /// Where to keep clones of remote repositories. Only used when
+    /// `source` is a URL.
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Remote name to fetch from (default `origin`). Ignored in
+    /// `--offline` mode and for local sources.
+    #[arg(long, default_value = "origin")]
+    remote: String,
+
+    /// Skip on-demand fetching. Any miss against the local store
+    /// surfaces as an I/O error.
+    #[arg(long)]
+    offline: bool,
+
+    /// On unmount, print shared `ObjectStore` cache stats and
+    /// per-projection prefetch counters.
+    #[arg(long)]
+    stats: bool,
+
+    /// Apply to every projection: don't synthesize a `.git/` directory
+    /// at the projection root. See `mount --no-dotgit` for the
+    /// semantics.
+    #[arg(long)]
+    no_dotgit: bool,
+
+    /// Apply to every projection: pass the `allow_other` FUSE mount
+    /// option. See `mount --allow-other` for the security note.
+    #[arg(long)]
+    allow_other: bool,
+
+    /// Fetch backend for URL-backed mounts.
+    #[arg(long, value_enum, default_value = "git")]
+    fetcher: FetcherChoice,
+
+    /// Base GVFS protocol URL, with or without a trailing `/gvfs`.
+    /// Required when `--fetcher gvfs` is selected.
+    #[cfg(feature = "gvfs-fetcher")]
+    #[arg(long, value_name = "URL")]
+    gvfs_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MountSpec {
+    ref_name: String,
+    mountpoint: PathBuf,
+}
+
+fn parse_mount_spec(s: &str) -> Result<MountSpec, String> {
+    let (r, p) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected REF=PATH, got `{s}`"))?;
+    if r.is_empty() {
+        return Err(format!("ref name is empty in `{s}`"));
+    }
+    if p.is_empty() {
+        return Err(format!("mountpoint is empty in `{s}`"));
+    }
+    Ok(MountSpec {
+        ref_name: r.to_owned(),
+        mountpoint: PathBuf::from(p),
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
     match cli.command {
         Command::Mount(args) => cmd_mount(args),
+        Command::MountMulti(args) => cmd_mount_multi(args),
     }
 }
 
@@ -320,6 +408,266 @@ fn cmd_mount(_args: MountArgs) -> Result<()> {
          deferred to the planned projgit-winfsp backend."
     );
 }
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn cmd_mount_multi(_args: MountMultiArgs) -> Result<()> {
+    bail!(
+        "`projgit mount-multi` is not yet supported on this platform. \
+         Linux/macOS use FUSE (projgit-fuse); Windows support is \
+         deferred to the planned projgit-winfsp backend."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `mount-multi` (Stage 1 of the projgitd plan)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cmd_mount_multi(args: MountMultiArgs) -> Result<()> {
+    #[cfg(feature = "gvfs-fetcher")]
+    use projgit_core::GvfsFetcher;
+    use projgit_core::{
+        clone::{git_dir_for, partial_clone, CloneOptions},
+        GitCliFetcher, HydratingObjectStore, NoopFetcher, ObjectStore,
+    };
+    use std::sync::Arc;
+
+    if args.mounts.is_empty() {
+        bail!("at least one --mount REF=PATH is required");
+    }
+    // Reject duplicate mountpoints up front; the underlying mount(2)
+    // would just blow up later and the error wouldn\'t name what
+    // collided.
+    let mut seen = std::collections::HashSet::new();
+    for spec in &args.mounts {
+        if !spec.mountpoint.is_dir() {
+            bail!(
+                "mountpoint {} does not exist or is not a directory",
+                spec.mountpoint.display()
+            );
+        }
+        let canon = std::fs::canonicalize(&spec.mountpoint).with_context(|| {
+            format!("canonicalizing mountpoint {}", spec.mountpoint.display())
+        })?;
+        if !seen.insert(canon.clone()) {
+            bail!(
+                "mountpoint {} listed more than once",
+                spec.mountpoint.display()
+            );
+        }
+    }
+
+    // 1. Resolve `source` to a local git directory (same as cmd_mount).
+    let (git_dir, source_is_url) = if looks_like_url(&args.source) {
+        let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+        let dest = cache_dir.join(cache_subdir_for_url(&args.source));
+        if !dest.exists() {
+            eprintln!(
+                "projgit: partial-cloning {} into {}",
+                args.source,
+                dest.display()
+            );
+            std::fs::create_dir_all(&cache_dir)
+                .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+            let opts = CloneOptions::new(args.source.clone(), dest.clone());
+            partial_clone(&opts).with_context(|| format!("cloning {}", args.source))?;
+        } else {
+            eprintln!("projgit: reusing cached clone at {}", dest.display());
+        }
+        (git_dir_for(&dest), true)
+    } else {
+        let p = PathBuf::from(&args.source);
+        if !p.exists() {
+            bail!("source path {} does not exist", p.display());
+        }
+        (git_dir_for(&p), false)
+    };
+
+    // 2. Open the shared ObjectStore (one per process, regardless of N).
+    let store = Arc::new(
+        ObjectStore::open(&git_dir)
+            .with_context(|| format!("opening object store at {}", git_dir.display()))?,
+    );
+
+    // 3. Pick a fetcher; dispatch into the generic helper. The arms
+    //    differ only at the fetcher\'s concrete type.
+    let _remote_hint = &args.remote;
+    if args.offline || !source_is_url {
+        if args.fetcher != FetcherChoice::Git {
+            bail!("--fetcher gvfs requires a URL source and cannot be combined with --offline");
+        }
+        let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), NoopFetcher));
+        run_mount_multi(store, hydrating, &args, &git_dir)
+    } else {
+        match args.fetcher {
+            FetcherChoice::Git => {
+                let fetcher = GitCliFetcher::open(store.clone())
+                    .context("opening GitCliFetcher (needs `git` on PATH)")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
+                run_mount_multi(store, hydrating, &args, &git_dir)
+            }
+            #[cfg(feature = "gvfs-fetcher")]
+            FetcherChoice::Gvfs => {
+                let gvfs_url = args
+                    .gvfs_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--fetcher gvfs requires --gvfs-url <URL>"))?;
+                let fetcher = match std::env::var("PROJGIT_GVFS_TOKEN") {
+                    Ok(token) if !token.is_empty() => {
+                        GvfsFetcher::with_bearer_token(store.clone(), gvfs_url, token)
+                    }
+                    _ => GvfsFetcher::open(store.clone(), gvfs_url),
+                }
+                .context("opening GvfsFetcher")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
+                run_mount_multi(store, hydrating, &args, &git_dir)
+            }
+        }
+    }
+}
+
+/// Shared per-fetcher body. Loops over the user\'s `--mount` specs,
+/// building one `ProjectionFsProvider` per spec (all sharing the same
+/// `Arc<HydratingObjectStore<F>>`) and spawning one
+/// `mount_background` per spec. Holds every `BackgroundSession` until
+/// Ctrl-C; drop-order unmounts all cleanly.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_mount_multi<F>(
+    store: std::sync::Arc<projgit_core::ObjectStore>,
+    hydrating: std::sync::Arc<projgit_core::HydratingObjectStore<F>>,
+    args: &MountMultiArgs,
+    git_dir: &Path,
+) -> Result<()>
+where
+    F: projgit_core::Fetcher + 'static,
+{
+    use projgit_core::{Projection, ProjectionFsProvider};
+    use projgit_fuse::MountConfig;
+    use std::sync::Arc;
+
+    let mut cfg = MountConfig::default();
+    if args.allow_other {
+        cfg.acl = projgit_fuse::SessionACL::All;
+    }
+
+    let mut sessions: Vec<projgit_fuse::BackgroundSession> = Vec::with_capacity(args.mounts.len());
+    let mut providers: Vec<Arc<ProjectionFsProvider<F>>> = Vec::with_capacity(args.mounts.len());
+
+    for (idx, spec) in args.mounts.iter().enumerate() {
+        // projection_id is 1-based so it stays distinct from the
+        // single-mount path (which uses 1) when this code shares a
+        // future daemon address space.
+        let projection_id = (idx + 1) as u64;
+        let projection = Projection::Ref(spec.ref_name.clone());
+        let overlay =
+            build_overlay_no_subtree(args.no_dotgit, &projection, &store, git_dir).with_context(
+                || format!("building overlay for {}", spec.ref_name),
+            )?;
+        let provider = Arc::new(
+            ProjectionFsProvider::new(projection, hydrating.clone(), overlay, projection_id)
+                .with_context(|| {
+                    format!(
+                        "building ProjectionFsProvider for {} -> {}",
+                        spec.ref_name,
+                        spec.mountpoint.display()
+                    )
+                })?,
+        );
+        eprintln!(
+            "projgit: mounting {} at {} (projection_id={})",
+            spec.ref_name,
+            spec.mountpoint.display(),
+            projection_id
+        );
+        let session = projgit_fuse::mount_background(provider.clone(), &spec.mountpoint, &cfg)
+            .with_context(|| format!("mounting at {}", spec.mountpoint.display()))?;
+        sessions.push(session);
+        providers.push(provider);
+    }
+
+    eprintln!(
+        "projgit: {} projection(s) mounted; Ctrl-C to unmount all",
+        sessions.len()
+    );
+
+    // Park on Ctrl-C / SIGTERM. Dropping every session unmounts via
+    // fuser\'s Drop impl.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .context("installing Ctrl-C handler")?;
+    rx.recv().ok();
+
+    eprintln!("projgit: unmounting {} session(s)…", sessions.len());
+    drop(sessions);
+
+    if args.stats {
+        // Tree / header / blob caches are shared across all
+        // providers (they live on the inner ObjectStore), so print
+        // them once. Prefetch counters are per-provider; print one
+        // line per mount.
+        let s = store.as_ref();
+        let t = s.tree_cache_stats();
+        let h = s.header_cache_stats();
+        let b = s.blob_cache_stats();
+        eprintln!(
+            "projgit: tree cache    hits={} misses={} inserts={} evictions={} len={}/{}",
+            t.hits, t.misses, t.inserts, t.evictions, t.len, t.capacity,
+        );
+        eprintln!(
+            "projgit: header cache  hits={} misses={} inserts={} evictions={} len={}/{}",
+            h.hits, h.misses, h.inserts, h.evictions, h.len, h.capacity,
+        );
+        eprintln!(
+            "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
+            b.hits, b.misses, b.inserts, b.evictions, b.skipped_too_large,
+            b.bytes_used, b.capacity_bytes,
+        );
+        for (provider, spec) in providers.iter().zip(args.mounts.iter()) {
+            let p = provider.prefetch_stats();
+            eprintln!(
+                "projgit: prefetch ({:<20}) posted={} dropped={} batches={} resolved={} headers={} failed={}",
+                spec.ref_name,
+                p.posted, p.dropped, p.batches_sent, p.oids_resolved, p.headers_published, p.oids_failed,
+            );
+        }
+    }
+
+    eprintln!("projgit: unmounted all.");
+    Ok(())
+}
+
+/// `build_root_overlay` sibling that takes individual flags rather
+/// than the single-mount `MountArgs`. Behaviour identical: A1+ overlay
+/// by default, empty overlay if `no_dotgit` or `Projection::Subtree`
+/// (the latter unreachable today since `mount-multi` only accepts
+/// refs, but the guard stays for the future).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn build_overlay_no_subtree(
+    no_dotgit: bool,
+    projection: &projgit_core::Projection,
+    store: &std::sync::Arc<projgit_core::ObjectStore>,
+    git_dir: &Path,
+) -> Result<projgit_core::RootOverlay> {
+    use projgit_core::{dotgit, Projection, RootOverlay};
+
+    if no_dotgit {
+        return Ok(RootOverlay::new());
+    }
+    if matches!(projection, Projection::Subtree { .. }) {
+        return Ok(RootOverlay::new());
+    }
+    let commit_oid = projection
+        .resolve_commit(store)
+        .with_context(|| "resolving projection commit for .git/ synthesis")?;
+    let objects_dir = git_dir.join("objects");
+    let objects_dir = std::fs::canonicalize(&objects_dir)
+        .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
+    dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
+        .context("building A1+ overlay")
+}
+
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_mount<F>(
