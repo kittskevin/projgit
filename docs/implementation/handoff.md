@@ -9,7 +9,8 @@
 >
 > Living document. Updated whenever we land a phase or change direction.
 > Last updated: 2026-06-02, after `projgitd` Stage 3 shipped
-> (sidecar holds the FUSE fd; daemon is pure data plane).
+> (sidecar holds the FUSE fd; daemon is pure data plane) and the
+> dotgit A2 ref-visibility rung landed.
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -229,6 +230,31 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   clean" with zero user configuration. 5 unit tests in
   `crates/projgit-core/tests/dotgit_index.rs` + 1 network-gated e2e
   test. Full design in [`docs/design/dotgit-index.md`](../design/dotgit-index.md).
+- **dotgit A2 ref visibility for branch projections (2026-06-02).**
+  `crate::dotgit::apply_a2_ref_visibility(overlay, branch_full, oid)`
+  mutates an A1 / A1+ overlay in place: symbolic `.git/HEAD` →
+  `ref: refs/heads/<branch>\n` plus a loose ref file at
+  `.git/refs/heads/<branch>` containing `<oid>\n`. Pure data
+  mutation; no store dependency. Supports nested branch names
+  (`feature/foo` creates the intermediate directory on the fly).
+  `ObjectStore::try_resolve_branch_full_name(refname)` does
+  short-name → full-name resolution and gates by ref kind
+  (returns `None` for tags, remote-tracking refs, non-existent
+  refs, and `HEAD` itself; those correctly stay on A1's detached
+  HEAD). All three overlay-building call sites (`projgit mount`,
+  `projgit mount-multi`, `projgitd` Mount handler) apply A2 when
+  applicable; no separate CLI flag — it's just "what `--no-dotgit`
+  opts out of". Inside the mount: `git symbolic-ref HEAD` →
+  `refs/heads/<branch>`, `git branch --show-current` → `<branch>`
+  (was empty under A1+), IDE branch indicators show the branch
+  name instead of "detached HEAD". 6 unit tests in dotgit.rs
+  + 1 resolver integration test + 1 network-gated e2e test
+  (`mount_real_remote_with_dotgit_a2_shows_branch_name` against
+  `rust-lang/log`). Manual smoke against `/workspaces/projgit`:
+  `cat .git/HEAD` shows `ref: refs/heads/main`,
+  `git rev-parse refs/heads/main` matches `git rev-parse HEAD`
+  (`686dd10`, the de-flake commit). Full design in
+  [`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) §9.7.
 - **FUSE adapter echoes the requesting process's uid/gid as file
   ownership (2026-05-17).** Previously every file in a mount showed
   as `root`-owned regardless of who was running `projgit`, which
@@ -673,12 +699,13 @@ two design docs.)
 
 ## What I'd do next
 
-Reprioritized 2026-06-02 after `projgitd` Stage 3 landed. The audit
-lives in repo-scoped session memory at `/memories/repo/audit.md`
-(persists across conversations); the actionable items below are its top
-open findings plus the staged plan from
-[`docs/design/projgitd.md`](../design/projgitd.md). Stage-by-stage
-implementation steps, commit boundaries, and decision points live in
+Reprioritized 2026-06-02 after `projgitd` Stage 3 and dotgit A2
+landed. The audit lives in repo-scoped session memory at
+`/memories/repo/audit.md` (persists across conversations); the
+actionable items below are its top open findings plus the staged
+plan from [`docs/design/projgitd.md`](../design/projgitd.md).
+Stage-by-stage implementation steps, commit boundaries, and
+decision points live in
 [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
 the working doc that gets updated as each stage lands.
 
@@ -690,35 +717,29 @@ the working doc that gets updated as each stage lands.
    coalescer in the daemon's `HydratingObjectStore` should turn N
    concurrent requests into 1 upstream fetch. Puts the first
    empirical number on the cross-process single-flight gap.
-2. **A2 ref visibility** (audit A2 row, dotgit ladder).
-   Symbolic `HEAD` → `refs/heads/<name>` + the ref file populated
-   when the projection is a `Ref`. Enables `git branch
-   --show-current`, IDE branch indicators, `git log --all` seeing
-   the one ref. ~150 LOC per [`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) §6;
-   cleanly orthogonal to the `projgitd` plan.
-3. **`projgitd` Stage 4 — T4 last mile via per-namespace fd-passing.**
+2. **`projgitd` Stage 4 — T4 last mile via per-namespace fd-passing.**
    Add the second `MountSource` impl: sidecar accepts a FUSE fd from
    Harbor via `SCM_RIGHTS` and runs the protocol loop against it,
    instead of opening `/dev/fuse` itself. Builds on Stage 0 (proven
    fd-passing) and Stage 3 (sidecar architecture). The Stage 3
    `DaemonFetcher` carries over unchanged — Stage 4 is purely about
    how the sidecar receives its fd, not where its cold fetches go.
-4. **`projgitd` Stage 5 — production polish.** systemd unit,
+3. **`projgitd` Stage 5 — production polish.** systemd unit,
    PID file / restart policy, persistent daemon state for fast
    recovery (so daemon-restart doesn't re-resolve refs), health
    checks, `tracing-subscriber` wiring for the existing `-v` flag,
    structured logging.
-5. **B3: CI bench job.** README + bench doc claim the bench
+4. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
    bench and compares to the checked-in baseline. Moderate.
-6. **Phase 3d. Production `projgit-winfsp`** on top of the
+5. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-7. **Container deployment recipe doc.** User-facing `docs/` page
+6. **Container deployment recipe doc.** User-facing `docs/` page
    covering `/etc/fuse.conf`, `bind-propagation`, a sample
    systemd unit, an example Docker invocation, **and the new
    sidecar deployment shape** (`projgitd` on the host or in a
@@ -726,7 +747,8 @@ the working doc that gets updated as each stage lands.
    --daemon-socket /run/projgitd.sock`). Architectural framing
    in [`docs/design/container-deployment.md`](../design/container-deployment.md)
    and [`docs/design/projgitd.md`](../design/projgitd.md); this is
-   the cookbook side.
+   the cookbook side. The [scripts/docker-smoke/](../../scripts/docker-smoke/)
+   recipe shipped with Stage 3d is the runnable seed.
 
 **Items folded into the projgitd plan and removed from the
 standalone list:**

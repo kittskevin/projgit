@@ -806,7 +806,8 @@ where
 
 /// `build_root_overlay` sibling that takes individual flags rather
 /// than the single-mount `MountArgs`. Behaviour identical: A1+ overlay
-/// by default, empty overlay if `no_dotgit` or `Projection::Subtree`
+/// by default, plus A2 ref visibility when the projection is a
+/// branch; empty overlay if `no_dotgit` or `Projection::Subtree`
 /// (the latter unreachable today since `mount-multi` only accepts
 /// refs, but the guard stays for the future).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -830,8 +831,10 @@ fn build_overlay_no_subtree(
     let objects_dir = git_dir.join("objects");
     let objects_dir = std::fs::canonicalize(&objects_dir)
         .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
-        .context("building A1+ overlay")
+    let mut overlay = dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
+        .context("building A1+ overlay")?;
+    apply_a2_if_branch(&mut overlay, projection, store, commit_oid);
+    Ok(overlay)
 }
 
 
@@ -959,8 +962,10 @@ fn looks_like_url(s: &str) -> bool {
 /// Construct the `RootOverlay` for the mount based on the user's flags
 /// and the projection kind. Default behavior synthesizes an A1+ `.git/`
 /// (A1 plus a clean read-only `.git/index` matching HEAD) pointing at
-/// the commit and the shared object store; `--no-dotgit` or a `Subtree`
-/// projection yields an empty overlay.
+/// the commit and the shared object store, and applies **A2** ref
+/// visibility on top when the projection is a branch (symbolic `HEAD`
+/// → `refs/heads/<branch>` plus the loose ref file). `--no-dotgit`
+/// or a `Subtree` projection yields an empty overlay.
 fn build_root_overlay(
     args: &MountArgs,
     projection: &projgit_core::Projection,
@@ -986,7 +991,31 @@ fn build_root_overlay(
     let objects_dir = git_dir.join("objects");
     let objects_dir = std::fs::canonicalize(&objects_dir)
         .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")
+    let mut overlay = dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
+        .context("building A1+ overlay")?;
+    apply_a2_if_branch(&mut overlay, projection, store, commit_oid);
+    Ok(overlay)
+}
+
+/// Apply A2 ref visibility to `overlay` when `projection` is a
+/// `Projection::Ref` that resolves to a local branch. No-op for
+/// `Commit`, `Subtree`, tag refs, or refs that don't exist.
+///
+/// Factored out of [`build_root_overlay`] / [`build_overlay_no_subtree`]
+/// so both single-mount and multi-mount call sites apply the same
+/// rule with one definition.
+fn apply_a2_if_branch(
+    overlay: &mut projgit_core::RootOverlay,
+    projection: &projgit_core::Projection,
+    store: &projgit_core::ObjectStore,
+    commit_oid: gix::ObjectId,
+) {
+    use projgit_core::{dotgit, Projection};
+    if let Projection::Ref(name) = projection {
+        if let Some(full) = store.try_resolve_branch_full_name(name) {
+            dotgit::apply_a2_ref_visibility(overlay, &full, commit_oid);
+        }
+    }
 }
 
 /// Default cache root. Honours `XDG_CACHE_HOME`; falls back to

@@ -185,6 +185,7 @@ ownership, so git's `safe.directory` check passes without any user setup.
 | `git status` / `git status --porcelain` | "nothing to commit, working tree clean" / empty                       |
 | `git diff` / `git diff --cached`        | Both empty                                                            |
 | `git ls-files`                          | Returns the projection's file list                                    |
+| `git branch --show-current`, `git symbolic-ref HEAD` | Returns the branch name (when projection is a `Ref`) / `refs/heads/<branch>` |
 | `cargo build` source-control stamping   | Picks up the commit OID                                               |
 | `ripgrep`, `fd`, IDE repo detection     | Treat the mount as a repo; respect the projection's `.gitignore`      |
 
@@ -192,14 +193,14 @@ ownership, so git's `safe.directory` check passes without any user setup.
 
 - Any write verb — `git add`, `git commit`, `git stash`, `git update-index`
   fail with "permission denied". The mount has no writable working tree.
-- Branch-aware output — `git branch --show-current` prints `HEAD` rather
-  than the branch name; IDE branch indicators show "detached HEAD". This
-  needs **A2** ref visibility (deferred — see
-  [docs/design/dotgit-synthesis.md](docs/design/dotgit-synthesis.md) §4).
-- `git log --all` sees only `HEAD` (same reason — no refs visible).
+- `git log --all` sees the projection's branch but not other refs —
+  projections only synthesize the one branch they're projecting.
 - `git push`, `git fetch`, `git checkout <other>` — projection identity is
   fixed at mount time; switching commits means mounting a different
   projection.
+- `--commit <oid>` projections keep a detached `HEAD` (no branch to
+  symbolically point at); tag projections also stay detached because
+  git refuses to set `HEAD` symbolically to a tag.
 
 **Opt-outs:**
 
@@ -208,8 +209,9 @@ ownership, so git's `safe.directory` check passes without any user setup.
   describing the full commit while the user browses only a subtree would
   create surprising `git log <path>` semantics.
 
-The design ladder (A0 / A1 / A1+ / A2 / A3), why A1+ is the current
-shipped default, and what's still deferred all live in
+The design ladder (A0 / A1 / A1+ / A2 / A3), why A1+A2 is the current
+shipped default for branch projections, and what's still deferred (A3
+writable illusion) all live in
 [docs/design/dotgit-synthesis.md](docs/design/dotgit-synthesis.md) (parent
 ladder) and [docs/design/dotgit-index.md](docs/design/dotgit-index.md)
 (A1+ index synthesis specifically).
@@ -341,11 +343,14 @@ What works today:
 - Linux/macOS FUSE backend through `fuser`, with file ownership echoed
   per-request so `git`'s `safe.directory` check passes without setup.
 - `projgit mount` for refs, commits, and subtrees.
-- A1-flavored `.git/` synthesized at the mount root by default
-  (detached HEAD pointing at the projection's commit, plus
+- A1+ / A2-flavored `.git/` synthesized at the mount root by default
+  for branch projections (symbolic HEAD pointing at the branch ref,
+  a clean read-only `.git/index` matching HEAD, and
   `objects/info/alternates` reaching the shared on-disk store), so
-  `git rev-parse HEAD`, `git log`, `git cat-file`, `cargo build`'s VCS
-  detection, and IDE repo-root detection all work out of the box.
+  `git rev-parse HEAD`, `git status`, `git log`,
+  `git branch --show-current`, `git symbolic-ref HEAD`, `cargo build`'s
+  VCS detection, and IDE branch indicators all work out of the box.
+  Commit-OID and tag projections keep the detached HEAD (A1+).
   Opt out with `--no-dotgit`.
 - Tree, blob, and header caches, plus T1 readdir-time header prefetch.
 - Optional GVFS protocol fetcher (Azure DevOps Server / Azure Repos) behind the `gvfs-fetcher` Cargo feature.

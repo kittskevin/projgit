@@ -472,3 +472,136 @@ fn mount_real_remote_with_dotgit_a1_plus_shows_clean_status() {
 
     drop(_session);
 }
+
+/// **A2** companion: same setup, with `dotgit::apply_a2_ref_visibility`
+/// applied on top of A1+. Asserts what the symbolic-HEAD + loose ref
+/// file unlocks: `git symbolic-ref HEAD` returns the branch's full
+/// name, `git branch --show-current` returns the short name (vs
+/// empty under A1 / A1+), and `git rev-parse <branch>` and
+/// `git rev-parse HEAD` agree. See `docs/design/dotgit-synthesis.md`
+/// §4.1 row A2.
+#[test]
+#[ignore = "requires FUSE and network; opt in with PROJGIT_NETWORK_TESTS=1"]
+fn mount_real_remote_with_dotgit_a2_shows_branch_name() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    if !network_enabled() {
+        eprintln!("SKIP: set PROJGIT_NETWORK_TESTS=1 to enable network tests");
+        return;
+    }
+
+    let (cache_dir, _cache_guard) = make_temp_dir("a2-cache");
+    let opts = CloneOptions::new(TARGET_URL.to_owned(), cache_dir.clone());
+    partial_clone(&opts).expect("partial_clone of TARGET_URL");
+
+    let git_dir = git_dir_for(&cache_dir);
+    let store = Arc::new(ObjectStore::open(&git_dir).expect("ObjectStore::open"));
+
+    let projection = Projection::Ref(TARGET_REF.to_owned());
+    let commit_oid = projection.resolve_commit(&store).expect("resolve_commit");
+    let objects_dir = std::fs::canonicalize(git_dir.join("objects")).expect("canonicalize objects");
+
+    // Mirror the CLI's build_root_overlay logic exactly: A1+ then
+    // A2 if the projection is a branch.
+    let mut overlay = dotgit::a1_plus_overlay(&store, commit_oid, &objects_dir)
+        .expect("a1_plus_overlay builds successfully");
+    let branch_full = store
+        .try_resolve_branch_full_name(TARGET_REF)
+        .expect("TARGET_REF should resolve as a branch");
+    assert_eq!(
+        branch_full, "refs/heads/master",
+        "TARGET_REF `{TARGET_REF}` must resolve to refs/heads/master",
+    );
+    dotgit::apply_a2_ref_visibility(&mut overlay, &branch_full, commit_oid);
+
+    let fetcher = GitCliFetcher::open(store.clone()).expect("GitCliFetcher::open");
+    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+    let provider = Arc::new(
+        ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 4)
+            .expect("ProjectionFsProvider::new"),
+    );
+
+    let (mountpoint, _mountpoint_guard) = make_temp_dir("a2-mp");
+    let _session =
+        mount_background(provider, &mountpoint, &MountConfig::default()).expect("mount_background");
+
+    assert!(
+        wait_for_mount(&mountpoint, Duration::from_secs(10)),
+        "mountpoint never became a FUSE mount within 10s"
+    );
+
+    // 1. symbolic-ref HEAD returns the full branch name.
+    let sym = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["symbolic-ref", "HEAD"])
+        .output()
+        .expect("spawn git symbolic-ref HEAD");
+    assert!(
+        sym.status.success(),
+        "git symbolic-ref HEAD failed (HEAD should be symbolic under A2): stderr={:?}",
+        String::from_utf8_lossy(&sym.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&sym.stdout).trim(),
+        "refs/heads/master",
+    );
+
+    // 2. `git branch --show-current` returns the short name (empty
+    //    under A1 / A1+ because HEAD was detached).
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["branch", "--show-current"])
+        .output()
+        .expect("spawn git branch --show-current");
+    assert!(branch.status.success());
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "master");
+
+    // 3. `git rev-parse refs/heads/master` resolves and agrees with
+    //    `git rev-parse HEAD`.
+    let rev_branch = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["rev-parse", "refs/heads/master"])
+        .output()
+        .expect("spawn git rev-parse refs/heads/master");
+    assert!(
+        rev_branch.status.success(),
+        "git rev-parse refs/heads/master failed: stderr={:?}",
+        String::from_utf8_lossy(&rev_branch.stderr),
+    );
+    let rev_head = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("spawn git rev-parse HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&rev_branch.stdout).trim(),
+        commit_oid.to_string(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rev_head.stdout).trim(),
+        commit_oid.to_string(),
+        "HEAD and refs/heads/master must resolve to the same commit under A2",
+    );
+
+    // 4. A1+ status guarantee still holds (clean working tree).
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&mountpoint)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("spawn git status --porcelain");
+    assert!(status.status.success());
+    assert!(
+        status.stdout.is_empty(),
+        "git status --porcelain must remain empty under A2 (A1+ guarantee preserved); got:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+    );
+
+    drop(_session);
+}

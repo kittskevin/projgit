@@ -354,6 +354,60 @@ A2 (ref visibility) stays independently deferred; the axis split made
 it a cleaner standalone decision than it was when bundled. Full design
 in [`dotgit-index.md`](dotgit-index.md).
 
+### 9.7 Shipped (2026-06-02): A2 ref visibility for branch projections
+
+A2 promoted from deferred to shipped-as-default. The trigger was the
+audit listing "IDE branch indicator shows detached HEAD" and
+"`git branch --show-current` returns empty" as the most-cited
+day-one papercuts after the A1+ landing closed the `git status`
+cells. The axis-split insight from §9.6 made A2 a clean ~150 LOC
+add: no entanglement with the index path, no changes to the
+existing `RootOverlay` mechanism.
+
+Shipped as:
+
+- **`crate::dotgit::apply_a2_ref_visibility(overlay, branch_full, oid)`**
+  mutates an A1 or A1+ overlay in place: replaces the detached
+  `.git/HEAD` with `ref: <branch_full>\n` and creates a loose ref
+  file at `.git/<branch_full>` containing `<oid>\n`. Pure data
+  mutation; no store dependency. Supports nested branch names
+  (`refs/heads/feature/foo` creates the intermediate `feature/`
+  directory on the fly).
+- **`ObjectStore::try_resolve_branch_full_name(refname)`** does the
+  short-name → full-name resolution and the "is this actually a
+  branch?" gate via gix's `find_reference` + `name()` prefix
+  check. Returns `None` for tags, remote-tracking refs, non-existent
+  refs, and `HEAD` itself (those correctly stay on A1's detached
+  HEAD; setting HEAD symbolically to a tag is something git refuses
+  to do anyway).
+- **All three overlay-building call sites apply A2 when applicable**:
+  `projgit mount`, `projgit mount-multi`, and the `projgitd` Mount
+  handler. The CLI / daemon never expose A2 as a separate flag —
+  it's just "what `--no-dotgit` opts out of", same as A1+.
+- **6 unit tests** in `crates/projgit-core/src/dotgit.rs` (symbolic
+  HEAD content, loose ref file content, nested branch names, A1
+  files preserved, two panic-on-invalid-input cases).
+- **1 integration test** in `crates/projgit-core/tests/integration.rs`
+  for the resolver (short name, full name, tag, HEAD, non-existent
+  ref).
+- **1 network-gated e2e test** in
+  `crates/projgit-fuse/tests/mount_real_remote.rs` against
+  `rust-lang/log`: asserts `git symbolic-ref HEAD` →
+  `refs/heads/master`, `git branch --show-current` → `master`,
+  `git rev-parse refs/heads/master` matches `git rev-parse HEAD`,
+  and the A1+ clean-status guarantee is preserved.
+
+What A2 doesn't try to do (still deferred to A3):
+
+- Branch tip mutations from inside the mount. The ref file is
+  read-only; `git update-ref` etc. fail consistently with all
+  other write verbs in the mount.
+- Multiple visible refs. Only the projection's branch shows up;
+  `git log --all` sees one ref. Multi-ref visibility would need
+  to declare which other refs are "interesting" enough to
+  synthesize, and the workload doc §1 doesn't surface a use
+  case for this yet.
+
 ## 10. `RootOverlay` mechanism \u2014 the architectural commitment
 
 Because this is the only part shipping in MVP, it gets a precise spec.

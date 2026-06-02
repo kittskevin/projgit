@@ -718,7 +718,18 @@ fn build_overlay(
     let objects_dir = git_dir.join("objects");
     let objects_dir = std::fs::canonicalize(&objects_dir)
         .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")
+    let mut overlay = dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
+        .context("building A1+ overlay")?;
+    // Apply A2 ref visibility when the projection is a local branch.
+    // No-op for Commit projections and for refs that resolve to tags
+    // (those correctly stay on A1's detached HEAD; see
+    // docs/design/dotgit-synthesis.md §4.1 row A2).
+    if let Projection::Ref(name) = projection {
+        if let Some(full) = store.try_resolve_branch_full_name(name) {
+            dotgit::apply_a2_ref_visibility(&mut overlay, &full, commit_oid);
+        }
+    }
+    Ok(overlay)
 }
 
 // -----------------------------------------------------------------------------
