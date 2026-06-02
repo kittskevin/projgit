@@ -56,11 +56,24 @@ enum Scenario {
     /// coordination. Failure mode is data: thread errors are
     /// counted, not panicked.
     NaiveConcurrent,
+    /// Sparse-access single-agent: scripted access pattern (one
+    /// `ls` plus read of N files) against three configurations:
+    /// projgit mount of a partial clone, partial-clone-plus-
+    /// `cat-file --batch`, and `clone --depth=1` direct read.
+    /// Measures the per-blob path and the upfront-cost gap;
+    /// projgit's per-blob path should be structurally equivalent
+    /// to the partial-cat configuration (same mechanism, plus
+    /// FUSE overhead).
+    SparseSingle,
 }
 
 impl Scenario {
     fn is_concurrent(self) -> bool {
         matches!(self, Scenario::DaemonConcurrent | Scenario::NaiveConcurrent)
+    }
+
+    fn is_sparse(self) -> bool {
+        matches!(self, Scenario::SparseSingle)
     }
 }
 
@@ -119,9 +132,10 @@ fn parse_args() -> Args {
                     "sequential" => Scenario::Sequential,
                     "daemon-concurrent" => Scenario::DaemonConcurrent,
                     "naive-concurrent" => Scenario::NaiveConcurrent,
+                    "sparse-single" => Scenario::SparseSingle,
                     other => {
                         eprintln!(
-                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent)"
+                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single)"
                         );
                         std::process::exit(2);
                     }
@@ -140,7 +154,7 @@ fn parse_args() -> Args {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent] [--concurrency N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent scenarios)",
+                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single] [--concurrency N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent scenarios)",
                     DEFAULT_FILES.join(","),
                 );
                 std::process::exit(0);
@@ -193,6 +207,8 @@ fn main() -> anyhow::Result<()> {
 
     if args.scenario.is_concurrent() {
         run_concurrent_main(&args)
+    } else if args.scenario.is_sparse() {
+        run_sparse_main(&args)
     } else {
         run_paired_main(&args)
     }
@@ -234,7 +250,7 @@ fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
         let s = match args.scenario {
             Scenario::DaemonConcurrent => bench_projgit_daemon_concurrent(args)?,
             Scenario::NaiveConcurrent => bench_projgit_naive_concurrent(args)?,
-            Scenario::Single | Scenario::Sequential => unreachable!(),
+            Scenario::Single | Scenario::Sequential | Scenario::SparseSingle => unreachable!(),
         };
         eprintln!(
             "ok (setup {} ms, wall {} ms, fail {})",
@@ -246,6 +262,43 @@ fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
     }
     eprintln!();
     print_concurrent_report(args, &samples);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_sparse_main(args: &Args) -> anyhow::Result<()> {
+    let mut samples: Vec<SparseSingleSample> = Vec::with_capacity(args.iterations);
+    for i in 1..=args.iterations {
+        eprintln!("== iteration {i}/{} ==", args.iterations);
+        let s = match args.scenario {
+            Scenario::SparseSingle => bench_sparse_single(args)?,
+            Scenario::Single
+            | Scenario::Sequential
+            | Scenario::DaemonConcurrent
+            | Scenario::NaiveConcurrent => unreachable!(),
+        };
+        eprintln!(
+            "  projgit:     setup {} ms, script {} ms, disk {} KiB",
+            ms(s.projgit.setup),
+            ms(s.projgit.script),
+            s.projgit.disk_bytes / 1024,
+        );
+        eprintln!(
+            "  partial-cat: setup {} ms, script {} ms, disk {} KiB",
+            ms(s.partial_cat.setup),
+            ms(s.partial_cat.script),
+            s.partial_cat.disk_bytes / 1024,
+        );
+        eprintln!(
+            "  depth1:      setup {} ms, script {} ms, disk {} KiB",
+            ms(s.depth1.setup),
+            ms(s.depth1.script),
+            s.depth1.disk_bytes / 1024,
+        );
+        samples.push(s);
+    }
+    eprintln!();
+    print_sparse_single_report(args, &samples);
     Ok(())
 }
 
@@ -311,8 +364,8 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
     let mount2_cold_cat = match args.scenario {
         Scenario::Single => None,
         Scenario::Sequential => Some(projgit_remount_cold_cat(args, &cache_dir)?),
-        Scenario::DaemonConcurrent | Scenario::NaiveConcurrent => {
-            unreachable!("*-concurrent dispatches via run_concurrent_main")
+        Scenario::DaemonConcurrent | Scenario::NaiveConcurrent | Scenario::SparseSingle => {
+            unreachable!("*-concurrent and sparse-* dispatch via their own run_*_main")
         }
     };
 
@@ -1008,6 +1061,311 @@ fn print_concurrent_report(args: &Args, samples: &[ConcurrentSample]) {
             per_thread_all.len()
         );
     }
+}
+
+// -----------------------------------------------------------------------------
+// Sparse-access: single-agent
+// -----------------------------------------------------------------------------
+
+/// One iteration of `sparse-single`: setup / script / disk_bytes for
+/// each of three configurations against the same target.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct SparseSingleSample {
+    /// projgit mount of a partial clone.
+    projgit: SparseConfigSample,
+    /// `git clone --filter=blob:none --no-checkout` +
+    /// `git cat-file --batch` for each scripted read.
+    partial_cat: SparseConfigSample,
+    /// `git clone --depth=1` + direct filesystem reads.
+    depth1: SparseConfigSample,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy)]
+struct SparseConfigSample {
+    /// Setup window: whatever cloning / mounting the config needs
+    /// before the access script can run.
+    setup: Duration,
+    /// Script window: `ls` of the root + read every file in
+    /// `args.files`.
+    script: Duration,
+    /// Bytes resident on disk after the script (cache dir for
+    /// projgit / partial-cat; full clone for depth1).
+    disk_bytes: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bench_sparse_single(args: &Args) -> anyhow::Result<SparseSingleSample> {
+    eprint!("  projgit...     ");
+    let projgit = sparse_single_projgit(args)?;
+    eprintln!("ok");
+    eprint!("  partial-cat... ");
+    let partial_cat = sparse_single_partial_cat(args)?;
+    eprintln!("ok");
+    eprint!("  depth1...      ");
+    let depth1 = sparse_single_depth1(args)?;
+    eprintln!("ok");
+    Ok(SparseSingleSample {
+        projgit,
+        partial_cat,
+        depth1,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sparse_single_projgit(args: &Args) -> anyhow::Result<SparseConfigSample> {
+    use projgit_core::clone::{git_dir_for, partial_clone, CloneOptions};
+    use projgit_core::{
+        GitCliFetcher, HydratingObjectStore, ObjectStore, Projection, ProjectionFsProvider,
+        RootOverlay,
+    };
+    use projgit_fuse::{mount_background, MountConfig};
+    use std::sync::Arc;
+
+    let cache_dir = make_temp("projgit-bench-sparse-pj-cache");
+    let _cache_guard = DirGuard(cache_dir.clone());
+    let mountpoint = make_temp("projgit-bench-sparse-pj-mp");
+    let _mp_guard = DirGuard(mountpoint.clone());
+
+    let setup = time_it(|| -> anyhow::Result<()> {
+        let opts = CloneOptions::new(args.url.clone(), cache_dir.clone());
+        partial_clone(&opts)?;
+        Ok(())
+    })?;
+
+    // Build the projgit stack and mount inside the script window —
+    // matches `sparse-shared`, where per-thread mount is part of
+    // the per-agent cost. Avoids over-crediting the projgit arm by
+    // hiding mount cost in setup.
+    let script = time_it(|| -> anyhow::Result<()> {
+        let store = Arc::new(ObjectStore::open(git_dir_for(&cache_dir))?);
+        let fetcher = GitCliFetcher::open(store.clone())?;
+        let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+        let provider = Arc::new(ProjectionFsProvider::new(
+            Projection::Ref(args.ref_name.clone()),
+            hydrating,
+            RootOverlay::new(),
+            /* projection_id */ 1,
+        )?);
+        let session = mount_background(provider, &mountpoint, &MountConfig::default())?;
+        wait_for_mount(&mountpoint, Duration::from_secs(10))?;
+
+        // `ls` the root.
+        let _ = read_dir_names(&mountpoint)?;
+        // Read each scripted file.
+        for f in &args.files {
+            let _ = std::fs::read_to_string(mountpoint.join(f))?;
+        }
+        drop(session);
+        Ok(())
+    })?;
+
+    let disk_bytes = disk_bytes_of(&cache_dir)?;
+    Ok(SparseConfigSample {
+        setup,
+        script,
+        disk_bytes,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sparse_single_partial_cat(args: &Args) -> anyhow::Result<SparseConfigSample> {
+    let dir = make_temp("projgit-bench-sparse-pc-clone");
+    let _guard = DirGuard(dir.clone());
+
+    let setup = time_it(|| {
+        run_git(
+            None,
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                args.url.as_str(),
+                dir.to_str().expect("utf-8 tmp path"),
+            ],
+        )
+    })?;
+
+    let script = time_it(|| -> anyhow::Result<()> {
+        // `ls` equivalent: `git ls-tree <ref>` of the root.
+        run_git(Some(&dir), &["ls-tree", &args.ref_name])?;
+        // Read each file via a long-lived `git cat-file --batch`
+        // child. Mirrors projgit's GitCliFetcher strategy so the
+        // comparator isn't unfairly penalised by per-call git
+        // process startup.
+        let mut child = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .arg("cat-file")
+            .arg("--batch")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+            for f in &args.files {
+                writeln!(stdin, "{}:{}", args.ref_name, f)?;
+                stdin.flush()?;
+                let mut header = String::new();
+                let n = stdout.read_line(&mut header)?;
+                if n == 0 {
+                    anyhow::bail!("git cat-file --batch closed mid-stream");
+                }
+                // `<sha> <kind> <size>\n`; pull the trailing size.
+                let size: usize = header
+                    .trim_end()
+                    .rsplit_once(' ')
+                    .and_then(|(_, n)| n.parse().ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("git cat-file --batch: bad header line: {header:?}")
+                    })?;
+                let mut buf = vec![0u8; size];
+                stdout.read_exact(&mut buf)?;
+                // Skip the trailing newline git emits after the payload.
+                let mut nl = [0u8; 1];
+                stdout.read_exact(&mut nl)?;
+            }
+            // Drop stdin so the child sees EOF and exits.
+        }
+        let _ = child.wait();
+        Ok(())
+    })?;
+
+    let disk_bytes = disk_bytes_of(&dir)?;
+    Ok(SparseConfigSample {
+        setup,
+        script,
+        disk_bytes,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sparse_single_depth1(args: &Args) -> anyhow::Result<SparseConfigSample> {
+    let dir = make_temp("projgit-bench-sparse-d1-clone");
+    let _guard = DirGuard(dir.clone());
+
+    let setup = time_it(|| {
+        run_git(
+            None,
+            &[
+                "clone",
+                "--depth=1",
+                "--branch",
+                args.ref_name.as_str(),
+                args.url.as_str(),
+                dir.to_str().expect("utf-8 tmp path"),
+            ],
+        )
+    })?;
+
+    let script = time_it(|| -> anyhow::Result<()> {
+        // `ls` the working tree root (skip `.git`).
+        let _ = read_dir_names(&dir)?;
+        // Plain reads — everything's already on disk.
+        for f in &args.files {
+            let _ = std::fs::read_to_string(dir.join(f))?;
+        }
+        Ok(())
+    })?;
+
+    let disk_bytes = disk_bytes_of(&dir)?;
+    Ok(SparseConfigSample {
+        setup,
+        script,
+        disk_bytes,
+    })
+}
+
+/// Recursive sum of file sizes under `root`. Does NOT follow
+/// symlinks (uses `symlink_metadata` semantics via the file_type
+/// check). Bench-grade — not a `du -s` replacement, but good
+/// enough for one-shot reporting.
+fn disk_bytes_of(root: &std::path::Path) -> anyhow::Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue, // raced cleanup; bench-grade.
+        };
+        for entry in read {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() || ft.is_symlink() {
+                if let Ok(m) = entry.metadata() {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn print_sparse_single_report(args: &Args, samples: &[SparseSingleSample]) {
+    // Compute medians per (config, axis) independently. We use
+    // microseconds to avoid losing sub-ms resolution on the
+    // typically small `script` numbers.
+    let med_axis = |xs: &[u128]| -> u128 {
+        let mut v: Vec<u128> = xs.to_vec();
+        v.sort();
+        v[v.len() / 2]
+    };
+    let med_dur = |samples: &[SparseSingleSample], pick: fn(&SparseSingleSample) -> Duration| {
+        let xs: Vec<u128> = samples.iter().map(|s| pick(s).as_micros()).collect();
+        Duration::from_micros(med_axis(&xs) as u64)
+    };
+    let med_bytes = |samples: &[SparseSingleSample], pick: fn(&SparseSingleSample) -> u64| -> u64 {
+        let xs: Vec<u128> = samples.iter().map(|s| pick(s) as u128).collect();
+        med_axis(&xs) as u64
+    };
+
+    let pj_setup = med_dur(samples, |s| s.projgit.setup);
+    let pj_script = med_dur(samples, |s| s.projgit.script);
+    let pj_disk = med_bytes(samples, |s| s.projgit.disk_bytes);
+    let pc_setup = med_dur(samples, |s| s.partial_cat.setup);
+    let pc_script = med_dur(samples, |s| s.partial_cat.script);
+    let pc_disk = med_bytes(samples, |s| s.partial_cat.disk_bytes);
+    let d1_setup = med_dur(samples, |s| s.depth1.setup);
+    let d1_script = med_dur(samples, |s| s.depth1.script);
+    let d1_disk = med_bytes(samples, |s| s.depth1.disk_bytes);
+
+    println!("# bench_mount: {} @ {}\n", args.url, args.ref_name);
+    println!(
+        "Sparse-access single-agent. Median of {} iterations. Times in ms; disk in KiB.\n",
+        args.iterations
+    );
+    println!(
+        "Script: `ls` mount root + read {} file(s): {:?}\n",
+        args.files.len(),
+        args.files
+    );
+    println!("| Config | setup | script | disk |");
+    println!("|---|---:|---:|---:|");
+    println!(
+        "| `projgit` (mount of partial clone) | {} | {} | {} |",
+        ms(pj_setup),
+        ms(pj_script),
+        pj_disk / 1024
+    );
+    println!(
+        "| `partial-cat` (`--filter=blob:none` + `cat-file --batch`) | {} | {} | {} |",
+        ms(pc_setup),
+        ms(pc_script),
+        pc_disk / 1024
+    );
+    println!(
+        "| `depth1` (`--depth=1` clone, direct reads) | {} | {} | {} |",
+        ms(d1_setup),
+        ms(d1_script),
+        d1_disk / 1024
+    );
 }
 
 // -----------------------------------------------------------------------------
