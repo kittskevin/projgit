@@ -8,16 +8,18 @@
 > code.
 >
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-06-02, after Phase C concurrent bench ran (the
-> daemon's in-flight coalescer doesn't deliver a wall-clock win at
-> N ≤ 10 on `rust-lang/log`; audit A3 stays architecturally closed
-> but isn't a load-bearing perf win at this scale — see
-> [`../bench/baseline.md`](../bench/baseline.md) §Phase C). Earlier
-> in the same session: `projgitd` Stage 3 shipped (sidecar holds
-> the FUSE fd; daemon is pure data plane), the dotgit A2
-> ref-visibility rung landed, and Stage 4 was indefinitely deferred
-> per its design-doc stop condition (Harbor's single-operator
-> deployment shape doesn't need per-namespace isolation).
+> Last updated: 2026-06-02, after the sparse-access bench ran
+> (multi-agent shared-CAS pitch empirically validated on
+> `rust-lang/cargo`: at N=10, projgit-shared wins 1.59× on wall
+> clock and ~10× on disk vs N independent partial clones; the
+> daemon's load-bearing value is amortising per-agent clone
+> setup, not coalescing per-agent fetches — see
+> [`../bench/baseline.md`](../bench/baseline.md) §sparse-access).
+> Earlier in the same session: Phase C concurrent bench ran,
+> `projgitd` Stage 3 shipped (sidecar holds the FUSE fd; daemon
+> is pure data plane), the dotgit A2 ref-visibility rung landed,
+> and Stage 4 was indefinitely deferred per its design-doc stop
+> condition.
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -466,6 +468,41 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   investigated before declaring done rather than massaging numbers.
   Full per-stage detail in
   [`docs/implementation/phase-c-plan.md`](phase-c-plan.md).
+- **Sparse-access bench (2026-06-02).** Two new scenarios on
+  `crates/projgit-cli/examples/bench_mount.rs`: `sparse-single`
+  (one agent, three configurations — projgit, `partial-cat`,
+  `depth1`) and `sparse-shared` (N agents with 100 % blob
+  overlap; projgit-shared vs N independent partial clones).
+  Measures the workload projgit is actually for (sparse access
+  on a moderately-sized repo, possibly by multiple agents),
+  rather than cargo-build / recursive-walk shapes that were
+  always off-target. Full table + writeup in
+  [`../bench/baseline.md`](../bench/baseline.md) §sparse-access;
+  design in
+  [`../design/sparse-access-bench.md`](../design/sparse-access-bench.md);
+  plan in
+  [`sparse-access-plan.md`](sparse-access-plan.md).
+  **Three findings:**
+  (a) **multi-agent shared-CAS pitch validated** — at N=10 on
+  cargo, projgit-shared wins **1.59× on wall clock and ~10× on
+  disk** vs N independent partial clones; the crossover happens
+  between N=4 (slight loss, 0.93×) and N=10 (decisive win), via
+  amortising the ~3 s partial-clone cost once across N agents;
+  (b) **single-agent surprise** — `depth1` (`--depth=1` clone
+  + direct reads) wins every axis for source-heavy repos like
+  cargo, because partial-clone metadata + lazy-fetched packs
+  (~24 MB) exceeds a single-snapshot working tree (~22 MB);
+  partial-clone disk savings only materialise when working tree
+  bytes >> history bytes (large media / generated artifacts);
+  (c) **reframing of the daemon's empirical value** — Phase C
+  showed the daemon's fetch *coalescing* ties at N≤10;
+  sparse-shared shows the daemon's clone *amortisation* wins
+  decisively at N=10. The daemon's load-bearing value for the
+  target workload is *eliminating per-agent setup redundancy*,
+  not *coalescing per-agent fetches*. The pitch becomes "100
+  agents sharing one clone" not "100 agents fetching through one
+  coalescer". Four commits (Stage 1 sparse-single, Stage 2
+  sparse-shared, Stage 3 capture, this handoff update).
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
@@ -752,11 +789,16 @@ the working doc that gets updated as each stage lands.
    PID file / restart policy, persistent daemon state for fast
    recovery (so daemon-restart doesn't re-resolve refs), health
    checks, `tracing-subscriber` wiring for the existing `-v` flag,
-   structured logging.
+   structured logging. Now the leading next-up item: with the
+   sparse-access bench validating the multi-agent pitch, hardening
+   the daemon for real deployment is the highest-leverage move.
 2. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
-   bench and compares to the checked-in baseline. Moderate.
+   bench and compares to the checked-in baseline. Now genuinely
+   ready since the bench shape is more complete (the
+   sparse-access scenarios should be in the CI matrix from day
+   one, not just the existing single/sequential).
 3. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
@@ -773,18 +815,28 @@ the working doc that gets updated as each stage lands.
    and [`docs/design/projgitd.md`](../design/projgitd.md); this is
    the cookbook side. The [scripts/docker-smoke/](../../scripts/docker-smoke/)
    recipe shipped with Stage 3d is the runnable seed.
-5. **Phase C follow-up: higher-N or larger-blob bench** (optional,
-   only if Harbor's actual workload shape suggests the daemon's
-   architectural coalescing is worth re-measuring at a regime
-   where it could win). Phase C measured `log` × N ∈ {1,4,10}
-   × 3 small blobs and found the daemon's coalescer doesn't
-   deliver a wall-clock win at that scale; the bench accepts
-   `--concurrency` and `--files` for exploration of higher-N
-   (likely the README's 100 mark, where file-descriptor or
-   remote-connection limits could start to favour the daemon)
-   or bigger blobs (where per-byte savings from dedup matter).
-   Not load-bearing for shipping projgit; would inform whether
-   to invest in protocol pipelining for projgitd Stage 5.
+5. **Bench follow-ups** (optional, conditional on Harbor's actual
+   workload). Three plausible extensions, only worth running if
+   the basic pitch needs more nuance:
+   - **Higher-N sparse-shared** (N=100, README's headline). At
+     N=10 projgit-shared already wins 1.59×/10×; at N=100 the
+     win should grow (more per-agent clones to amortise) but
+     could also expose new bottlenecks (in-thread daemon CPU,
+     file-descriptor limits). Bench accepts `--concurrency 100`.
+   - **Bigger / monorepo target.** `rust-lang/rust` or
+     `torvalds/linux` (multi-GB working tree, modest partial
+     clone). Where partial-clone disk savings would materialise
+     in single-agent runs too. Would generalise the
+     single-agent depth1-vs-partial-clone finding from cargo.
+   - **Divergent-access** (Phase C2). Each agent reads a
+     disjoint file slice. Tests the daemon's serialisation cost
+     (one cat-file child) at workloads where the coalescer
+     doesn't help. If projgit-shared still wins on disk but
+     loses badly on wall clock, the cat-file pool becomes a
+     real follow-up; otherwise the pool stays speculation.
+   None of these are load-bearing for shipping projgit; do them
+   only if Harbor's deployment characterisation suggests the
+   default bench doesn't cover their case.
 
 **Items folded into the projgitd plan and removed from the
 standalone list:**
