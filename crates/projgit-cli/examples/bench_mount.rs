@@ -215,7 +215,12 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
             .map_err(anyhow::Error::from)
     })?;
 
-    let mount1 = projgit_mount_once(args, &cache_dir)?;
+    let mount1 = projgit_mount_once(args, &cache_dir, |store| {
+        use projgit_core::{GitCliFetcher, HydratingObjectStore};
+        use std::sync::Arc;
+        let fetcher = GitCliFetcher::open(store.clone())?;
+        Ok(Arc::new(HydratingObjectStore::new(store, fetcher)))
+    })?;
 
     let mount2_cold_cat = match args.scenario {
         Scenario::Single => None,
@@ -247,10 +252,21 @@ struct MountTimings {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn projgit_mount_once(args: &Args, cache_dir: &Path) -> anyhow::Result<MountTimings> {
+fn projgit_mount_once<F, MakeHydrating>(
+    args: &Args,
+    cache_dir: &Path,
+    make_hydrating: MakeHydrating,
+) -> anyhow::Result<MountTimings>
+where
+    F: projgit_core::Fetcher + Send + Sync + 'static,
+    MakeHydrating: FnOnce(
+        std::sync::Arc<projgit_core::ObjectStore>,
+    ) -> anyhow::Result<
+        std::sync::Arc<projgit_core::HydratingObjectStore<F>>,
+    >,
+{
     use projgit_core::{
-        clone::git_dir_for, GitCliFetcher, HydratingObjectStore, ObjectStore, Projection,
-        ProjectionFsProvider, RootOverlay,
+        clone::git_dir_for, ObjectStore, Projection, ProjectionFsProvider, RootOverlay,
     };
     use projgit_fuse::{mount_background, MountConfig};
     use std::sync::Arc;
@@ -259,8 +275,7 @@ fn projgit_mount_once(args: &Args, cache_dir: &Path) -> anyhow::Result<MountTimi
     let _mp_guard = DirGuard(mountpoint.clone());
 
     let store = Arc::new(ObjectStore::open(git_dir_for(cache_dir))?);
-    let fetcher = GitCliFetcher::open(store.clone())?;
-    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+    let hydrating = make_hydrating(store)?;
     let provider = Arc::new(ProjectionFsProvider::new(
         Projection::Ref(args.ref_name.clone()),
         hydrating,
