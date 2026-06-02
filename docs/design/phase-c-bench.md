@@ -1,11 +1,16 @@
 # Design: Phase C — concurrent cold-fetch amortisation bench
 
-> Status: **planned, not yet run.** The implementation plan with
-> sub-stages and commit boundaries is in
+> Status: **run 2026-06-02.** Both scenarios implemented and
+> executed at N ∈ {1, 4, 10} on `rust-lang/log`; results captured
+> in [`../bench/baseline.md`](../bench/baseline.md) §Phase C. The
+> implementation plan with sub-stages and commit boundaries is in
 > [`../implementation/phase-c-plan.md`](../implementation/phase-c-plan.md).
-> Existing bench results (single + sequential) live in
-> [`../bench/baseline.md`](../bench/baseline.md); Phase C results will
-> land there too once the bench is run.
+> Headline finding: the daemon's in-flight coalescer doesn't
+> deliver a wall-clock win at this workload scale (1.04× at
+> N=10, ~12% loss at 20-file/N=10). The §4 "expected shape"
+> below is left as-shipped and annotated post-run with what
+> actually happened so the doc stays honest about expected vs.
+> measured.
 >
 > Read alongside [`workload.md`](workload.md) §1.6 (the headline
 > amortisation claim Phase C tests in its hardest case),
@@ -150,6 +155,32 @@ secondary follow-up if `log`'s numbers don't tell a clear story.
 
 ## 4. Expected shape (this is an expectation, not a promise)
 
+> **Update 2026-06-02 (post-run): expectations did not hold.** Both
+> the absolute per-consumer baseline and the qualitative shape of
+> the ratio at N=10 were wrong. Actual results captured in
+> [`../bench/baseline.md`](../bench/baseline.md) §Phase C — at
+> N ∈ {1, 4, 10} on `rust-lang/log` with 3 small blobs, the two
+> arms converge to within ~5–8% (ratio 1.04–1.08× at N=4/10, with
+> N=1 single-iteration variance making daemon-N=1 nominally
+> *slower* by 25% but inside the per-thread range). At 20 files /
+> N=10 the daemon actually *loses* by ~12% (naive 8.1 s vs daemon
+> 9.1 s) because the daemon serialises N×files unique fetches
+> through one shared `git cat-file --batch-check` child, while
+> the naive arm pipelines them across N parallel `cat-file`
+> children with N parallel HTTPS connections to GitHub. The
+> mechanism written below ("daemon coalesces N×duplicate fetches
+> down to 1") is real — the coalescer does dedupe — but at this
+> bandwidth / RTT regime the savings are bounded by per-fetch
+> RTT, while the naive arm's cost is bounded by per-thread
+> parallel work. They converge instead of diverging. The
+> §3 methodology section's "secondary numbers" (per-thread p50,
+> failure count) are still valid framing; only the §4 numerical
+> expectations were wrong.
+>
+> **Original expectation block kept below** so the doc records
+> what was expected before running vs. what was real after.
+> See baseline.md for the headline.
+
 Using existing `single` cold-cat as the per-consumer baseline
 (~3.4 s, of which ~95% is upstream HTTPS round-trip):
 
@@ -173,6 +204,13 @@ same `.git/`**. Three plausible regimes:
 
 The bench finding out which regime is real is itself a result
 even if the ratio is unsurprising.
+
+> **Actual answer (2026-06-02):** regime 2 ("Git allows pipelined
+> fetches"). At N=10 the naive arm not only doesn't fail, it
+> matches (3 files) or beats (20 files) the daemon. Per-thread
+> wall clock dominates; pack-lock contention is invisible at this
+> N. Higher N would be needed to surface the other regimes; the
+> bench supports `--concurrency` for that exploration.
 
 ## 5. Success criteria
 

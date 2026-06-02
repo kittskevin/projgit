@@ -56,14 +56,18 @@ PROJGIT_NETWORK_TESTS=1 \
   reads. This is the falsifier for workload §1.6 — "the first
   mount pays the network cost; every subsequent mount sees a warm
   hit."
-- **Concurrent (Phase C)** — *not yet run*. Two simultaneous
-  mounts of the same URL racing to cold-fetch the same blob.
-  Would put a number on the audit's A3 finding (cross-process
-  single-flight gap). Deferred because it's the most
-  resource-intensive scenario and would risk racing two
-  `git fetch` children into the same `.git/objects/pack/`. Worth
-  doing eventually; see audit `/memories/repo/audit.md` Phase C
-  note.
+- **`daemon-concurrent` / `naive-concurrent` (Phase C)** — *run
+  2026-06-02*. N simultaneous local mounts of the same URL
+  cold-fetching the same blobs. `daemon-concurrent` runs them
+  through one in-thread `projgitd` (its `Coalescer` dedupes
+  concurrent fetches per audit A3); `naive-concurrent` skips the
+  daemon and lets N independent `GitCliFetcher`s race a shared
+  `.git/objects/pack/`. Results below in
+  [Phase C concurrent](#results--phase-c-concurrent-rust-langlog--master).
+  Headline: at N ≤ 10 with 3 small blobs, the daemon's coalescer
+  isn't a wall-clock win — it's a tie within noise. At 20
+  files/N=10 it becomes a ~12% loss because of
+  serialise-through-one-cat-file overhead.
 
 ## What was measured
 
@@ -156,6 +160,178 @@ Mount 2's cold cat is **~4,750× faster** than mount 1's cold cat —
 amortisation holds at this scale too. The persistent on-disk CAS is
 doing exactly what the workload doc claims.
 
+## Results — Phase C concurrent (`rust-lang/log` @ master)
+
+Captured 2026-06-02 inside the projgit devcontainer; same machine /
+network as the `single` and `sequential` results above. Median of 3
+iterations per cell. **Wall clock** is from the all-N-threads
+barrier release to the last thread's join (the load-bearing
+headline); **per-thread p50** is the median across all per-thread
+cold-cat durations from all iterations (3 × N samples).
+
+Cat targets: `Cargo.toml`, `src/lib.rs`, `LICENSE-APACHE` (3 files,
+same as the `single` table above). Cold blobs only — every
+iteration starts from a fresh `cache_dir` so no on-disk state is
+inherited from prior runs.
+
+| N  | daemon-concurrent wall | daemon p50 | naive-concurrent wall | naive p50 | naive/daemon | failures |
+| -- | ---------------------: | ---------: | --------------------: | --------: | -----------: | -------: |
+| 1  |                1,577.0 |    1,577.0 |               1,186.0 |   1,185.9 |        0.75× |    0 / 0 |
+| 4  |                1,185.0 |    1,184.7 |               1,283.9 |   1,235.1 |        1.08× |    0 / 0 |
+| 10 |                1,276.7 |    1,275.3 |               1,331.6 |   1,299.0 |        1.04× |    0 / 0 |
+
+Per-thread range across iterations (min – max), useful for
+gauging variance:
+
+| N  | daemon range | naive range |
+| -- | -----------: | ----------: |
+| 1  |  1,168.9 – 1,656.0 (n=3)  | 1,174.0 – 1,275.9 (n=3)  |
+| 4  |  1,143.7 – 1,234.8 (n=12) | 1,187.1 – 1,293.5 (n=12) |
+| 10 |  1,169.4 – 1,336.6 (n=30) | 1,227.2 – 1,351.1 (n=30) |
+
+### Secondary measurement — same matrix, but 20 files per consumer
+
+To probe whether the daemon's coalescer wins at higher per-thread
+fetch counts, the N=10 cell was re-run with a 20-file `--files`
+list (everything in `rust-lang/log` master at the top level plus
+all of `src/kv/` and `tests/`). Same medians-of-3 protocol.
+
+| N  | daemon wall (20 files) | naive wall (20 files) | naive/daemon |
+| -- | ---------------------: | --------------------: | -----------: |
+| 10 |                9,068.1 |               8,123.9 |        0.90× |
+
+In this regime the naive arm is the *faster* one — the daemon's
+coalescing turns from a tie into a slowdown (~12%) as per-thread
+work grows.
+
+### Reproduce
+
+```sh
+# 3-file matrix
+for arm in daemon-concurrent naive-concurrent; do
+  for n in 1 4 10; do
+    PROJGIT_NETWORK_TESTS=1 \
+      cargo run -p projgit-cli --example bench_mount --release -- \
+      --scenario "$arm" --concurrency "$n" --iterations 3
+  done
+done
+
+# 20-file probe (re-run only the N=10 cell)
+FILES="Cargo.toml,src/lib.rs,LICENSE-APACHE,LICENSE-MIT,README.md,\
+CHANGELOG.md,src/macros.rs,src/serde.rs,src/__private_api.rs,\
+src/kv/mod.rs,src/kv/key.rs,src/kv/value.rs,src/kv/source.rs,\
+src/kv/error.rs,tests/integration.rs,tests/macros.rs,benches/value.rs,\
+.gitignore,triagebot.toml,.github/workflows/main.yml"
+for arm in daemon-concurrent naive-concurrent; do
+  PROJGIT_NETWORK_TESTS=1 \
+    cargo run -p projgit-cli --example bench_mount --release -- \
+    --scenario "$arm" --concurrency 10 --iterations 3 --files "$FILES"
+done
+```
+
+### What this shows
+
+- **The daemon's in-flight coalescer does not deliver a wall-clock
+  win at this workload scale.** At N ∈ {1, 4, 10} with 3 cold
+  blobs the two arms converge to within ~5–8% of each other; the
+  N=1 outlier (daemon 1,577 vs naive 1,186) is single-iteration
+  network variance, not a structural difference (per-thread range
+  1,169–1,656 covers both medians). The headline ratio at N=10 is
+  **1.04×** — well below the design doc §4 expected band of
+  "1.0–10×" and below the implementation-plan §7 "investigate
+  before declaring done" threshold of 1.5×.
+
+- **At higher per-thread fetch counts the daemon *loses* by ~12%.**
+  The 20-file N=10 cell shows naive 8.1 s vs daemon 9.1 s. The
+  mechanism is the daemon's single shared `git cat-file
+  --batch-check` child: across N=10 sidecars × 20 unique blobs the
+  daemon's coalescer dedupes upstream fetches (20 unique, not
+  200), but then serialises those 20 fetches through one cat-file
+  child. The naive arm pays the full 200-fetch upstream cost but
+  pipelines them across 10 independent `cat-file` children with
+  10 parallel HTTPS connections to GitHub's promisor endpoint —
+  parallelism beats deduplication on this workload because each
+  fetch is small and bandwidth isn't the bottleneck.
+
+- **Audit A3 (cross-process single-flight gap) is architecturally
+  closed but not empirically load-bearing at this scale.** Stage
+  2 of the projgitd plan introduced the daemon-side coalescer so
+  N sidecars asking for the same OID see one upstream fetch.
+  That property *is* true — Stage 3's `two_sidecars_share_one_daemon`
+  test verifies it, and the design doc says so. The Phase C
+  measurement shows the property doesn't *win in wall clock*
+  for `rust-lang/log` at N ≤ 10. The daemon's load-bearing wins
+  for projgit's target workload remain (a) the sidecar / FUSE-fd
+  ownership split from Stage 3 (failure-mode isolation, not
+  perf) and (b) the persistent on-disk CAS that the `sequential`
+  section above measures (~3,000× sequential-mount amortisation).
+
+- **The naive arm doesn't fail.** At N=10 (and even at N=10 with
+  20 files = 200 total upstream lazy-fetches into one
+  `.git/objects/pack/`) every thread completes successfully —
+  zero git-lock errors, zero pack-corruption errors, zero
+  cat-file crashes. The design doc §6.1 risk ("highest-risk to
+  run on the host, concurrent git fetch children writing the same
+  pack dir") is real in principle but didn't manifest at this
+  load. Git's promisor protocol handles concurrent lazy fetches
+  into a shared pack dir more gracefully than the architecture
+  doc suspected.
+
+- **Where the daemon would still win.** The empirical neutrality
+  here is workload-specific. The coalescer would deliver a real
+  wall-clock win when (i) network bandwidth, not RTT, is the
+  bottleneck (each duplicate fetch costs proportional bytes); (ii)
+  N is large enough that the naive arm runs into local
+  file-descriptor or remote connection limits; (iii) per-thread
+  fetch count is small enough that the daemon's serialisation
+  cost stays below the naive arm's parallelism cost. None of
+  those hold for `log` × N ≤ 10 × 3 small blobs on this
+  high-bandwidth devcontainer link.
+
+### Caveats specific to Phase C
+
+- **In-thread daemon, not subprocess.** The bench spawns
+  `projgit_daemon::server::run` on a `std::thread` rather than
+  `cargo run --bin projgitd`. Matches the
+  `sidecar_mount_smoke.rs` test pattern. Cross-process IPC adds
+  < 1 ms RTT per `UnixStream::connect`; at 3 fetches per thread
+  that's ~3 ms per thread, negligible vs the ~400 ms per fetch.
+  Worth re-running with a subprocess daemon if a future change
+  to the per-call connect path makes that overhead meaningful.
+
+- **N=10 is the responsible default, not the README headline.**
+  The README's "100 containers per host" target is unevaluated
+  here. At N=100 the naive arm would likely run into file
+  descriptor / connection limits and the daemon might start to
+  win on parallelism grounds. The bench accepts `--concurrency`
+  for exploration above 10; a future "100-concurrency" capture
+  is the natural follow-up.
+
+- **3 files is a small per-thread workload.** The 20-file
+  secondary probe shows the daemon's serialisation cost matters
+  at higher fetch counts. Real-world consumers (a CI agent doing
+  `cargo build` against a projgit mount) read hundreds of blobs;
+  for those, this bench probably underestimates the daemon's
+  serialisation cost and underestimates the naive arm's
+  parallelism win.
+
+- **Network variance is real.** Individual iterations swing
+  ±10–20% from the median; the daemon-N=1 outlier (1,577 vs
+  smoke-test 1,244 from a different session) demonstrates this.
+  Stable shapes hold across runs; absolute ms numbers don't.
+  Run the bench yourself; expect the *shape* to match, not the
+  digits.
+
+- **Per-thread p50 ≠ `mount2_cold_cat` from `sequential`.** The
+  `sequential` section above reports ~1 ms for mount 2's cold
+  cat against a warm on-disk CAS. Phase C's per-thread p50 is
+  ~1.2 s — three orders of magnitude higher. That's because Phase
+  C's cache starts cold every iteration (the daemon's partial
+  clone only contains commits + trees, not blobs); the per-thread
+  number is the cost of *actually fetching the 3 blobs from
+  upstream*, not of reading them from a warm pack. The two
+  numbers measure different things.
+
 ## What this shows
 
 - **§1.6 amortisation is real.** Across both targets, the second
@@ -213,8 +389,12 @@ doing exactly what the workload doc claims.
   matches what a second real-world process would see.
 - Sequential amortisation is the easier case. The harder case
   (concurrent mounts racing the same cold OID) is the Phase C
-  follow-up; that's where audit A3's cross-process single-flight
-  gap would actually show up.
+  section above. Headline: the daemon's architectural
+  single-flight does close audit A3 (one upstream fetch per OID
+  across N sidecars), but at this workload scale (`log` × N ≤
+  10 × 3 small blobs) that doesn't translate to a wall-clock
+  win, and at N=10 × 20 files the daemon's cat-file
+  serialisation actually loses by ~12%.
 - Two targets are not "many targets". The bench will need a
   bigger-than-`cargo` target (10K–100K files) before we can claim
   anything about monorepo behaviour. Worth doing once we have a
