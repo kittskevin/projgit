@@ -65,6 +65,16 @@ enum Scenario {
     /// to the partial-cat configuration (same mechanism, plus
     /// FUSE overhead).
     SparseSingle,
+    /// Sparse-access multi-agent: N agents each run the same
+    /// scripted access pattern (one `ls` plus read of N files)
+    /// against two configurations — N projgit sidecars sharing
+    /// one in-thread daemon + one CAS, vs N independent
+    /// `--filter=blob:none` clones each with their own
+    /// `cat-file --batch` reader. 100% blob overlap (every agent
+    /// reads the same files), so the daemon's Coalescer is the
+    /// architectural property under measurement and the shared
+    /// CAS is the disk-bytes property under measurement.
+    SparseShared,
 }
 
 impl Scenario {
@@ -73,7 +83,14 @@ impl Scenario {
     }
 
     fn is_sparse(self) -> bool {
-        matches!(self, Scenario::SparseSingle)
+        matches!(self, Scenario::SparseSingle | Scenario::SparseShared)
+    }
+
+    fn uses_concurrency(self) -> bool {
+        matches!(
+            self,
+            Scenario::DaemonConcurrent | Scenario::NaiveConcurrent | Scenario::SparseShared
+        )
     }
 }
 
@@ -133,9 +150,10 @@ fn parse_args() -> Args {
                     "daemon-concurrent" => Scenario::DaemonConcurrent,
                     "naive-concurrent" => Scenario::NaiveConcurrent,
                     "sparse-single" => Scenario::SparseSingle,
+                    "sparse-shared" => Scenario::SparseShared,
                     other => {
                         eprintln!(
-                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single)"
+                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single, sparse-shared)"
                         );
                         std::process::exit(2);
                     }
@@ -154,7 +172,7 @@ fn parse_args() -> Args {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single] [--concurrency N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent scenarios)",
+                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single|sparse-shared] [--concurrency N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent and sparse-shared scenarios)",
                     DEFAULT_FILES.join(","),
                 );
                 std::process::exit(0);
@@ -198,7 +216,7 @@ fn main() -> anyhow::Result<()> {
         args.iterations,
         args.scenario,
         args.files,
-        if args.scenario.is_concurrent() {
+        if args.scenario.uses_concurrency() {
             format!(", concurrency={}", args.concurrency)
         } else {
             String::new()
@@ -250,7 +268,10 @@ fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
         let s = match args.scenario {
             Scenario::DaemonConcurrent => bench_projgit_daemon_concurrent(args)?,
             Scenario::NaiveConcurrent => bench_projgit_naive_concurrent(args)?,
-            Scenario::Single | Scenario::Sequential | Scenario::SparseSingle => unreachable!(),
+            Scenario::Single
+            | Scenario::Sequential
+            | Scenario::SparseSingle
+            | Scenario::SparseShared => unreachable!(),
         };
         eprintln!(
             "ok (setup {} ms, wall {} ms, fail {})",
@@ -267,16 +288,19 @@ fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_sparse_main(args: &Args) -> anyhow::Result<()> {
+    match args.scenario {
+        Scenario::SparseSingle => run_sparse_single(args),
+        Scenario::SparseShared => run_sparse_shared(args),
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_sparse_single(args: &Args) -> anyhow::Result<()> {
     let mut samples: Vec<SparseSingleSample> = Vec::with_capacity(args.iterations);
     for i in 1..=args.iterations {
         eprintln!("== iteration {i}/{} ==", args.iterations);
-        let s = match args.scenario {
-            Scenario::SparseSingle => bench_sparse_single(args)?,
-            Scenario::Single
-            | Scenario::Sequential
-            | Scenario::DaemonConcurrent
-            | Scenario::NaiveConcurrent => unreachable!(),
-        };
+        let s = bench_sparse_single(args)?;
         eprintln!(
             "  projgit:     setup {} ms, script {} ms, disk {} KiB",
             ms(s.projgit.setup),
@@ -299,6 +323,36 @@ fn run_sparse_main(args: &Args) -> anyhow::Result<()> {
     }
     eprintln!();
     print_sparse_single_report(args, &samples);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_sparse_shared(args: &Args) -> anyhow::Result<()> {
+    let mut samples: Vec<SparseSharedSample> = Vec::with_capacity(args.iterations);
+    for i in 1..=args.iterations {
+        eprintln!(
+            "== iteration {i}/{} (N={}) ==",
+            args.iterations, args.concurrency
+        );
+        let s = bench_sparse_shared(args)?;
+        eprintln!(
+            "  projgit-shared:          setup {} ms, wall {} ms, disk {} KiB, fail {}",
+            ms(s.projgit_shared.setup),
+            ms(s.projgit_shared.wall_clock),
+            s.projgit_shared.disk_bytes / 1024,
+            s.projgit_shared.failures,
+        );
+        eprintln!(
+            "  partial-cat-independent: setup {} ms, wall {} ms, disk {} KiB, fail {}",
+            ms(s.partial_cat_independent.setup),
+            ms(s.partial_cat_independent.wall_clock),
+            s.partial_cat_independent.disk_bytes / 1024,
+            s.partial_cat_independent.failures,
+        );
+        samples.push(s);
+    }
+    eprintln!();
+    print_sparse_shared_report(args, &samples);
     Ok(())
 }
 
@@ -364,7 +418,10 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
     let mount2_cold_cat = match args.scenario {
         Scenario::Single => None,
         Scenario::Sequential => Some(projgit_remount_cold_cat(args, &cache_dir)?),
-        Scenario::DaemonConcurrent | Scenario::NaiveConcurrent | Scenario::SparseSingle => {
+        Scenario::DaemonConcurrent
+        | Scenario::NaiveConcurrent
+        | Scenario::SparseSingle
+        | Scenario::SparseShared => {
             unreachable!("*-concurrent and sparse-* dispatch via their own run_*_main")
         }
     };
@@ -1365,6 +1422,424 @@ fn print_sparse_single_report(args: &Args, samples: &[SparseSingleSample]) {
         ms(d1_setup),
         ms(d1_script),
         d1_disk / 1024
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Sparse-access: multi-agent (sparse-shared)
+// -----------------------------------------------------------------------------
+
+/// One iteration of `sparse-shared`: setup / wall_clock /
+/// disk_bytes / failure-count for each of two configurations
+/// against the same target with N agents running the same
+/// scripted access pattern.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct SparseSharedSample {
+    /// N projgit sidecars sharing one in-thread daemon + one CAS.
+    projgit_shared: SparseSharedConfig,
+    /// N independent `--filter=blob:none` clones, each with its
+    /// own per-thread `cat-file --batch` reader. No sharing.
+    partial_cat_independent: SparseSharedConfig,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct SparseSharedConfig {
+    /// Setup before the measurement window: clones, daemon
+    /// startup, attach.
+    setup: Duration,
+    /// Wall clock from barrier release to last-thread join.
+    wall_clock: Duration,
+    /// Per-thread script wall clocks; one entry per successful
+    /// thread.
+    per_thread: Vec<Duration>,
+    /// Total bytes on disk after the measurement window, summed
+    /// across all cache / clone dirs (one for projgit-shared, N
+    /// for partial-cat-independent).
+    disk_bytes: u64,
+    /// Threads that errored before reporting a duration.
+    failures: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bench_sparse_shared(args: &Args) -> anyhow::Result<SparseSharedSample> {
+    eprint!("  projgit-shared...           ");
+    let projgit_shared = sparse_shared_projgit(args)?;
+    eprintln!("ok");
+    eprint!("  partial-cat-independent...  ");
+    let partial_cat_independent = sparse_shared_partial_cat_independent(args)?;
+    eprintln!("ok");
+    Ok(SparseSharedSample {
+        projgit_shared,
+        partial_cat_independent,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sparse_shared_projgit(args: &Args) -> anyhow::Result<SparseSharedConfig> {
+    use projgit_core::{
+        HydratingObjectStore, ObjectStore, Projection, ProjectionFsProvider, RootOverlay,
+    };
+    use projgit_daemon::protocol::{read_message, write_message, Request, Response};
+    use projgit_daemon::server::{run as daemon_run, DaemonConfig};
+    use projgit_daemon::DaemonFetcher;
+    use projgit_fuse::{mount_background, MountConfig};
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let n = args.concurrency;
+
+    // --- setup window ---------------------------------------------------------
+    let setup_start = Instant::now();
+
+    let cache_root = make_temp("projgit-bench-sparse-pjs-cache");
+    let _cache_guard = DirGuard(cache_root.clone());
+    let socket_path = make_temp("projgit-bench-sparse-pjs-sock").join("daemon.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let config = DaemonConfig {
+        socket_path: socket_path.clone(),
+        socket_mode: 0o600,
+        cache_dir: Some(cache_root.clone()),
+    };
+    let daemon_handle = thread::spawn(move || daemon_run(config));
+
+    let bind_deadline = Instant::now() + Duration::from_secs(5);
+    while !socket_path.exists() {
+        if Instant::now() > bind_deadline {
+            anyhow::bail!("daemon never created socket at {}", socket_path.display());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Daemon Attach triggers the one shared partial clone.
+    let git_dir = {
+        let mut s = UnixStream::connect(&socket_path)?;
+        write_message(
+            &mut s,
+            &Request::Attach {
+                source: args.url.clone(),
+            },
+        )?;
+        match read_message::<_, Response>(&mut s)? {
+            Response::Attached { git_dir } => git_dir,
+            other => anyhow::bail!("daemon attach: unexpected {other:?}"),
+        }
+    };
+
+    let mountpoints: Vec<PathBuf> = (0..n)
+        .map(|_| make_temp("projgit-bench-sparse-pjs-mp"))
+        .collect();
+    let _mp_guards: Vec<DirGuard> = mountpoints.iter().cloned().map(DirGuard).collect();
+
+    let setup = setup_start.elapsed();
+
+    // --- measurement window ---------------------------------------------------
+    let barrier = Arc::new(Barrier::new(n + 1));
+    let (tx, rx) = mpsc::channel::<Result<Duration, String>>();
+    let mut handles = Vec::with_capacity(n);
+
+    for (tid, mp) in mountpoints.iter().enumerate() {
+        let barrier = barrier.clone();
+        let tx = tx.clone();
+        let socket_path = socket_path.clone();
+        let git_dir = git_dir.clone();
+        let ref_name = args.ref_name.clone();
+        let files = args.files.clone();
+        let mp = mp.clone();
+
+        let handle = thread::Builder::new()
+            .name(format!("sparse-pjs-{tid}"))
+            .spawn(move || {
+                barrier.wait();
+                let t0 = Instant::now();
+                let result = (|| -> anyhow::Result<()> {
+                    let store = Arc::new(ObjectStore::open(&git_dir)?);
+                    let fetcher = DaemonFetcher::new(socket_path);
+                    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                    let provider = Arc::new(ProjectionFsProvider::new(
+                        Projection::Ref(ref_name),
+                        hydrating,
+                        RootOverlay::new(),
+                        (tid as u64) + 300,
+                    )?);
+                    let session =
+                        mount_background(provider, &mp, &MountConfig::default())?;
+                    wait_for_mount(&mp, Duration::from_secs(10))?;
+                    // Sparse-access script: ls root + read each file.
+                    let _ = read_dir_names(&mp)?;
+                    for f in &files {
+                        let _ = std::fs::read_to_string(mp.join(f))?;
+                    }
+                    drop(session);
+                    Ok(())
+                })();
+                let elapsed = t0.elapsed();
+                let _ = tx.send(result.map(|_| elapsed).map_err(|e| e.to_string()));
+            })?;
+        handles.push(handle);
+    }
+    drop(tx);
+
+    barrier.wait();
+    let measurement_start = Instant::now();
+
+    let mut per_thread = Vec::with_capacity(n);
+    let mut failures = 0usize;
+    for r in rx {
+        match r {
+            Ok(d) => per_thread.push(d),
+            Err(e) => {
+                failures += 1;
+                eprintln!("    thread failure: {e}");
+            }
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let wall_clock = measurement_start.elapsed();
+    let disk_bytes = disk_bytes_of(&cache_root)?;
+
+    // --- teardown -------------------------------------------------------------
+    let mut s = UnixStream::connect(&socket_path)?;
+    write_message(&mut s, &Request::Shutdown)?;
+    let _: Response = read_message(&mut s)?;
+    let _ = daemon_handle.join();
+
+    Ok(SparseSharedConfig {
+        setup,
+        wall_clock,
+        per_thread,
+        disk_bytes,
+        failures,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sparse_shared_partial_cat_independent(args: &Args) -> anyhow::Result<SparseSharedConfig> {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let n = args.concurrency;
+
+    // --- setup window ---------------------------------------------------------
+    // Pre-create N empty target dirs so the per-thread script
+    // window does its OWN clone + read pass. Setup here is the
+    // structural setup (dir creation) only; the N clones run in
+    // the measurement window because they're per-agent cost.
+    // This matches the comparator's actual deployment shape:
+    // each agent does its own clone, no sharing.
+    let setup_start = Instant::now();
+    let clone_dirs: Vec<PathBuf> = (0..n)
+        .map(|_| make_temp("projgit-bench-sparse-pci-clone"))
+        .collect();
+    let _guards: Vec<DirGuard> = clone_dirs.iter().cloned().map(DirGuard).collect();
+    // `make_temp` creates the dir; remove it so `git clone` has
+    // a clean target.
+    for d in &clone_dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    let setup = setup_start.elapsed();
+
+    // --- measurement window ---------------------------------------------------
+    let barrier = Arc::new(Barrier::new(n + 1));
+    let (tx, rx) = mpsc::channel::<Result<Duration, String>>();
+    let mut handles = Vec::with_capacity(n);
+
+    for (tid, dir) in clone_dirs.iter().enumerate() {
+        let barrier = barrier.clone();
+        let tx = tx.clone();
+        let url = args.url.clone();
+        let ref_name = args.ref_name.clone();
+        let files = args.files.clone();
+        let dir = dir.clone();
+
+        let handle = thread::Builder::new()
+            .name(format!("sparse-pci-{tid}"))
+            .spawn(move || {
+                barrier.wait();
+                let t0 = Instant::now();
+                let result = (|| -> anyhow::Result<()> {
+                    // Clone (per-agent, no sharing).
+                    run_git(
+                        None,
+                        &[
+                            "clone",
+                            "--filter=blob:none",
+                            "--no-checkout",
+                            url.as_str(),
+                            dir.to_str().expect("utf-8 tmp path"),
+                        ],
+                    )?;
+                    // Sparse-access script: ls-tree root + read
+                    // each file via long-lived `cat-file --batch`.
+                    run_git(Some(&dir), &["ls-tree", &ref_name])?;
+                    let mut child = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&dir)
+                        .arg("cat-file")
+                        .arg("--batch")
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()?;
+                    {
+                        use std::io::{BufRead, BufReader, Read, Write};
+                        let mut stdin = child.stdin.take().expect("piped stdin");
+                        let mut stdout =
+                            BufReader::new(child.stdout.take().expect("piped stdout"));
+                        for f in &files {
+                            writeln!(stdin, "{}:{}", ref_name, f)?;
+                            stdin.flush()?;
+                            let mut header = String::new();
+                            let n = stdout.read_line(&mut header)?;
+                            if n == 0 {
+                                anyhow::bail!("git cat-file --batch closed mid-stream");
+                            }
+                            let size: usize = header
+                                .trim_end()
+                                .rsplit_once(' ')
+                                .and_then(|(_, n)| n.parse().ok())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "git cat-file --batch: bad header line: {header:?}"
+                                    )
+                                })?;
+                            let mut buf = vec![0u8; size];
+                            stdout.read_exact(&mut buf)?;
+                            let mut nl = [0u8; 1];
+                            stdout.read_exact(&mut nl)?;
+                        }
+                    }
+                    let _ = child.wait();
+                    Ok(())
+                })();
+                let elapsed = t0.elapsed();
+                let _ = tx.send(result.map(|_| elapsed).map_err(|e| e.to_string()));
+            })?;
+        handles.push(handle);
+    }
+    drop(tx);
+
+    barrier.wait();
+    let measurement_start = Instant::now();
+
+    let mut per_thread = Vec::with_capacity(n);
+    let mut failures = 0usize;
+    for r in rx {
+        match r {
+            Ok(d) => per_thread.push(d),
+            Err(e) => {
+                failures += 1;
+                eprintln!("    thread failure: {e}");
+            }
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let wall_clock = measurement_start.elapsed();
+    // Sum bytes across all N clone dirs.
+    let mut disk_bytes = 0u64;
+    for d in &clone_dirs {
+        disk_bytes += disk_bytes_of(d)?;
+    }
+
+    Ok(SparseSharedConfig {
+        setup,
+        wall_clock,
+        per_thread,
+        disk_bytes,
+        failures,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn print_sparse_shared_report(args: &Args, samples: &[SparseSharedSample]) {
+    let med_axis = |xs: &[u128]| -> u128 {
+        let mut v: Vec<u128> = xs.to_vec();
+        v.sort();
+        v[v.len() / 2]
+    };
+    let med_dur = |samples: &[SparseSharedSample], pick: fn(&SparseSharedSample) -> Duration| {
+        let xs: Vec<u128> = samples.iter().map(|s| pick(s).as_micros()).collect();
+        Duration::from_micros(med_axis(&xs) as u64)
+    };
+    let med_bytes = |samples: &[SparseSharedSample], pick: fn(&SparseSharedSample) -> u64| -> u64 {
+        let xs: Vec<u128> = samples.iter().map(|s| pick(s) as u128).collect();
+        med_axis(&xs) as u64
+    };
+
+    let pjs_setup = med_dur(samples, |s| s.projgit_shared.setup);
+    let pjs_wall = med_dur(samples, |s| s.projgit_shared.wall_clock);
+    let pjs_disk = med_bytes(samples, |s| s.projgit_shared.disk_bytes);
+    let pjs_fail: usize = samples.iter().map(|s| s.projgit_shared.failures).sum();
+    let pci_setup = med_dur(samples, |s| s.partial_cat_independent.setup);
+    let pci_wall = med_dur(samples, |s| s.partial_cat_independent.wall_clock);
+    let pci_disk = med_bytes(samples, |s| s.partial_cat_independent.disk_bytes);
+    let pci_fail: usize = samples
+        .iter()
+        .map(|s| s.partial_cat_independent.failures)
+        .sum();
+
+    // Per-thread aggregations across all iterations.
+    let pjs_per_thread: Vec<Duration> = samples
+        .iter()
+        .flat_map(|s| s.projgit_shared.per_thread.clone())
+        .collect();
+    let pci_per_thread: Vec<Duration> = samples
+        .iter()
+        .flat_map(|s| s.partial_cat_independent.per_thread.clone())
+        .collect();
+    let p50 = |xs: &[Duration]| -> Duration {
+        if xs.is_empty() {
+            return Duration::ZERO;
+        }
+        let mut v: Vec<u128> = xs.iter().map(|d| d.as_micros()).collect();
+        v.sort();
+        Duration::from_micros(v[v.len() / 2] as u64)
+    };
+    let pjs_p50 = p50(&pjs_per_thread);
+    let pci_p50 = p50(&pci_per_thread);
+
+    println!("# bench_mount: {} @ {}\n", args.url, args.ref_name);
+    println!(
+        "Sparse-access multi-agent. Median of {} iterations, N={}. Times in ms; disk in KiB.\n",
+        args.iterations, args.concurrency
+    );
+    println!(
+        "Script (per agent): `ls` mount root + read {} file(s): {:?}\n",
+        args.files.len(),
+        args.files
+    );
+    println!("| Config | setup | wall clock | per-thread p50 | disk total | failures |");
+    println!("|---|---:|---:|---:|---:|---:|");
+    println!(
+        "| `projgit-shared` (1 daemon + N sidecars + 1 CAS) | {} | {} | {} | {} | {} |",
+        ms(pjs_setup),
+        ms(pjs_wall),
+        ms(pjs_p50),
+        pjs_disk / 1024,
+        pjs_fail,
+    );
+    println!(
+        "| `partial-cat-independent` (N independent clones) | {} | {} | {} | {} | {} |",
+        ms(pci_setup),
+        ms(pci_wall),
+        ms(pci_p50),
+        pci_disk / 1024,
+        pci_fail,
+    );
+    let wall_ratio = pci_wall.as_secs_f64() / pjs_wall.as_secs_f64();
+    let disk_ratio = pci_disk as f64 / pjs_disk.max(1) as f64;
+    println!();
+    println!(
+        "Ratios (partial-cat-independent / projgit-shared): wall {wall_ratio:.2}x, disk {disk_ratio:.2}x"
     );
 }
 
