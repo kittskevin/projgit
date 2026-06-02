@@ -5,7 +5,7 @@
 > stage by stage. Updated as each stage lands or surfaces something
 > that changes downstream stages.
 >
-> Last updated: 2026-05-20 (Stages 0–2 done; Stages 3–5 not started).
+> Last updated: 2026-06-02 (Stages 0–3 done; Stages 4–5 not started).
 >
 > Architecture lives in [`docs/design/projgitd.md`](../design/projgitd.md);
 > this doc is one level down: concrete steps, file layout, commit
@@ -479,15 +479,140 @@ to three).
 
 Detail lands after Stage 2.
 
-### Stage 3 — Sidecar holds the FUSE fd
+### Stage 3 — Sidecar holds the FUSE fd — **DONE 2026-06-02**
 
-Move the FUSE mount from the daemon to per-container sidecars. The
-daemon becomes pure data plane; sidecars run the protocol loop
-locally. Failure-mode upgrade — daemon crash becomes recoverable
-instead of mount-killing.
+#### 3.1 Goal (as shipped)
 
-Stage 3 only makes sense after Stage 2 ships a working daemon and
-we have the supervision story in mind.
+Move the FUSE fd ownership from the daemon to the consumer process.
+The daemon becomes a **pure data plane** — coordinates fetches, owns
+the upstream connection and the in-flight coalescer — and the
+sidecar runs the FUSE protocol loop locally. Failure-mode upgrade:
+daemon crash degrades to brief cold-fetch unavailability instead
+of killing every mount on the host.
+
+#### 3.2 Design decisions (settled while landing)
+
+- **`DaemonFetcher` lives in `projgit-daemon`**, not in
+  `projgit-core::fetcher::daemon`. The protocol types live in the
+  daemon crate; making `projgit-core` depend on `projgit-daemon`
+  would invert the layering (and is unnecessary — the sidecar
+  already depends on `projgit-daemon` for the `attach`
+  subcommand). Closes the "where does `DaemonFetcher` live?"
+  open question from the prior session handoff.
+- **No new sidecar binary.** Extended `projgit mount` with a
+  `--daemon-socket <PATH>` flag instead of introducing a separate
+  `projgit-sidecar`. The sidecar code path is a 90-line helper
+  (`cmd_mount_via_daemon`) that talks to the daemon for one
+  `Attach` then builds the same `ProjectionFsProvider`
+  /`HydratingObjectStore` stack as the local-fetcher path.
+  Closes "sidecar binary or library-only?" — library-only.
+- **No fd-passing in Stage 3 itself.** Sidecar opens its own
+  `/dev/fuse` and calls `mount(2)`; Stage 4 (T4 last mile) is
+  what brings Harbor's `SCM_RIGHTS` fd handoff into the picture.
+  Closes "protocol extension for fd passing?" — deferred.
+- **Three new control-plane RPCs** rather than one. `Attach`
+  returns the on-disk git_dir so the sidecar can open its own
+  `ObjectStore`; `Fetch` makes a single OID resident; the daemon
+  reuses its existing `HydratingObjectStore` coalescer for
+  cross-sidecar single-flight (the A3-closing property).
+  `PrefetchHeaders` batches the T1 readdir-prefetch worker so
+  it doesn't degenerate to N RPCs per readdir.
+- **Per-call connect (no socket pool).** The existing protocol
+  is one-shot per connection. `DaemonFetcher` opens a fresh
+  `UnixStream` per `fetch_object` / `prefetch_headers` call.
+  Reconnect-friendly by construction (next call dials the
+  restarted daemon with zero state to migrate). A connection
+  pool / pipelined connection is a Stage 5+ optimisation if
+  profiling cares.
+
+#### 3.3 Sub-stage breakdown (as shipped)
+
+Three commits, in plan order. (The fourth commit is this doc
+update + handoff + audit memory.)
+
+- **3a** — Protocol extensions: `Attach`, `Fetch`,
+  `PrefetchHeaders` requests; `Attached`, `HeaderProbes`
+  responses; `HeaderProbeWire` (no-`FetcherError`-payload form
+  of `HeaderProbe`); new stable error codes (`not_attached`,
+  `bad_oid`, `fetch_failed`). Daemon-side handlers wire the
+  three new RPCs through `ActiveBackend::fetch_one` (uses
+  `HydratingObjectStore::header()` so any object kind hydrates
+  — `read_blob` would reject trees/commits) and
+  `ActiveBackend::prefetch_headers`. 6 always-on integration
+  tests in `tests/fetch_smoke.rs` plus 5 new protocol roundtrip
+  unit tests.
+- **3b** — `DaemonFetcher` in `projgit-daemon::fetcher`,
+  cfg-gated to Linux/macOS like the rest of the server.
+  Implements `projgit_core::Fetcher` end-to-end via
+  per-call connect. Translates daemon error codes back to
+  `FetcherError::Backend`/`Transport`. `prefetch_headers`
+  serialises a batch RPC and reassembles the per-OID probe
+  vector in original order (synthesising `Error` for any OID
+  the daemon omitted). 5 integration tests in
+  `tests/daemon_fetcher_smoke.rs` including the daemon-crash
+  → `FetcherError::Transport` failure-mode case.
+- **3c** — `--daemon-socket <PATH>` flag on `projgit mount`.
+  Sidecar code path: `Attach` to discover `git_dir`, open own
+  `ObjectStore` at that path, wrap in
+  `HydratingObjectStore<DaemonFetcher>`, mount FUSE locally.
+  Rejects `--offline`. 3 FUSE-gated integration tests in
+  `tests/sidecar_mount_smoke.rs` (library-level: in-thread
+  daemon + provider stack), 2 FUSE-gated **cross-process**
+  tests in `tests/xprocess_mount_smoke.rs` (spawn the real
+  `projgitd` and `projgit` binaries as separate OS processes
+  via `Command::new`; covers binary lifecycle incl. `kill -9`
+  of the daemon), and 1 FUSE+userns-gated **cross-mount-namespace**
+  test in `tests/xns_mount_smoke.rs` (sidecar runs inside
+  `unshare --user --map-root-user --mount --propagation=private`
+  as the closest in-CI proxy for "daemon on host, sidecar in
+  container" without docker). End-to-end CLI smoke also
+  confirmed manually: `projgitd` + `projgit mount
+  --daemon-socket …  /workspaces/projgit /tmp/sc-mp --ref main`
+  correctly serves the workspace; `.git/HEAD` shows the
+  projected commit OID; `projgit attach … status` shows the
+  daemon attached with `mounts: 0` (confirming the sidecar
+  owns the FUSE fd, not the daemon).
+
+#### 3.4 Decision point — **CLEAR 2026-06-02**
+
+Outcome: Stage 3 landed in one focused session. All three
+predictions from the plan held:
+
+- **`DaemonFetcher` is small.** ~250 lines including the wire
+  translation helpers and tests; no surprises.
+- **The failure-mode contract works.** The
+  `sidecar_warm_reads_survive_daemon_shutdown` test asserts the
+  Stage 3 design's headline property: with the daemon dead, warm
+  reads (data already in the shared CAS / page cache) keep
+  succeeding and `readdir` keeps working through the sidecar's
+  local `ObjectStore`. Only cold-path object hydration fails
+  (returns `FetcherError::Transport`), and the kernel surfaces
+  that as I/O error per the natural FUSE contract.
+- **§1.6 cross-process amortisation works architecturally.** The
+  two-sidecars test confirms two consumer processes can mount
+  the same projection against one daemon. (Empirically measuring
+  the cross-process single-flight win still requires a
+  partial-clone source where objects aren't already on disk —
+  that's the Phase C bench, separate from Stage 3 correctness.)
+
+Things noted for Stage 4+:
+
+- The daemon's `Status` cache counters show zero activity for
+  local-fixture sidecar tests because every object is already
+  on disk and the sidecar reads via mmap'd packs (the §4.2
+  "bytes don't cross the socket" property in action). This is
+  correct behaviour; it means a network-backed Phase C bench
+  is the right place to put a quantitative claim on the
+  daemon's value-add.
+- Per-call connect adds one `UnixStream::connect` syscall per
+  cold fault. Negligible vs the upstream fetch cost it dedupes;
+  becomes interesting only if we start pipelining or doing
+  micro-batched reads. Stage 5+ optimisation.
+- The pre-existing `clippy::items_after_test_module` lint
+  introduced in Stage 2c (when `cmd_attach` landed after the
+  `mod tests` block) was suppressed via `#[allow]` rather than
+  reordering the file; reordering when more attach-side helpers
+  land is the cleaner long-term fix.
 
 ### Stage 4 — T4 last mile (per-namespace fd passing)
 

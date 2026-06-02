@@ -1,7 +1,8 @@
 # Design: `projgitd` — Daemon + Sidecar Topology
 
 > Status: **architecture committed 2026-05-20; Stage 0 spike done
-> GREEN 2026-05-20; Stages 1–5 not started.** Extends
+> GREEN 2026-05-20; Stages 1–2 done 2026-05-20; Stage 3 done
+> 2026-06-02; Stages 4–5 not started.** Extends
 > [`container-deployment.md`](container-deployment.md) with the
 > next-step topology that closes audit items A1 (no daemon) and A3
 > (cross-process single-flight gap). Tenancy (T1.5 vs T4 last-mile)
@@ -616,30 +617,90 @@ today.
 serialising errors across the wire surfaces ambiguity), pause and
 iterate before committing client code.
 
-### Stage 3 — Sidecar holds the FUSE fd (failure-mode upgrade)
+### Stage 3 — Sidecar holds the FUSE fd (failure-mode upgrade) — **DONE 2026-06-02**
 
 Move the FUSE mount from the daemon to per-container sidecars. The
 daemon becomes pure data plane; sidecars run the protocol loop
 locally; if the daemon crashes, sidecars degrade rather than die.
 
-Surface:
+**Surface as shipped:**
 
-- The sidecar process is essentially a `projgit attach …` from
-  Stage 2 that *also* opens `/dev/fuse` and does its own mount,
-  rather than asking the daemon to mount on its behalf.
-- A small per-sidecar inode-level hot cache to avoid daemon
-  round-trips on hot `getattr`.
-- Documentation of the daemon-failure failure mode (the EAGAIN /
-  retry contract).
+- Three new control-plane RPCs in `projgit-daemon::protocol`:
+  - `Attach { source }` → `Attached { git_dir }` — sidecar
+    discovers the on-disk CAS path. Idempotent; second `Attach`
+    to the same source returns the same git_dir, to a different
+    source returns `source_mismatch`.
+  - `Fetch { oid }` → `Ok | Err` — sidecar asks the daemon to
+    make an OID resident. Daemon goes through its existing
+    `HydratingObjectStore::header()` so the underlying
+    fetcher's `Coalescer` dedupes concurrent requests across
+    sidecars. This is the single-flight that closes **A3**.
+  - `PrefetchHeaders { oids }` → `HeaderProbes { probes }` —
+    batch variant for the sidecar's T1 readdir-prefetch worker
+    so it doesn't degenerate to N RPCs.
+- `DaemonFetcher` in `projgit-daemon::fetcher` implements
+  `projgit_core::Fetcher` by per-call connect. Reconnect-friendly
+  by construction: a daemon restart between calls is just the
+  next `UnixStream::connect` finding a fresh listener.
+- `projgit mount --daemon-socket <PATH>` is the sidecar entry
+  point (no separate `projgit-sidecar` binary). Skips the local
+  partial-clone path, calls `Attach` to discover `git_dir`,
+  opens its own `ObjectStore` against the shared CAS, builds
+  the same `ProjectionFsProvider` stack as the local-fetcher
+  path with a `DaemonFetcher` underneath. Rejects `--offline`.
+- Three FUSE-gated integration tests under
+  [`crates/projgit-daemon/tests/sidecar_mount_smoke.rs`](../../crates/projgit-daemon/tests/sidecar_mount_smoke.rs):
+  serve-files-through-DaemonFetcher; warm-reads-survive-daemon-shutdown
+  (the headline §3 failure-mode property — kernel keeps serving
+  cached pages after `shutdown_daemon` returns); and two
+  sidecars sharing one daemon.
+- Two FUSE-gated **cross-process** integration tests under
+  [`crates/projgit-daemon/tests/xprocess_mount_smoke.rs`](../../crates/projgit-daemon/tests/xprocess_mount_smoke.rs)
+  spawn the real `projgitd` and `projgit` binaries as separate OS
+  processes via `Command::new`. They cover what the in-thread
+  tests can't: the actual binary CLIs, real process supervision,
+  and the §3 failure-mode contract at the OS-process level
+  (`kill -9 <projgitd>` while a sidecar's mount is live; warm
+  reads keep succeeding).
+- One FUSE + userns-gated **cross-mount-namespace** integration
+  test under
+  [`crates/projgit-daemon/tests/xns_mount_smoke.rs`](../../crates/projgit-daemon/tests/xns_mount_smoke.rs)
+  runs the sidecar inside
+  `unshare --user --map-root-user --mount --propagation=private`,
+  the closest in-CI proxy for "daemon on host, sidecar in
+  container" without requiring docker. The sidecar mounts FUSE
+  inside its private mount namespace; the parent namespace
+  cannot see the mount (kernel-enforced by `--propagation=private`).
+  The test probes for unprivileged-userns support and skips
+  cleanly when disabled (e.g. on CI images with
+  `kernel.unprivileged_userns_clone=0`).
 
 **Why fourth.** This is the failure-mode upgrade. Stage 2's
 daemon-holds-fd model is fragile in production. Stage 3 makes the
-daemon restartable without taking down the world.
+daemon restartable without taking down the world. Verified by
+test: with the daemon killed, the sidecar's mount keeps serving
+already-resident data through the shared CAS / page cache; only
+cold-path object hydration fails (returns
+`FetcherError::Transport`, surfaced to the kernel as I/O error).
 
-**Stop conditions:** if sidecar-side caches need to grow large
-enough to defeat the §1.6 amortisation goal (i.e. we're
-duplicating per-container what the daemon is supposed to own),
-pause and rethink the cache split.
+**Findings:**
+
+- The protocol stayed small — three new request variants, two
+  new response variants, three new error codes. JSON over the
+  existing length-prefixed framing was sufficient with zero
+  hand-tuning.
+- `DaemonFetcher` is ~250 LOC including translation helpers and
+  unit tests. The `Fetcher` trait shape from `projgit-core`
+  carried the boundary cleanly — no trait changes needed.
+- Local-fixture tests don't exercise the daemon's value-add by
+  design: every object is already on disk, so the sidecar's
+  `ObjectStore` reads via mmap'd packs without round-tripping
+  the daemon (the §4.2 "bytes don't cross the socket" property
+  in action). Empirical cross-process amortisation needs the
+  Phase C bench with a partial-clone source.
+- The pre-existing `clippy::items_after_test_module` lint
+  introduced by Stage 2c was suppressed via `#[allow]` rather
+  than reordering the file.
 
 ### Stage 4 — T4 last mile (per-namespace mount via fd passing)
 

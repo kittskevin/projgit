@@ -8,9 +8,8 @@
 > code.
 >
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-05-18, after a full project audit, the dotgit A1
-> and A1+ shipping, the fetch-coalescing retraction, and a README
-> restructure / 'What works inside a projgit mount' documentation pass.
+> Last updated: 2026-06-02, after `projgitd` Stage 3 shipped
+> (sidecar holds the FUSE fd; daemon is pure data plane).
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -363,6 +362,45 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   one focused session, vs the plan’s two-to-three-session estimate.
   Full sub-stage notes in
   [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) §2.
+- **`projgitd` Stage 3 — sidecar holds the FUSE fd (2026-06-02).**
+  Three new control-plane RPCs (`Attach { source } → Attached
+  { git_dir }`, `Fetch { oid } → Ok | Err`, `PrefetchHeaders { oids }
+  → HeaderProbes { probes }`) plus a new `DaemonFetcher` in
+  `projgit-daemon::fetcher` that implements `projgit_core::Fetcher`
+  by per-call connect to the daemon's unix socket. New
+  `projgit mount --daemon-socket <PATH>` flag selects sidecar mode:
+  the consumer process holds its own `/dev/fuse` fd, opens its own
+  `ObjectStore` against the daemon's CAS (discovered via `Attach`),
+  and runs the FUSE protocol loop locally; only cold-path object
+  hydration goes over the wire (bytes don't — they flow through the
+  shared on-disk CAS / OS page cache; see
+  [`docs/design/projgitd.md`](../design/projgitd.md) §4.2/§5). The
+  load-bearing failure-mode property is **verified by integration
+  test**: with the daemon killed, the sidecar's mount keeps serving
+  cached pages and `readdir` keeps working; only cold-path fetches
+  fail (return `FetcherError::Transport`, surfaced as I/O error to
+  the kernel). Three sub-commits (3a protocol + handlers, 3b
+  DaemonFetcher, 3c CLI sidecar mode) shipped in one focused
+  session. 17 new tests total:
+  - **In-process / library-level** (always-on unless noted):
+    `tests/fetch_smoke.rs` (6), `tests/daemon_fetcher_smoke.rs` (5),
+    and `tests/sidecar_mount_smoke.rs` (3, FUSE-gated).
+  - **Cross-process** (`tests/xprocess_mount_smoke.rs`, 2,
+    FUSE-gated): spawns the real `projgitd` and `projgit` binaries
+    as separate OS processes via `Command::new`; covers the actual
+    binary lifecycle including `kill -9` of the daemon mid-mount.
+  - **Cross-mount-namespace** (`tests/xns_mount_smoke.rs`, 1,
+    FUSE+userns-gated): runs the sidecar inside
+    `unshare --user --map-root-user --mount --propagation=private`,
+    the closest in-CI proxy for "daemon on host, sidecar in
+    container" without needing docker. Probes for unprivileged-userns
+    support and skips with a clear message if disabled.
+  End-to-end CLI smoke against `/workspaces/projgit` confirmed:
+  `projgitd --socket …` plus `projgit mount --daemon-socket … --ref
+  main` serves the workspace cleanly; `projgit attach … status`
+  shows the daemon with `mounts: 0` (sidecar owns the fd, not the
+  daemon). Full sub-stage notes in
+  [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) §3.
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
@@ -635,7 +673,7 @@ two design docs.)
 
 ## What I'd do next
 
-Reprioritized 2026-05-20 after the `projgitd` design landing. The audit
+Reprioritized 2026-06-02 after `projgitd` Stage 3 landed. The audit
 lives in repo-scoped session memory at `/memories/repo/audit.md`
 (persists across conversations); the actionable items below are its top
 open findings plus the staged plan from
@@ -644,35 +682,32 @@ implementation steps, commit boundaries, and decision points live in
 [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
 the working doc that gets updated as each stage lands.
 
-1. **`projgitd` Stage 3 — sidecar holds the FUSE fd**
-   ([`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 3).
-   Move the FUSE mount from the daemon to per-container sidecars.
-   The daemon becomes pure data plane; sidecars run the protocol
-   loop locally (via `fuser::Session::from_fd` — proven in Stage
-   0). Failure-mode upgrade: daemon crash degrades to a brief
-   cold-path EAGAIN window rather than killing every mount on the
-   host. Needs the `DaemonFetcher` impl (the new Fetcher that
-   talks to the daemon over the wire) the Stage 2 plan-text
-   mistakenly placed in Stage 2.
+1. **Phase C concurrent bench** (audit A3 measurement). Now
+   genuinely runnable post-Stage-3 against a *partial-clone* source
+   (local fixtures don't drive cold-path daemon fetches — see Stage
+   3 findings). Spawn two `projgit mount --daemon-socket …` sidecars
+   against the same daemon and time cold reads of the same blob; the
+   coalescer in the daemon's `HydratingObjectStore` should turn N
+   concurrent requests into 1 upstream fetch. Puts the first
+   empirical number on the cross-process single-flight gap.
 2. **A2 ref visibility** (audit A2 row, dotgit ladder).
    Symbolic `HEAD` → `refs/heads/<name>` + the ref file populated
    when the projection is a `Ref`. Enables `git branch
    --show-current`, IDE branch indicators, `git log --all` seeing
    the one ref. ~150 LOC per [`docs/design/dotgit-synthesis.md`](../design/dotgit-synthesis.md) §6;
-   cleanly orthogonal to A1+ now that the axis-split insight
-   landed. Independent of the `projgitd` plan; pick up between
-   stages when a self-contained piece is desired.
-3. **Phase C concurrent bench** (audit A3 measurement).
-   Two simultaneous mounts of the same URL racing to cold-fetch
-   the same blob. Puts a number on the cross-process single-flight
-   gap. Higher-leverage *after* Stage 2 lands because then we can
-   measure the gain from the daemon's coalescer directly; less
-   useful before. Highest-risk to run on the host (concurrent
-   `git fetch` children writing the same `.git/objects/pack/`).
-4. **`projgitd` Stages 4–5** (T4 last mile via per-namespace
-   fd-passing; production polish via systemd unit / persistent
-   daemon state). Sequenced after Stage 3 above; specifics in
-   [`docs/design/projgitd.md`](../design/projgitd.md) §8.
+   cleanly orthogonal to the `projgitd` plan.
+3. **`projgitd` Stage 4 — T4 last mile via per-namespace fd-passing.**
+   Add the second `MountSource` impl: sidecar accepts a FUSE fd from
+   Harbor via `SCM_RIGHTS` and runs the protocol loop against it,
+   instead of opening `/dev/fuse` itself. Builds on Stage 0 (proven
+   fd-passing) and Stage 3 (sidecar architecture). The Stage 3
+   `DaemonFetcher` carries over unchanged — Stage 4 is purely about
+   how the sidecar receives its fd, not where its cold fetches go.
+4. **`projgitd` Stage 5 — production polish.** systemd unit,
+   PID file / restart policy, persistent daemon state for fast
+   recovery (so daemon-restart doesn't re-resolve refs), health
+   checks, `tracing-subscriber` wiring for the existing `-v` flag,
+   structured logging.
 5. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
@@ -685,18 +720,13 @@ the working doc that gets updated as each stage lands.
    workload makes this worth the cost (C1 leans "no").
 7. **Container deployment recipe doc.** User-facing `docs/` page
    covering `/etc/fuse.conf`, `bind-propagation`, a sample
-   systemd unit, an example Docker invocation. Architectural
-   framing already in
-   [`docs/design/container-deployment.md`](../design/container-deployment.md);
-   this is the cookbook side. Best after `projgitd` Stage 2 lands
-   so the recipe documents the supervised-daemon path that is the
-   intended production shape.
-8. **`tracing-subscriber` wiring for the existing `-v` flag.** The
-    verbosity flag stashes `PROJGIT_LOG` in env today; nothing reads
-    it. Wiring `tracing-subscriber` (with optional crate feature)
-    would surface fetcher/provider events at `-v` / `-vv`. Mostly
-    cosmetic until the daemon lands; then it's table stakes for
-    production diagnostics.
+   systemd unit, an example Docker invocation, **and the new
+   sidecar deployment shape** (`projgitd` on the host or in a
+   sidecar pod, agent containers run `projgit mount
+   --daemon-socket /run/projgitd.sock`). Architectural framing
+   in [`docs/design/container-deployment.md`](../design/container-deployment.md)
+   and [`docs/design/projgitd.md`](../design/projgitd.md); this is
+   the cookbook side.
 
 **Items folded into the projgitd plan and removed from the
 standalone list:**
