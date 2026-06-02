@@ -48,11 +48,19 @@ enum Scenario {
     /// files at the same time. The daemon's in-flight coalescer
     /// (audit A3) is the architectural property under test.
     DaemonConcurrent,
+    /// Phase C comparator arm: no daemon. N independent local
+    /// mounts, each with its own `GitCliFetcher`, all pointing at
+    /// the **same** on-disk cache dir. Models the actual A3
+    /// scenario the daemon was built to fix — N consumers racing
+    /// `git fetch` children into one `.git/objects/pack/` with no
+    /// coordination. Failure mode is data: thread errors are
+    /// counted, not panicked.
+    NaiveConcurrent,
 }
 
 impl Scenario {
     fn is_concurrent(self) -> bool {
-        matches!(self, Scenario::DaemonConcurrent)
+        matches!(self, Scenario::DaemonConcurrent | Scenario::NaiveConcurrent)
     }
 }
 
@@ -110,9 +118,10 @@ fn parse_args() -> Args {
                     "single" => Scenario::Single,
                     "sequential" => Scenario::Sequential,
                     "daemon-concurrent" => Scenario::DaemonConcurrent,
+                    "naive-concurrent" => Scenario::NaiveConcurrent,
                     other => {
                         eprintln!(
-                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent)"
+                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent)"
                         );
                         std::process::exit(2);
                     }
@@ -131,7 +140,7 @@ fn parse_args() -> Args {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent] [--concurrency N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent scenarios)",
+                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent] [--concurrency N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent scenarios)",
                     DEFAULT_FILES.join(","),
                 );
                 std::process::exit(0);
@@ -224,7 +233,7 @@ fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
         eprint!("  setup (clone + daemon)...  ");
         let s = match args.scenario {
             Scenario::DaemonConcurrent => bench_projgit_daemon_concurrent(args)?,
-            // Stage 3 adds NaiveConcurrent.
+            Scenario::NaiveConcurrent => bench_projgit_naive_concurrent(args)?,
             Scenario::Single | Scenario::Sequential => unreachable!(),
         };
         eprintln!(
@@ -302,8 +311,8 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
     let mount2_cold_cat = match args.scenario {
         Scenario::Single => None,
         Scenario::Sequential => Some(projgit_remount_cold_cat(args, &cache_dir)?),
-        Scenario::DaemonConcurrent => {
-            unreachable!("daemon-concurrent dispatches via run_concurrent_main")
+        Scenario::DaemonConcurrent | Scenario::NaiveConcurrent => {
+            unreachable!("*-concurrent dispatches via run_concurrent_main")
         }
     };
 
@@ -822,6 +831,117 @@ fn bench_projgit_daemon_concurrent(args: &Args) -> anyhow::Result<ConcurrentSamp
     write_message(&mut s, &Request::Shutdown)?;
     let _: Response = read_message(&mut s)?;
     let _ = daemon_handle.join();
+
+    Ok(ConcurrentSample {
+        setup,
+        per_thread,
+        wall_clock,
+        failures,
+    })
+}
+
+/// `naive-concurrent`: no daemon. N independent local mounts sharing
+/// one on-disk cache dir, each driving its own `GitCliFetcher`. This
+/// is the actual A3 scenario the daemon was built to fix — the
+/// fetchers race `git fetch` (lazy promisor) into one
+/// `.git/objects/pack/` with no coordination. Failures (git lock,
+/// pack contention, "fatal: could not parse object") are counted
+/// rather than panicked-on, per design doc §6.1.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bench_projgit_naive_concurrent(args: &Args) -> anyhow::Result<ConcurrentSample> {
+    use projgit_core::clone::{git_dir_for, partial_clone, CloneOptions};
+    use projgit_core::{
+        GitCliFetcher, HydratingObjectStore, ObjectStore, Projection, ProjectionFsProvider,
+        RootOverlay,
+    };
+    use projgit_fuse::{mount_background, MountConfig};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let n = args.concurrency;
+
+    // --- setup window ---------------------------------------------------------
+    let setup_start = Instant::now();
+
+    // Single shared cache_dir — the load-bearing property: every
+    // thread's `git fetch` lands in the same `.git/objects/pack/`,
+    // which is what audit A3 cares about.
+    let cache_dir = make_temp("projgit-bench-cache-n");
+    let _cache_guard = DirGuard(cache_dir.clone());
+    {
+        let opts = CloneOptions::new(args.url.clone(), cache_dir.clone());
+        partial_clone(&opts)?;
+    }
+    let git_dir = git_dir_for(&cache_dir);
+
+    let mountpoints: Vec<PathBuf> = (0..n).map(|_| make_temp("projgit-bench-mp-n")).collect();
+    let _mp_guards: Vec<DirGuard> = mountpoints.iter().cloned().map(DirGuard).collect();
+
+    let setup = setup_start.elapsed();
+
+    // --- measurement window ---------------------------------------------------
+    let barrier = Arc::new(Barrier::new(n + 1));
+    let (tx, rx) = mpsc::channel::<Result<Duration, String>>();
+    let mut handles = Vec::with_capacity(n);
+
+    for (tid, mp) in mountpoints.iter().enumerate() {
+        let barrier = barrier.clone();
+        let tx = tx.clone();
+        let git_dir = git_dir.clone();
+        let ref_name = args.ref_name.clone();
+        let files = args.files.clone();
+        let mp = mp.clone();
+
+        let handle = thread::Builder::new()
+            .name(format!("naive-{tid}"))
+            .spawn(move || {
+                barrier.wait();
+                let t0 = Instant::now();
+                let result = (|| -> anyhow::Result<()> {
+                    let store = Arc::new(ObjectStore::open(&git_dir)?);
+                    let fetcher = GitCliFetcher::open(store.clone())?;
+                    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                    let provider = Arc::new(ProjectionFsProvider::new(
+                        Projection::Ref(ref_name),
+                        hydrating,
+                        RootOverlay::new(),
+                        (tid as u64) + 200,
+                    )?);
+                    let session =
+                        mount_background(provider, &mp, &MountConfig::default())?;
+                    wait_for_mount(&mp, Duration::from_secs(10))?;
+                    for f in &files {
+                        let _ = std::fs::read_to_string(mp.join(f))?;
+                    }
+                    drop(session);
+                    Ok(())
+                })();
+                let elapsed = t0.elapsed();
+                let _ = tx.send(result.map(|_| elapsed).map_err(|e| e.to_string()));
+            })?;
+        handles.push(handle);
+    }
+    drop(tx);
+
+    barrier.wait();
+    let measurement_start = Instant::now();
+
+    let mut per_thread = Vec::with_capacity(n);
+    let mut failures = 0usize;
+    for r in rx {
+        match r {
+            Ok(d) => per_thread.push(d),
+            Err(e) => {
+                failures += 1;
+                eprintln!("    thread failure: {e}");
+            }
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let wall_clock = measurement_start.elapsed();
 
     Ok(ConcurrentSample {
         setup,
