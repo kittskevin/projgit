@@ -18,7 +18,22 @@ use projgit_core::overlay::SyntheticEntry;
 use projgit_core::ObjectStore;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Per-test-binary monotonically-increasing counter used to make
+/// every temp path inside this file unique even when `cargo test`
+/// runs the tests in parallel.
+///
+/// The previous scheme used `Instant::now().elapsed().as_nanos()`,
+/// which returns ~0 ns because the instant is immediately polled —
+/// parallel test threads would hit the same `(pid, nanos)` pair and
+/// race-delete each other's fixtures (typically surfaced as "git
+/// failed" or `read_overlay_file` assertion failures on ~1/5 runs).
+fn next_unique_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 // -----------------------------------------------------------------------------
 // Fixture helpers (mirror `tests/projection_fs.rs` so each test binary
@@ -51,7 +66,7 @@ fn build_fixture(name: &str) -> (PathBuf, gix::ObjectId) {
         "projgit-dotgit-{}-{}-{}",
         name,
         std::process::id(),
-        std::time::Instant::now().elapsed().as_nanos(),
+        next_unique_id(),
     ));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
@@ -142,7 +157,7 @@ fn parse_index(index_bytes: &[u8]) -> gix::index::File {
     let tmp = std::env::temp_dir().join(format!(
         "projgit-dotgit-index-parse-{}-{}",
         std::process::id(),
-        std::time::Instant::now().elapsed().as_nanos()
+        next_unique_id(),
     ));
     let _ = std::fs::remove_file(&tmp);
     std::fs::write(&tmp, index_bytes).unwrap();
