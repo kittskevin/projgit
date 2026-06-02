@@ -16,14 +16,16 @@ FUSE fd; daemon is pure data plane; failure-mode contract
 verified), **dotgit A2 ref visibility landed** as a parallel
 small win, and **Stage 4 was indefinitely deferred** once we
 walked through Harbor's threat model and concluded the stop
-condition was met.
+condition was met. Closed with **Phase C design + plan docs**
+so the next-up item (concurrent cold-fetch bench) is ready to
+pick up cold.
 
 Net result: the daemon-architecture backbone is structurally
 complete for the announced Harbor workload, with measured tests
 proving each layer and the next-step queue trimmed of speculative
 multi-tenant work.
 
-## Commits landed (chronological, all on `main`, NOT pushed)
+## Commits landed (chronological, all on `main`)
 
 | commit | what |
 |---|---|
@@ -35,9 +37,12 @@ multi-tenant work.
 | `dcfbf5b` | feat(core): A2 ref visibility for branch projections (dotgit) |
 | `736f6d0` | feat(cli, daemon): wire A2 ref visibility + e2e test + docs |
 | `7c673ae` | docs(projgitd): defer Stage 4 indefinitely; T1.5 is sufficient for Harbor |
+| `b07e60f` | docs(handoffs): session handoff for 2026-06-02 (Stage 3, A2, Stage 4 deferral) |
+| `89a4607` | docs(phase-c): design + implementation plan for concurrent cold-fetch bench |
 
-HEAD = `7c673ae` at end-of-session; 8 commits ahead of
-`origin/main`. Push when ready.
+HEAD = `89a4607` at end-of-session; 10 commits ahead of
+the prior session's `origin/main` baseline (`6bcbeaf`), all
+pushed.
 
 ## What each chunk proved / shipped
 
@@ -188,6 +193,50 @@ Decision recorded in:
 Spike + Stage 3 sidecar substrate stay in place — Stage 4 is
 ~1 session away if Harbor's deployment model ever shifts.
 
+### Phase C design + plan docs (`89a4607`)
+
+Landed after the initial handoff doc (this file's original
+version) was committed -- captured here for completeness so the
+session record stays whole.
+
+Two planning docs, mirroring the projgitd design/plan split:
+
+- **`docs/design/phase-c-bench.md`** (282 lines) -- the why:
+  the question Phase C answers ("at concurrency N, how much
+  does the daemon's in-flight fetch coalescer save vs N
+  independent consumers racing to fetch the same blobs?"),
+  the architectural property under test (audit A3 closure),
+  methodology (two new scenarios on the existing bench harness),
+  expected shape (clearly labeled as expectation not prediction;
+  expect 5-10× daemon win at N=10), success criteria, risks
+  (concurrent `git fetch` in the naive arm, in-thread vs
+  subprocess daemon), open questions to settle by running.
+
+- **`docs/implementation/phase-c-plan.md`** (353 lines) -- the
+  how: 5 stages with per-stage commit boundaries and decision
+  points. Stages 1-3 are bench code (refactor harness, add
+  daemon-concurrent, add naive-concurrent comparator); Stage 4
+  captures results in baseline.md; Stage 5 updates the handoff.
+  Explicit **stop conditions** -- if daemon arm at N=1 is > 20%
+  off baseline-single, or if naive arm deadlocks, or if N=10
+  ratio is < 1.5×, pause and investigate before declaring Phase
+  C done. Don't massage results.
+
+Key design choices baked in:
+- Two scenarios on existing `bench_mount.rs` (not new bench
+  infra). Phase C is small (~half a session).
+- `naive-concurrent` uses a SHARED on-disk cache dir -- the
+  actual A3 scenario, not the safer "separate cache dirs"
+  variant that measures a different (already-answered) property.
+- In-thread daemon (matches `sidecar_mount_smoke.rs` pattern).
+  Subprocess variant is a follow-up if numbers raise questions.
+- Default matrix N ∈ {1, 4, 10}. N=100 (README headline) is
+  bench-machine-dependent.
+
+Nothing is committed to numerical predictions -- if results
+contradict the expected shape, the design doc updates to record
+actual findings rather than the bench getting tuned to match.
+
 ## Tests added this session
 
 | file | tests | gating |
@@ -260,9 +309,16 @@ Plus the dotgit_index de-flake (no new tests, just the
 - **[`../design/dotgit-synthesis.md`](../design/dotgit-synthesis.md)**
   — new §9.7 entry for A2 promotion (parallel to §9.5 / §9.6
   for A1 / A1+).
+- **[`../design/phase-c-bench.md`](../design/phase-c-bench.md)**
+  — new design doc for the concurrent cold-fetch bench. Status:
+  planned, not yet run; mental model going in is documented.
 - **[`../implementation/projgitd-plan.md`](../implementation/projgitd-plan.md)**
   — Stage 3 marked DONE with full sub-stage breakdown; Stage 4
   marked DEFERRED INDEFINITELY.
+- **[`../implementation/phase-c-plan.md`](../implementation/phase-c-plan.md)**
+  — new 5-stage execution plan for Phase C; reads top-to-bottom
+  as a checklist; explicit stop conditions and decision points
+  per stage.
 - **[`../implementation/handoff.md`](../implementation/handoff.md)**
   — Done section has fresh bullets for Stage 3 and A2; "What
   I'd do next" demotes Stage 5 to #2 (was #3), drops Stage 4
@@ -277,18 +333,30 @@ Plus the dotgit_index de-flake (no new tests, just the
   session-cross note: don't re-propose Stage 4.
 - **`/memories/repo/test-flakes.md`** — deleted (the only entry
   was the dotgit_index flake; fixed this session).
+- **`/memories/repo/audit.md`** — noted as referenced in the
+  handoff but NOT currently present in this devcontainer's repo
+  memory. Phase C plan calls this out (§6.2): A3 closure goes
+  in the handoff text rather than the audit memory unless a
+  future session re-creates the audit file.
 
 ## Next up
 
-Per the updated handoff "What I'd do next" at end of session:
+Per the updated handoff "What I'd do next" at end of session,
+and with Phase C's design + plan now in place:
 
-1. **Phase C concurrent bench.** The natural sequel to Stage 3.
-   Now genuinely runnable against a *partial-clone* source.
-   Extends `crates/projgit-cli/examples/bench_mount.rs` with a
-   `--scenario daemon-concurrent` mode that spawns two
-   `projgit mount --daemon-socket …` sidecars against one
-   daemon and times cold reads of the same blob. First measured
-   number on the cross-process single-flight gap.
+1. **Execute Phase C** — the design and implementation plan are
+   already committed. The plan reads top-to-bottom as a 5-stage
+   checklist:
+     1. Refactor: extract a fetcher-factory in
+        `projgit_mount_once` (~1 commit, pure refactor).
+     2. Add `daemon-concurrent` scenario (~1 commit, new code).
+     3. Add `naive-concurrent` comparator (~1 commit, new code).
+     4. Capture results in `docs/bench/baseline.md` (~1 commit,
+        prose + tables).
+     5. Update handoff (~1 commit).
+   Total expected: ~half a session, 4-5 commits. Start point:
+   [`docs/implementation/phase-c-plan.md`](../implementation/phase-c-plan.md)
+   §2.2 (the Stage 1 "concrete change" block).
 2. **projgitd Stage 5 — production polish.** systemd unit + PID
    file, `tracing-subscriber` wiring for the existing `-v` flag,
    persistent daemon state for fast restart, health endpoints.
