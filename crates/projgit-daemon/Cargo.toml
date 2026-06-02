@@ -36,6 +36,10 @@ projgit-fuse = { path = "../projgit-fuse" }
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 nix = { version = "0.29", features = ["fs", "user"] }
+# `gix::ObjectId` for parsing hex OIDs in the Fetch / PrefetchHeaders
+# handlers. Workspace pin so we never drift onto a different gix
+# major than projgit-core.
+gix = { workspace = true }
 
 [features]
 default = []

@@ -56,6 +56,41 @@ pub enum Request {
     /// Graceful shutdown: daemon unmounts everything, closes the
     /// listener, and exits with status 0.
     Shutdown,
+
+    // --- Stage 3 (sidecar holds the FUSE fd) --------------------------------
+    /// Bind the daemon to `source` (clone if needed) and return the
+    /// on-disk git-dir path so the sidecar can open its own
+    /// `ObjectStore` against the same CAS. Idempotent: if the daemon
+    /// is already attached to the same source, returns the existing
+    /// git_dir; if it's attached to a different one, returns
+    /// `source_mismatch`.
+    ///
+    /// Sidecars call this once at startup; subsequent reads go
+    /// through [`Request::Fetch`] / [`Request::PrefetchHeaders`].
+    Attach {
+        /// URL or local path of the upstream repo.
+        source: String,
+    },
+    /// Ask the daemon to make `oid` resident in the shared on-disk
+    /// CAS. Returns once the object is durably written (i.e. the
+    /// sidecar's `ObjectStore::contains(oid)` will succeed
+    /// immediately after).
+    ///
+    /// Concurrent `Fetch` requests for the same OID are coalesced
+    /// by the daemon's existing `HydratingObjectStore` — N sidecars
+    /// asking simultaneously see one upstream fetch. This is what
+    /// closes audit A3.
+    Fetch {
+        /// Hex-encoded object id.
+        oid: String,
+    },
+    /// Batch variant of [`Request::Fetch`]: ask the daemon to
+    /// resolve headers for many OIDs in one round trip. Backs the
+    /// sidecar's T1 readdir-time prefetch worker.
+    PrefetchHeaders {
+        /// Hex-encoded object ids.
+        oids: Vec<String>,
+    },
 }
 
 /// Control-plane response from daemon to client.
@@ -65,13 +100,56 @@ pub enum Response {
     /// Reply to [`Request::Ping`].
     Pong,
     /// Generic success for operations that don't carry a payload
-    /// (`Mount`, `Umount`, `Shutdown`).
+    /// (`Mount`, `Umount`, `Shutdown`, `Fetch`).
     Ok,
     /// Reply to [`Request::Status`].
     Status(StatusReport),
+    /// Reply to [`Request::Attach`]. Carries the on-disk git-dir
+    /// path the sidecar should open its own `ObjectStore` against.
+    Attached {
+        /// Absolute path to the partial-clone's `.git` directory
+        /// (or the bare repo directory). Stable for the lifetime of
+        /// the daemon.
+        git_dir: PathBuf,
+    },
+    /// Reply to [`Request::PrefetchHeaders`]. One probe per input
+    /// OID, in the same order as the request.
+    HeaderProbes { probes: Vec<HeaderProbeWire> },
     /// Operation failed. `code` is a short stable identifier the
     /// client can match on; `message` is human-readable detail.
     Err { code: String, message: String },
+}
+
+/// Wire form of [`projgit_core::fetcher::HeaderProbe`]. We don't
+/// serialise the in-process `HeaderProbe` directly because it
+/// carries a `FetcherError` payload that isn't `Clone` /
+/// `Serialize`; here errors degrade to a `code` + `message`
+/// pair, same shape as [`Response::Err`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HeaderProbeWire {
+    /// OID is locally present after this call.
+    Present { oid: String },
+    /// OID is present and the daemon read the header for free.
+    PresentWithHeader {
+        oid: String,
+        /// `"blob" | "tree" | "commit" | "tag"`.
+        object_kind: String,
+        size: u64,
+    },
+    /// Header metadata is known but the object may not yet be
+    /// resident. (Today only `GvfsFetcher` produces this.)
+    HeaderOnly {
+        oid: String,
+        object_kind: String,
+        size: u64,
+    },
+    /// Per-OID failure. The rest of the batch is unaffected.
+    Error {
+        oid: String,
+        code: String,
+        message: String,
+    },
 }
 
 /// Snapshot of daemon state returned by [`Request::Status`].
@@ -134,6 +212,18 @@ pub mod codes {
     pub const PROTOCOL_ERROR: &str = "protocol_error";
     /// Internal daemon error (panic, lock poison, etc.).
     pub const INTERNAL: &str = "internal";
+
+    // --- Stage 3 ---------------------------------------------------------
+    /// A [`super::Request::Fetch`] or [`super::Request::PrefetchHeaders`]
+    /// was sent before any [`super::Request::Attach`] / [`super::Request::Mount`]
+    /// bound the daemon to a source.
+    pub const NOT_ATTACHED: &str = "not_attached";
+    /// Malformed hex OID in [`super::Request::Fetch`] /
+    /// [`super::Request::PrefetchHeaders`].
+    pub const BAD_OID: &str = "bad_oid";
+    /// The daemon's fetcher could not hydrate the requested OID
+    /// (remote refused, transport error, etc.).
+    pub const FETCH_FAILED: &str = "fetch_failed";
 }
 
 // -----------------------------------------------------------------------------
@@ -335,6 +425,107 @@ mod tests {
         match read_message::<_, Request>(&mut cursor) {
             Err(FrameError::Json(_)) => {}
             other => panic!("expected Json error, got {other:?}"),
+        }
+    }
+
+    // --- Stage 3 -----------------------------------------------------
+
+    #[test]
+    fn fetch_request_roundtrip() {
+        let original = Request::Fetch {
+            oid: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+        };
+        match roundtrip::<Request>(&original) {
+            Request::Fetch { oid } => {
+                assert_eq!(oid, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_request_roundtrip() {
+        let original = Request::Attach {
+            source: "/tmp/repo".into(),
+        };
+        match roundtrip::<Request>(&original) {
+            Request::Attach { source } => assert_eq!(source, "/tmp/repo"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attached_response_roundtrip() {
+        let original = Response::Attached {
+            git_dir: PathBuf::from("/var/cache/projgitd/repo-cafef00d/.git"),
+        };
+        match roundtrip::<Response>(&original) {
+            Response::Attached { git_dir } => {
+                assert_eq!(
+                    git_dir,
+                    PathBuf::from("/var/cache/projgitd/repo-cafef00d/.git")
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefetch_headers_roundtrip() {
+        let original = Request::PrefetchHeaders {
+            oids: vec!["aa".into(), "bb".into()],
+        };
+        match roundtrip::<Request>(&original) {
+            Request::PrefetchHeaders { oids } => assert_eq!(oids, vec!["aa", "bb"]),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_probes_response_roundtrip() {
+        let original = Response::HeaderProbes {
+            probes: vec![
+                HeaderProbeWire::Present { oid: "aa".into() },
+                HeaderProbeWire::PresentWithHeader {
+                    oid: "bb".into(),
+                    object_kind: "blob".into(),
+                    size: 42,
+                },
+                HeaderProbeWire::Error {
+                    oid: "cc".into(),
+                    code: codes::FETCH_FAILED.into(),
+                    message: "boom".into(),
+                },
+            ],
+        };
+        match roundtrip::<Response>(&original) {
+            Response::HeaderProbes { probes } => {
+                assert_eq!(probes.len(), 3);
+                match &probes[0] {
+                    HeaderProbeWire::Present { oid } => assert_eq!(oid, "aa"),
+                    other => panic!("probe[0] = {other:?}"),
+                }
+                match &probes[1] {
+                    HeaderProbeWire::PresentWithHeader {
+                        oid,
+                        object_kind,
+                        size,
+                    } => {
+                        assert_eq!(oid, "bb");
+                        assert_eq!(object_kind, "blob");
+                        assert_eq!(*size, 42);
+                    }
+                    other => panic!("probe[1] = {other:?}"),
+                }
+                match &probes[2] {
+                    HeaderProbeWire::Error { oid, code, .. } => {
+                        assert_eq!(oid, "cc");
+                        assert_eq!(code, codes::FETCH_FAILED);
+                    }
+                    other => panic!("probe[2] = {other:?}"),
+                }
+            }
+            other => panic!("got {other:?}"),
         }
     }
 }

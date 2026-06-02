@@ -1152,6 +1152,38 @@ fn print_response(r: &projgit_daemon::protocol::Response) {
         Response::Err { code, message } => {
             eprintln!("err: {code}: {message}");
         }
+        // Attach / HeaderProbes are emitted by the new Stage 3
+        // RPCs (Attach / PrefetchHeaders). The `attach` CLI
+        // doesn't expose those today — they're driven by the
+        // sidecar's DaemonFetcher — but a future debug subcommand
+        // (or just a user poking around with `socat`) might. Print
+        // a one-line summary so the response isn't silently
+        // swallowed.
+        Response::Attached { git_dir } => {
+            println!("attached  : {}", git_dir.display());
+        }
+        Response::HeaderProbes { probes } => {
+            println!("probes    : {}", probes.len());
+            for p in probes {
+                use projgit_daemon::protocol::HeaderProbeWire;
+                match p {
+                    HeaderProbeWire::Present { oid } => println!("  present {oid}"),
+                    HeaderProbeWire::PresentWithHeader {
+                        oid,
+                        object_kind,
+                        size,
+                    } => println!("  present {oid} ({object_kind}, {size}B)"),
+                    HeaderProbeWire::HeaderOnly {
+                        oid,
+                        object_kind,
+                        size,
+                    } => println!("  header-only {oid} ({object_kind}, {size}B)"),
+                    HeaderProbeWire::Error { oid, code, message } => {
+                        println!("  error   {oid} ({code}): {message}")
+                    }
+                }
+            }
+        }
     }
 }
 

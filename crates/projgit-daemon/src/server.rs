@@ -20,14 +20,15 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use crate::protocol::{
-    codes, read_message, write_message, CacheStats, FrameError, MountInfo, Request, Response,
-    StatusReport,
+    codes, read_message, write_message, CacheStats, FrameError, HeaderProbeWire, MountInfo,
+    Request, Response, StatusReport,
 };
 use anyhow::{anyhow, Context, Result};
+use gix::ObjectId;
 use projgit_core::{
     clone::{git_dir_for, partial_clone, CloneOptions},
-    GitCliFetcher, HydratingObjectStore, NoopFetcher, ObjectStore, Projection,
-    ProjectionFsProvider, RootOverlay,
+    GitCliFetcher, HeaderProbe, HydratingObjectStore, NoopFetcher, ObjectKind, ObjectStore,
+    Projection, ProjectionFsProvider, RootOverlay,
 };
 use projgit_fuse::{mount_background, BackgroundSession, MountConfig, SessionACL};
 use std::collections::HashMap;
@@ -105,6 +106,37 @@ struct ActiveRepo {
 enum ActiveBackend {
     Noop(Arc<HydratingObjectStore<NoopFetcher>>),
     GitCli(Arc<HydratingObjectStore<GitCliFetcher>>),
+}
+
+impl ActiveBackend {
+    /// Make `oid` resident on disk through the underlying
+    /// `HydratingObjectStore`. Uses `header()` (not `read_blob`)
+    /// because the request may name an object of any kind — trees,
+    /// commits, and tags are all things the sidecar will need to
+    /// hydrate, and `read_blob` rejects non-blobs with
+    /// `UnexpectedKind`. `header()` is also cheap: warm hits skip
+    /// the fetcher entirely; cold hits go through the fetcher's
+    /// internal coalescer, which is the single-flight that closes
+    /// audit A3 (N sidecars asking for the same OID concurrently
+    /// see one upstream fetch).
+    ///
+    /// We discard the header; the daemon doesn't ship metadata
+    /// over the wire on this op (the data plane is the shared
+    /// on-disk CAS — see `docs/design/projgitd.md` §4.2). The fact
+    /// that `header()` succeeded is the signal the sidecar needs.
+    fn fetch_one(&self, oid: ObjectId) -> Result<(), String> {
+        match self {
+            ActiveBackend::Noop(h) => h.header(oid).map(|_| ()).map_err(|e| e.to_string()),
+            ActiveBackend::GitCli(h) => h.header(oid).map(|_| ()).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn prefetch_headers(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
+        match self {
+            ActiveBackend::Noop(h) => h.prefetch_headers(oids),
+            ActiveBackend::GitCli(h) => h.prefetch_headers(oids),
+        }
+    }
 }
 
 struct MountEntry {
@@ -194,12 +226,8 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     // surface a clear conflict — bind() below will fail with EADDRINUSE.
     let _ = std::fs::remove_file(&config.socket_path);
 
-    let listener = UnixListener::bind(&config.socket_path).with_context(|| {
-        format!(
-            "binding unix socket at {}",
-            config.socket_path.display()
-        )
-    })?;
+    let listener = UnixListener::bind(&config.socket_path)
+        .with_context(|| format!("binding unix socket at {}", config.socket_path.display()))?;
     nix::sys::stat::fchmodat(
         None,
         &config.socket_path,
@@ -214,7 +242,10 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         config.socket_mode
     );
 
-    let state = Arc::new(DaemonState::new(config.socket_path.clone(), config.cache_dir.clone()));
+    let state = Arc::new(DaemonState::new(
+        config.socket_path.clone(),
+        config.cache_dir.clone(),
+    ));
 
     // Accept loop. Non-blocking would be cleaner but a self-connect
     // wakeup on shutdown is good enough for V1 and matches what most
@@ -302,6 +333,9 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
             allow_other,
         } => handle_mount(state, source, ref_name, mountpoint, no_dotgit, allow_other),
         Request::Umount { mountpoint } => handle_umount(state, mountpoint),
+        Request::Attach { source } => handle_attach(state, source),
+        Request::Fetch { oid } => handle_fetch(state, oid),
+        Request::PrefetchHeaders { oids } => handle_prefetch_headers(state, oids),
     }
 }
 
@@ -328,9 +362,7 @@ fn handle_mount(
 
     let mut active = match state.active.lock() {
         Ok(g) => g,
-        Err(_) => {
-            return err(codes::INTERNAL, "daemon state mutex poisoned (prior panic)")
-        }
+        Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned (prior panic)"),
     };
 
     // First mount: attach the daemon to this source.
@@ -370,27 +402,31 @@ fn handle_mount(
     }
 
     let session_result = match &repo.backend {
-        ActiveBackend::Noop(h) => ProjectionFsProvider::new(
-            projection, h.clone(), overlay, projection_id,
-        )
-        .map_err(anyhow::Error::from)
-        .and_then(|p| {
-            mount_background(Arc::new(p), &mountpoint, &cfg).map_err(anyhow::Error::from)
-        }),
-        ActiveBackend::GitCli(h) => ProjectionFsProvider::new(
-            projection, h.clone(), overlay, projection_id,
-        )
-        .map_err(anyhow::Error::from)
-        .and_then(|p| {
-            mount_background(Arc::new(p), &mountpoint, &cfg).map_err(anyhow::Error::from)
-        }),
+        ActiveBackend::Noop(h) => {
+            ProjectionFsProvider::new(projection, h.clone(), overlay, projection_id)
+                .map_err(anyhow::Error::from)
+                .and_then(|p| {
+                    mount_background(Arc::new(p), &mountpoint, &cfg).map_err(anyhow::Error::from)
+                })
+        }
+        ActiveBackend::GitCli(h) => {
+            ProjectionFsProvider::new(projection, h.clone(), overlay, projection_id)
+                .map_err(anyhow::Error::from)
+                .and_then(|p| {
+                    mount_background(Arc::new(p), &mountpoint, &cfg).map_err(anyhow::Error::from)
+                })
+        }
     };
 
     match session_result {
         Ok(session) => {
             repo.mounts.insert(
                 mountpoint,
-                MountEntry { ref_name, projection_id, session },
+                MountEntry {
+                    ref_name,
+                    projection_id,
+                    session,
+                },
             );
             Response::Ok
         }
@@ -424,6 +460,130 @@ fn handle_umount(state: &Arc<DaemonState>, mountpoint: PathBuf) -> Response {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Stage 3 — sidecar-mode handlers (Attach / Fetch / PrefetchHeaders)
+// -----------------------------------------------------------------------------
+
+/// Bind the daemon to `source` (clone if needed) and return the
+/// on-disk git-dir path. Idempotent: a second `Attach` to the same
+/// source returns the existing git_dir; a second `Attach` to a
+/// different source returns `source_mismatch`. Mirrors the
+/// first-`Mount`-wins behaviour for V1's one-source-per-daemon rule.
+fn handle_attach(state: &Arc<DaemonState>, source: String) -> Response {
+    let mut active = match state.active.lock() {
+        Ok(g) => g,
+        Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+    };
+    if active.is_none() {
+        match attach_source(&source, state.cache_dir.as_deref()) {
+            Ok(repo) => *active = Some(repo),
+            Err(e) => return err(codes::SOURCE_OPEN_FAILED, format!("{e:#}")),
+        }
+    }
+    let repo = active.as_ref().expect("just attached");
+    if repo.source != source {
+        return err(
+            codes::SOURCE_MISMATCH,
+            format!(
+                "daemon is bound to source `{}`; this Attach asked for `{source}`. \
+                 V1 is one source per daemon.",
+                repo.source
+            ),
+        );
+    }
+    Response::Attached {
+        git_dir: repo.git_dir.clone(),
+    }
+}
+
+/// Make `oid` resident on disk. Returns once the daemon's
+/// `HydratingObjectStore` reports success (the coalescer deduplicates
+/// concurrent requests for the same OID — closes audit A3). The
+/// sidecar's `ObjectStore::contains(oid)` succeeds immediately after.
+fn handle_fetch(state: &Arc<DaemonState>, oid_hex: String) -> Response {
+    let oid = match parse_oid(&oid_hex) {
+        Ok(o) => o,
+        Err(e) => return err(codes::BAD_OID, e),
+    };
+    let active = match state.active.lock() {
+        Ok(g) => g,
+        Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+    };
+    let Some(repo) = active.as_ref() else {
+        return err(
+            codes::NOT_ATTACHED,
+            "daemon has no active source yet; send Attach first",
+        );
+    };
+    match repo.backend.fetch_one(oid) {
+        Ok(()) => Response::Ok,
+        Err(e) => err(codes::FETCH_FAILED, e),
+    }
+}
+
+/// Batch variant: resolve headers for many OIDs in one round trip.
+fn handle_prefetch_headers(state: &Arc<DaemonState>, oid_hexes: Vec<String>) -> Response {
+    // Parse all OIDs up front; any malformed one rejects the whole
+    // batch with `bad_oid` so the client can fix its caller.
+    let mut oids: Vec<ObjectId> = Vec::with_capacity(oid_hexes.len());
+    for hex in &oid_hexes {
+        match parse_oid(hex) {
+            Ok(o) => oids.push(o),
+            Err(e) => return err(codes::BAD_OID, e),
+        }
+    }
+    let active = match state.active.lock() {
+        Ok(g) => g,
+        Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+    };
+    let Some(repo) = active.as_ref() else {
+        return err(
+            codes::NOT_ATTACHED,
+            "daemon has no active source yet; send Attach first",
+        );
+    };
+    let probes = repo.backend.prefetch_headers(&oids);
+    Response::HeaderProbes {
+        probes: probes.into_iter().map(probe_to_wire).collect(),
+    }
+}
+
+fn parse_oid(hex: &str) -> Result<ObjectId, String> {
+    ObjectId::from_hex(hex.as_bytes()).map_err(|e| format!("invalid OID `{hex}`: {e}"))
+}
+
+fn object_kind_str(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Blob => "blob",
+        ObjectKind::Tree => "tree",
+        ObjectKind::Commit => "commit",
+        ObjectKind::Tag => "tag",
+    }
+}
+
+fn probe_to_wire(probe: HeaderProbe) -> HeaderProbeWire {
+    match probe {
+        HeaderProbe::Present(oid) => HeaderProbeWire::Present {
+            oid: oid.to_string(),
+        },
+        HeaderProbe::PresentWithHeader(oid, kind, size) => HeaderProbeWire::PresentWithHeader {
+            oid: oid.to_string(),
+            object_kind: object_kind_str(kind).to_owned(),
+            size,
+        },
+        HeaderProbe::HeaderOnly(oid, kind, size) => HeaderProbeWire::HeaderOnly {
+            oid: oid.to_string(),
+            object_kind: object_kind_str(kind).to_owned(),
+            size,
+        },
+        HeaderProbe::Error(oid, e) => HeaderProbeWire::Error {
+            oid: oid.to_string(),
+            code: codes::FETCH_FAILED.into(),
+            message: format!("{e}"),
+        },
+    }
+}
+
 fn err(code: &str, message: impl Into<String>) -> Response {
     Response::Err {
         code: code.into(),
@@ -447,7 +607,11 @@ fn attach_source(source: &str, cache_dir_override: Option<&Path>) -> Result<Acti
         let cache_dir = resolve_cache_dir(cache_dir_override)?;
         let dest = cache_dir.join(cache_subdir_for_url(source));
         if !dest.exists() {
-            eprintln!("projgitd: partial-cloning {} into {}", source, dest.display());
+            eprintln!(
+                "projgitd: partial-cloning {} into {}",
+                source,
+                dest.display()
+            );
             std::fs::create_dir_all(&cache_dir)
                 .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
             let opts = CloneOptions::new(source.to_owned(), dest.clone());
@@ -554,8 +718,7 @@ fn build_overlay(
     let objects_dir = git_dir.join("objects");
     let objects_dir = std::fs::canonicalize(&objects_dir)
         .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
-        .context("building A1+ overlay")
+    dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")
 }
 
 // -----------------------------------------------------------------------------
@@ -569,7 +732,10 @@ mod tests {
 
     #[test]
     fn ping_dispatches_to_pong() {
-        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock"), None));
+        let state = Arc::new(DaemonState::new(
+            PathBuf::from("/tmp/_test_unused.sock"),
+            None,
+        ));
         match dispatch(&state, Request::Ping) {
             Response::Pong => {}
             other => panic!("got {other:?}"),
@@ -578,7 +744,10 @@ mod tests {
 
     #[test]
     fn status_reports_uptime_and_empty_state() {
-        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock"), None));
+        let state = Arc::new(DaemonState::new(
+            PathBuf::from("/tmp/_test_unused.sock"),
+            None,
+        ));
         match dispatch(&state, Request::Status) {
             Response::Status(r) => {
                 assert!(r.mounts.is_empty());
@@ -591,7 +760,10 @@ mod tests {
 
     #[test]
     fn shutdown_sets_flag_and_returns_ok() {
-        let state = Arc::new(DaemonState::new(PathBuf::from("/tmp/_test_unused.sock"), None));
+        let state = Arc::new(DaemonState::new(
+            PathBuf::from("/tmp/_test_unused.sock"),
+            None,
+        ));
         assert!(!state.should_shut_down());
         match dispatch(&state, Request::Shutdown) {
             Response::Ok => {}
@@ -599,5 +771,4 @@ mod tests {
         }
         assert!(state.should_shut_down());
     }
-
 }
