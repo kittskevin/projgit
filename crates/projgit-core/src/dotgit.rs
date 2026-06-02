@@ -27,11 +27,13 @@
 //! container use case but worth noting before sharing logs from a mount.
 //!
 //! Per the design ladder in `docs/design/dotgit-synthesis.md`, this module
-//! ships **A1** ([`a1_overlay`]) and **A1+** ([`a1_plus_overlay`], which
+//! ships **A1** ([`a1_overlay`]), **A1+** ([`a1_plus_overlay`], which
 //! adds a clean read-only `.git/index` matching HEAD; see
-//! `docs/design/dotgit-index.md`). The richer A2 (symbolic HEAD pointing
-//! at a real ref + the ref file populated) and A3 (writable illusion)
-//! are deferred follow-ups.
+//! `docs/design/dotgit-index.md`), and **A2** ref visibility
+//! ([`apply_a2_ref_visibility`], applied on top of either A1 or A1+
+//! when the projection is a branch — turns the detached `HEAD` into a
+//! symbolic `ref: refs/heads/<branch>` and creates the corresponding
+//! loose ref file). A3 (writable illusion) is deferred.
 
 use crate::object_store::ObjectStore;
 use crate::overlay::{RootOverlay, SyntheticEntry};
@@ -134,6 +136,65 @@ pub fn a1_plus_overlay(
     Ok(overlay)
 }
 
+/// Apply **A2 ref visibility** to an A1 / A1+ overlay in place.
+///
+/// Replaces the detached `.git/HEAD` (a bare OID) with a symbolic
+/// `ref: <branch_full_name>\n`, and creates the corresponding loose
+/// ref file at `.git/<branch_full_name>` containing `<commit_oid>\n`.
+/// Per `docs/design/dotgit-synthesis.md` §4.1 table row A2: orthogonal
+/// to A1+ (the index axis), composes on top of either A1 or A1+.
+///
+/// What this unlocks inside the mount:
+///
+/// - `git branch --show-current` returns `<branch>` instead of empty.
+/// - `git symbolic-ref HEAD` returns `<branch_full_name>`.
+/// - `git rev-parse <branch_full_name>` works.
+/// - IDE branch indicators show the branch name instead of "detached
+///   HEAD".
+/// - `git log --all` sees this one ref (vs A1, which sees no refs).
+///
+/// `branch_full_name` **must** start with `refs/heads/`. The caller is
+/// responsible for normalising user input (short names like `main`
+/// → `refs/heads/main`) and for restricting application to branch
+/// projections (not tags, not `--commit`, not `HEAD` in detached
+/// mode). Tag projections deliberately stay on A1's detached HEAD
+/// because git refuses to set HEAD to a tag ref and IDEs would
+/// misrender it as a branch indicator anyway.
+///
+/// Idempotent on the HEAD replacement; calling twice with different
+/// `branch_full_name`s overwrites the first call's ref file and
+/// leaves the previous one orphaned in the overlay tree. Don't do
+/// that.
+///
+/// # Panics
+///
+/// - if `branch_full_name` does not start with `refs/heads/`
+/// - if the overlay does not contain a top-level `.git/` directory
+///   (i.e. it was not produced by [`a1_overlay`] / [`a1_plus_overlay`])
+pub fn apply_a2_ref_visibility(
+    overlay: &mut RootOverlay,
+    branch_full_name: &str,
+    commit_oid: ObjectId,
+) {
+    assert!(
+        branch_full_name.starts_with("refs/heads/"),
+        "branch_full_name must start with `refs/heads/`, got `{branch_full_name}`",
+    );
+
+    // 1. Symbolic HEAD: `ref: refs/heads/<branch>\n`.
+    let head_bytes = format!("ref: {branch_full_name}\n").into_bytes();
+    splice_dotgit_child(overlay, "HEAD", head_bytes);
+
+    // 2. Loose ref file at `.git/<branch_full_name>` containing
+    //    `<oid>\n`. The path always has at least three segments
+    //    (`refs`, `heads`, plus one branch component), and may have
+    //    more for nested branches like `feature/foo`.
+    let ref_path: Vec<&str> = branch_full_name.split('/').collect();
+    debug_assert!(ref_path.len() >= 3 && ref_path[0] == "refs" && ref_path[1] == "heads");
+    let ref_content = format!("{commit_oid}\n").into_bytes();
+    splice_nested_dotgit_file(overlay, &ref_path, ref_content);
+}
+
 /// Splice a single file into the `.git/` directory of an overlay that
 /// was returned by [`a1_overlay`]. Panics if the overlay doesn't have
 /// a `.git/` directory at the top level (only the in-tree
@@ -145,6 +206,46 @@ fn splice_dotgit_child(overlay: &mut RootOverlay, name: &str, content: Vec<u8>) 
         panic!(".git entry is not a directory");
     };
     children.insert(BString::from(name), SyntheticEntry::file(content));
+}
+
+/// Splice a file at a nested `/`-separated path inside `.git/`,
+/// creating any intermediate directories that don't exist yet (or
+/// reusing existing ones — e.g. `refs/heads/` is already populated
+/// by [`a1_overlay`] and gets reused). `path` must have at least one
+/// component (the file name) and is interpreted as components *under*
+/// `.git/`: passing `["refs", "heads", "main"]` writes
+/// `.git/refs/heads/main`.
+///
+/// Used by [`apply_a2_ref_visibility`] to drop the loose ref file at
+/// `.git/refs/heads/<branch>` while reusing the already-empty
+/// `refs/heads/` directory the A1 overlay creates.
+fn splice_nested_dotgit_file(overlay: &mut RootOverlay, path: &[&str], content: Vec<u8>) {
+    assert!(!path.is_empty(), "splice_nested_dotgit_file needs a non-empty path");
+    let dotgit = overlay.get_mut(b".git").expect("overlay missing .git/");
+    let SyntheticEntry::Directory { children: dotgit_children } = dotgit else {
+        panic!(".git entry is not a directory");
+    };
+
+    // Walk / create intermediates. `current` always points at the
+    // children-map we're about to insert into.
+    let mut current: &mut std::collections::BTreeMap<BString, SyntheticEntry> = dotgit_children;
+    for &component in &path[..path.len() - 1] {
+        let key = BString::from(component);
+        let entry = current
+            .entry(key)
+            .or_insert_with(SyntheticEntry::directory);
+        match entry {
+            SyntheticEntry::Directory { children } => {
+                current = children;
+            }
+            _ => panic!(
+                "splice_nested_dotgit_file: `.git/{}` is not a directory",
+                path[..path.len() - 1].join("/"),
+            ),
+        }
+    }
+    let leaf_name = path[path.len() - 1];
+    current.insert(BString::from(leaf_name), SyntheticEntry::file(content));
 }
 
 /// Build the `.git/index` byte payload for the A1+ overlay.
@@ -324,5 +425,92 @@ mod tests {
         let o = a1_overlay(fixture_oid(), &PathBuf::from("/a/b/c"));
         let alt = walk(&o, ".git/objects/info/alternates");
         assert_eq!(file_content(alt), b"/a/b/c\n");
+    }
+
+    // ---- A2 ref visibility ----------------------------------------------
+
+    #[test]
+    fn a2_replaces_head_with_symbolic_ref() {
+        let mut o = a1_overlay(fixture_oid(), Path::new("/x/objects"));
+        apply_a2_ref_visibility(&mut o, "refs/heads/main", fixture_oid());
+        let head = file_content(walk(&o, ".git/HEAD"));
+        assert_eq!(head, b"ref: refs/heads/main\n");
+    }
+
+    #[test]
+    fn a2_creates_loose_ref_file_with_oid() {
+        let mut o = a1_overlay(fixture_oid(), Path::new("/x/objects"));
+        apply_a2_ref_visibility(&mut o, "refs/heads/main", fixture_oid());
+        let ref_file = file_content(walk(&o, ".git/refs/heads/main"));
+        assert_eq!(
+            ref_file,
+            b"1234567890abcdef1234567890abcdef12345678\n",
+            "loose ref file must contain `<oid>\\n`",
+        );
+    }
+
+    #[test]
+    fn a2_supports_nested_branch_names() {
+        // `feature/foo` needs a `.git/refs/heads/feature/` directory
+        // to be created on the fly because A1 only creates the empty
+        // `refs/heads/` parent.
+        let mut o = a1_overlay(fixture_oid(), Path::new("/x/objects"));
+        apply_a2_ref_visibility(&mut o, "refs/heads/feature/foo", fixture_oid());
+
+        let head = file_content(walk(&o, ".git/HEAD"));
+        assert_eq!(head, b"ref: refs/heads/feature/foo\n");
+
+        let ref_file = file_content(walk(&o, ".git/refs/heads/feature/foo"));
+        assert_eq!(
+            ref_file,
+            b"1234567890abcdef1234567890abcdef12345678\n",
+        );
+
+        // The intermediate `feature/` is a directory, not a file, and
+        // the empty `tags/` is still around from A1.
+        match walk(&o, ".git/refs/heads/feature") {
+            SyntheticEntry::Directory { children } => {
+                assert_eq!(children.len(), 1, "feature/ should contain only foo");
+            }
+            other => panic!("refs/heads/feature is not a directory: {other:?}"),
+        }
+        match walk(&o, ".git/refs/tags") {
+            SyntheticEntry::Directory { children } => {
+                assert!(children.is_empty(), "refs/tags/ must remain empty");
+            }
+            other => panic!("refs/tags is not a directory: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a2_preserves_other_a1_files() {
+        // Applying A2 must not disturb A1's config / packed-refs /
+        // objects/info/alternates entries.
+        let mut o = a1_overlay(fixture_oid(), Path::new("/cache/repo/.git/objects"));
+        apply_a2_ref_visibility(&mut o, "refs/heads/main", fixture_oid());
+
+        assert!(file_content(walk(&o, ".git/config")).starts_with(b"[core]"));
+        assert!(file_content(walk(&o, ".git/packed-refs")).is_empty());
+        assert_eq!(
+            file_content(walk(&o, ".git/objects/info/alternates")),
+            b"/cache/repo/.git/objects\n",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must start with `refs/heads/`")]
+    fn a2_panics_on_non_branch_ref() {
+        let mut o = a1_overlay(fixture_oid(), Path::new("/x/objects"));
+        apply_a2_ref_visibility(&mut o, "refs/tags/v1", fixture_oid());
+    }
+
+    #[test]
+    #[should_panic(expected = "must start with `refs/heads/`")]
+    fn a2_panics_on_short_branch_name() {
+        // The function takes the *full* ref name; the caller is
+        // responsible for normalising short names like `main` →
+        // `refs/heads/main`.
+        let mut o = a1_overlay(fixture_oid(), Path::new("/x/objects"));
+        apply_a2_ref_visibility(&mut o, "main", fixture_oid());
     }
 }

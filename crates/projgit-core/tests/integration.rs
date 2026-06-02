@@ -128,6 +128,45 @@ fn object_store_open_resolves_head() {
 }
 
 #[test]
+fn try_resolve_branch_full_name_classifies_refs() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, _) = build_fixture("os_branch_name");
+    // The fixture already has refs/heads/main; tag the same commit
+    // so we can prove tags are excluded.
+    git(&repo, &["tag", "v1"]);
+
+    let store = ObjectStore::open(&repo).unwrap();
+
+    // Short branch name and full branch ref both resolve to the
+    // same canonical full name.
+    assert_eq!(
+        store.try_resolve_branch_full_name("main").as_deref(),
+        Some("refs/heads/main"),
+    );
+    assert_eq!(
+        store.try_resolve_branch_full_name("refs/heads/main").as_deref(),
+        Some("refs/heads/main"),
+    );
+
+    // Tags are not branches.
+    assert_eq!(store.try_resolve_branch_full_name("v1"), None);
+    assert_eq!(store.try_resolve_branch_full_name("refs/tags/v1"), None);
+
+    // HEAD is excluded even though it resolves -- the caller should
+    // pass the underlying branch name instead.
+    assert_eq!(store.try_resolve_branch_full_name("HEAD"), None);
+
+    // Non-existent ref -> None (no error).
+    assert_eq!(
+        store.try_resolve_branch_full_name("definitely-not-a-ref"),
+        None,
+    );
+}
+
+#[test]
 fn object_store_header_classifies_kinds() {
     if !git_available() {
         eprintln!("SKIP: git CLI not available");

@@ -366,6 +366,44 @@ impl ObjectStore {
             .map_err(|e| ObjectStoreError::Backend(e.to_string()))?;
         Ok(id.detach())
     }
+
+    /// If `refname` (short like `main`, or full like `refs/heads/main`)
+    /// resolves to a **local branch** (`refs/heads/...`), return its
+    /// canonical full name. Otherwise (tag, remote-tracking ref,
+    /// non-existent ref, `HEAD`, or anything else) return `None`.
+    ///
+    /// Used by the `.git/` overlay builders to decide whether to
+    /// apply A2 ref visibility ([`crate::dotgit::apply_a2_ref_visibility`]),
+    /// which is only meaningful for branches: git refuses to set
+    /// `HEAD` symbolically to a tag, and IDE branch indicators would
+    /// misrender a tag as a branch name. Other ref kinds correctly
+    /// fall back to A1's detached HEAD.
+    ///
+    /// `HEAD` deliberately returns `None` even when HEAD is symbolic
+    /// upstream — `find_reference("HEAD")` resolves the *current*
+    /// HEAD's name, not the underlying branch. Callers that want
+    /// "the branch HEAD points at" should pass the user's `--ref`
+    /// value directly (typically the branch short name from CLI
+    /// flags or the daemon RPC).
+    pub fn try_resolve_branch_full_name(&self, refname: &str) -> Option<String> {
+        // `HEAD` is excluded up front so we don't accidentally A2-ify
+        // it on detached-HEAD upstreams (find_reference("HEAD") would
+        // succeed even there, returning a `HEAD` whose full name is
+        // literally "HEAD", which then fails the prefix check below
+        // — but excluding it explicitly also documents the intent).
+        if refname == "HEAD" {
+            return None;
+        }
+        let h = self.handle();
+        let reference = h.find_reference(refname).ok()?;
+        let full = reference.name().as_bstr();
+        let full_str = std::str::from_utf8(full).ok()?;
+        if full_str.starts_with("refs/heads/") {
+            Some(full_str.to_owned())
+        } else {
+            None
+        }
+    }
 }
 
 /// One entry in a parsed tree.
