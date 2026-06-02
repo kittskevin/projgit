@@ -8,12 +8,16 @@
 > code.
 >
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-06-02, after `projgitd` Stage 3 shipped
-> (sidecar holds the FUSE fd; daemon is pure data plane), the
-> dotgit A2 ref-visibility rung landed, and Stage 4 was
-> indefinitely deferred per its design-doc stop condition (Harbor's
-> single-operator deployment shape doesn't need per-namespace
-> isolation).
+> Last updated: 2026-06-02, after Phase C concurrent bench ran (the
+> daemon's in-flight coalescer doesn't deliver a wall-clock win at
+> N ≤ 10 on `rust-lang/log`; audit A3 stays architecturally closed
+> but isn't a load-bearing perf win at this scale — see
+> [`../bench/baseline.md`](../bench/baseline.md) §Phase C). Earlier
+> in the same session: `projgitd` Stage 3 shipped (sidecar holds
+> the FUSE fd; daemon is pure data plane), the dotgit A2
+> ref-visibility rung landed, and Stage 4 was indefinitely deferred
+> per its design-doc stop condition (Harbor's single-operator
+> deployment shape doesn't need per-namespace isolation).
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -386,7 +390,8 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   mount_smoke integration test: mount B’s read of the same OID
   produces a shared-cache `blob_cache` hit). Means audit **A1
   (no daemon)** and **A3 (cross-process single-flight gap) are now
-  architecturally closed**; Phase C bench measures the actual gain.
+  architecturally closed**; Phase C bench measures the actual gain
+  (now measured — see the Phase C Done bullet below).
   Three commits (2a/2b/2c — f33601e, 8291a05, cb98d5a) shipped in
   one focused session, vs the plan’s two-to-three-session estimate.
   Full sub-stage notes in
@@ -430,6 +435,37 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   shows the daemon with `mounts: 0` (sidecar owns the fd, not the
   daemon). Full sub-stage notes in
   [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) §3.
+- **Phase C concurrent cold-fetch bench (2026-06-02).** Two new
+  scenarios on `crates/projgit-cli/examples/bench_mount.rs`:
+  `daemon-concurrent` (one in-thread `projgitd` + N sidecar threads
+  holding `DaemonFetcher`) and `naive-concurrent` (no daemon; N
+  independent `GitCliFetcher`s racing one shared `.git/objects/pack/`,
+  the actual A3 scenario). Captured at N ∈ {1, 4, 10} on
+  `rust-lang/log` plus a 20-file secondary probe at N=10. Full
+  table + writeup in [`../bench/baseline.md`](../bench/baseline.md)
+  §"Results — Phase C concurrent"; design retrospective in
+  [`../design/phase-c-bench.md`](../design/phase-c-bench.md) §4.
+  Audit A3 (cross-process single-flight gap) is **architecturally
+  closed and empirically measured**: daemon's coalescer does dedupe
+  N×duplicate upstream fetches down to N unique fetches, but at
+  this workload scale that's not a wall-clock win — the headline
+  ratio at N=10 is 1.04× (within noise), and at 20-file/N=10 the
+  daemon actually loses by ~12% because it serialises N unique
+  fetches through one shared `git cat-file --batch-check` child
+  while the naive arm pipelines them across N parallel cat-file
+  children + N parallel HTTPS connections. Naive arm doesn't fail
+  at any tested N (git's promisor protocol handles concurrent
+  lazy fetches into a shared pack dir more gracefully than design
+  doc §6.1 suspected). The daemon's load-bearing wins for the
+  target workload remain Stage 3's sidecar/FUSE-fd isolation and
+  the persistent on-disk CAS measured in the sequential section
+  (~3,000× sequential-mount amortisation). Five commits (Stage
+  1 refactor, Stage 2 daemon arm, Stage 3 naive comparator, Stage
+  4 result capture, this handoff update). Stop condition §7.3
+  fired during Stage 4 (N=10 ratio < 1.5×); per plan instructions,
+  investigated before declaring done rather than massaging numbers.
+  Full per-stage detail in
+  [`docs/implementation/phase-c-plan.md`](phase-c-plan.md).
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
@@ -712,30 +748,22 @@ decision points live in
 [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
 the working doc that gets updated as each stage lands.
 
-1. **Phase C concurrent bench** (audit A3 measurement). Now
-   genuinely runnable post-Stage-3 against a *partial-clone* source
-   (local fixtures don't drive cold-path daemon fetches — see Stage
-   3 findings). Spawn two `projgit mount --daemon-socket …` sidecars
-   against the same daemon and time cold reads of the same blob; the
-   coalescer in the daemon's `HydratingObjectStore` should turn N
-   concurrent requests into 1 upstream fetch. Puts the first
-   empirical number on the cross-process single-flight gap.
-2. **`projgitd` Stage 5 — production polish.** systemd unit,
+1. **`projgitd` Stage 5 — production polish.** systemd unit,
    PID file / restart policy, persistent daemon state for fast
    recovery (so daemon-restart doesn't re-resolve refs), health
    checks, `tracing-subscriber` wiring for the existing `-v` flag,
    structured logging.
-3. **B3: CI bench job.** README + bench doc claim the bench
+2. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
    bench and compares to the checked-in baseline. Moderate.
-4. **Phase 3d. Production `projgit-winfsp`** on top of the
+3. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-5. **Container deployment recipe doc.** User-facing `docs/` page
+4. **Container deployment recipe doc.** User-facing `docs/` page
    covering `/etc/fuse.conf`, `bind-propagation`, a sample
    systemd unit, an example Docker invocation, **and the new
    sidecar deployment shape** (`projgitd` on the host or in a
@@ -745,6 +773,18 @@ the working doc that gets updated as each stage lands.
    and [`docs/design/projgitd.md`](../design/projgitd.md); this is
    the cookbook side. The [scripts/docker-smoke/](../../scripts/docker-smoke/)
    recipe shipped with Stage 3d is the runnable seed.
+5. **Phase C follow-up: higher-N or larger-blob bench** (optional,
+   only if Harbor's actual workload shape suggests the daemon's
+   architectural coalescing is worth re-measuring at a regime
+   where it could win). Phase C measured `log` × N ∈ {1,4,10}
+   × 3 small blobs and found the daemon's coalescer doesn't
+   deliver a wall-clock win at that scale; the bench accepts
+   `--concurrency` and `--files` for exploration of higher-N
+   (likely the README's 100 mark, where file-descriptor or
+   remote-connection limits could start to favour the daemon)
+   or bigger blobs (where per-byte savings from dedup matter).
+   Not load-bearing for shipping projgit; would inform whether
+   to invest in protocol pipelining for projgitd Stage 5.
 
 **Items folded into the projgitd plan and removed from the
 standalone list:**
