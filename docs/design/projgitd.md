@@ -702,7 +702,7 @@ cold-path object hydration fails (returns
   introduced by Stage 2c was suppressed via `#[allow]` rather
   than reordering the file.
 
-### Stage 4 — T4 last mile (per-namespace mount via fd passing)
+### Stage 4 — T4 last mile (per-namespace mount via fd passing) — **DEFERRED INDEFINITELY 2026-06-02**
 
 Add the second `MountSource` impl: sidecar accepts a FUSE fd from
 Harbor (via SCM_RIGHTS) and runs the protocol loop against it,
@@ -710,7 +710,7 @@ instead of opening `/dev/fuse` itself. Harbor does the mount in
 the agent's namespace; agent gets a mount visible only inside its
 own container.
 
-Surface:
+Surface (when/if built):
 
 - A `MountSource` trait with `Owned` (Stage 3's `mount()` itself)
   and `External` (fd from socket) impls.
@@ -725,6 +725,22 @@ needs the answer to Stage 0's main question.
 **Stop conditions:** if multi-tenant requirements never
 materialise, Stage 4 stays unbuilt. Single-tenant deployments use
 Stage 3.
+
+**Decision (2026-06-02): stop condition met; Stage 4 deferred
+indefinitely.** Harbor — the agent-eval framework that consumes
+projgit — is explicitly a single-operator, shared-host, parallel-
+agents shape (Scenario A in the §6 threat-model walk-through).
+T1.5 (Stage 3, sidecar mounts on a host path; Harbor docker-runs
+with `-v ...,rslave`) is sufficient: cross-agent isolation comes
+from container mount-namespaces regardless of T1.5 vs T4, and
+host-shell isolation is a non-event because the operator *is*
+the host shell. T4's remaining benefits (automatic mount cleanup
+via namespace reaping, defense-in-depth against operator bugs)
+are real but bounded — not worth the additional `CAP_SYS_ADMIN`
+in Harbor, the fd-passing race coordination, and the ~330 LOC of
+code-without-a-customer. If a multi-tenant requirement
+materialises later, Stage 0's spike + Stage 3's sidecar
+architecture mean picking Stage 4 up cold is a ~1 session job.
 
 ### Stage 5 — Lifecycle / supervision / production polish
 

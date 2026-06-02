@@ -614,13 +614,31 @@ Things noted for Stage 4+:
   reordering the file; reordering when more attach-side helpers
   land is the cleaner long-term fix.
 
-### Stage 4 — T4 last mile (per-namespace fd passing)
+### Stage 4 — T4 last mile (per-namespace fd passing) — **DEFERRED INDEFINITELY 2026-06-02**
 
-Add the second `MountSource` impl: sidecar accepts a FUSE fd from
-Harbor (via SCM_RIGHTS) and runs the protocol loop against it.
-Per-namespace agent isolation.
+Originally planned: add the second `MountSource` impl: sidecar
+accepts a FUSE fd from Harbor (via SCM_RIGHTS) and runs the
+protocol loop against it. Per-namespace agent isolation.
 
-Detail entirely dependent on Stage 0's outcome.
+Detail was entirely dependent on Stage 0's outcome (GREEN 2026-05-20).
+
+**Decision (2026-06-02): Stop condition from `docs/design/projgitd.md`
+§8 Stage 4 met.** Harbor is a single-operator, shared-host,
+parallel-agents framework (Scenario A in the design doc's
+threat-model walk-through). The Stage 3 / T1.5 deployment is
+sufficient for that shape; T4's headline win (per-namespace
+isolation) protects against attackers that don't exist in this
+workload (a different operator on the same host). The remaining
+benefits (auto mount cleanup, defense-in-depth) don't justify
+adding `CAP_SYS_ADMIN` to Harbor or shipping ~330 LOC of
+code-without-a-customer.
+
+If multi-tenant requirements materialise later, the Stage 0
+spike + Stage 3 sidecar architecture mean a fresh implementation
+pass is ~1 focused session, not a redesign. The
+[`spikes/fuse-fd-passing/`](../../spikes/fuse-fd-passing/README.md)
+spike stays in the repo specifically so we can re-run the demo
+if/when that day comes.
 
 ### Stage 5 — Lifecycle / supervision
 

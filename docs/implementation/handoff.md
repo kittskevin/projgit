@@ -9,8 +9,11 @@
 >
 > Living document. Updated whenever we land a phase or change direction.
 > Last updated: 2026-06-02, after `projgitd` Stage 3 shipped
-> (sidecar holds the FUSE fd; daemon is pure data plane) and the
-> dotgit A2 ref-visibility rung landed.
+> (sidecar holds the FUSE fd; daemon is pure data plane), the
+> dotgit A2 ref-visibility rung landed, and Stage 4 was
+> indefinitely deferred per its design-doc stop condition (Harbor's
+> single-operator deployment shape doesn't need per-namespace
+> isolation).
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -717,29 +720,22 @@ the working doc that gets updated as each stage lands.
    coalescer in the daemon's `HydratingObjectStore` should turn N
    concurrent requests into 1 upstream fetch. Puts the first
    empirical number on the cross-process single-flight gap.
-2. **`projgitd` Stage 4 — T4 last mile via per-namespace fd-passing.**
-   Add the second `MountSource` impl: sidecar accepts a FUSE fd from
-   Harbor via `SCM_RIGHTS` and runs the protocol loop against it,
-   instead of opening `/dev/fuse` itself. Builds on Stage 0 (proven
-   fd-passing) and Stage 3 (sidecar architecture). The Stage 3
-   `DaemonFetcher` carries over unchanged — Stage 4 is purely about
-   how the sidecar receives its fd, not where its cold fetches go.
-3. **`projgitd` Stage 5 — production polish.** systemd unit,
+2. **`projgitd` Stage 5 — production polish.** systemd unit,
    PID file / restart policy, persistent daemon state for fast
    recovery (so daemon-restart doesn't re-resolve refs), health
    checks, `tracing-subscriber` wiring for the existing `-v` flag,
    structured logging.
-4. **B3: CI bench job.** README + bench doc claim the bench
+3. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
    bench and compares to the checked-in baseline. Moderate.
-5. **Phase 3d. Production `projgit-winfsp`** on top of the
+4. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-6. **Container deployment recipe doc.** User-facing `docs/` page
+5. **Container deployment recipe doc.** User-facing `docs/` page
    covering `/etc/fuse.conf`, `bind-propagation`, a sample
    systemd unit, an example Docker invocation, **and the new
    sidecar deployment shape** (`projgitd` on the host or in a
@@ -762,6 +758,18 @@ standalone list:**
 **Explicitly off the actionable list** (recorded so they don't sneak
 back in by accident):
 
+- *`projgitd` Stage 4 (T4 last mile via per-namespace fd-passing).*
+  Stop condition met 2026-06-02: Harbor is a single-operator,
+  shared-host, parallel-agents framework (Scenario A in
+  [`docs/design/container-deployment.md`](../design/container-deployment.md)
+  §6); T1.5 / Stage 3 is sufficient for that shape. T4's headline
+  win (per-namespace isolation) protects against an attacker
+  Harbor doesn't have; remaining benefits don't justify the
+  `CAP_SYS_ADMIN` Harbor would need + ~330 LOC of
+  code-without-a-customer. Full decision rationale in
+  [`docs/design/projgitd.md`](../design/projgitd.md) §8 Stage 4.
+  Spike + sidecar architecture stay in place so if multi-tenant
+  ever lands as a real requirement, Stage 4 is ~1 session away.
 - *Fetch coalescing.* Tried; doesn't close the cold gap; cold path
   is structural. See `docs/design/fetch-coalescing.md` §9.5.
 - *Asciinema / video demo for the README.* User preference; the
