@@ -37,11 +37,23 @@ const DEFAULT_URL: &str = "https://github.com/rust-lang/log";
 const DEFAULT_REF: &str = "master";
 const DEFAULT_FILES: &[&str] = &["Cargo.toml", "src/lib.rs", "LICENSE-APACHE"];
 const DEFAULT_ITERATIONS: usize = 3;
+const DEFAULT_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Single,
     Sequential,
+    /// Phase C daemon arm: one in-thread `projgitd` + N sidecar
+    /// threads holding `DaemonFetcher`, all cold-catting the same
+    /// files at the same time. The daemon's in-flight coalescer
+    /// (audit A3) is the architectural property under test.
+    DaemonConcurrent,
+}
+
+impl Scenario {
+    fn is_concurrent(self) -> bool {
+        matches!(self, Scenario::DaemonConcurrent)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +63,10 @@ struct Args {
     files: Vec<String>,
     iterations: usize,
     scenario: Scenario,
+    /// Number of concurrent sidecars in the `daemon-concurrent` /
+    /// `naive-concurrent` scenarios. Ignored by `single` /
+    /// `sequential`. Default `DEFAULT_CONCURRENCY`.
+    concurrency: usize,
 }
 
 fn parse_args() -> Args {
@@ -59,6 +75,7 @@ fn parse_args() -> Args {
     let mut files: Vec<String> = DEFAULT_FILES.iter().map(|s| (*s).to_owned()).collect();
     let mut iterations = DEFAULT_ITERATIONS;
     let mut scenario = Scenario::Single;
+    let mut concurrency = DEFAULT_CONCURRENCY;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -92,15 +109,29 @@ fn parse_args() -> Args {
                 scenario = match v.as_str() {
                     "single" => Scenario::Single,
                     "sequential" => Scenario::Sequential,
+                    "daemon-concurrent" => Scenario::DaemonConcurrent,
                     other => {
-                        eprintln!("unknown scenario: {other} (expected: single, sequential)");
+                        eprintln!(
+                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent)"
+                        );
                         std::process::exit(2);
                     }
                 };
             }
+            "--concurrency" => {
+                let v = it.next().expect("--concurrency needs a value");
+                concurrency = v.parse().unwrap_or_else(|_| {
+                    eprintln!("--concurrency must be a positive integer");
+                    std::process::exit(2)
+                });
+                if concurrency == 0 {
+                    eprintln!("--concurrency must be > 0");
+                    std::process::exit(2);
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single",
+                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent] [--concurrency N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent scenarios)",
                     DEFAULT_FILES.join(","),
                 );
                 std::process::exit(0);
@@ -117,6 +148,7 @@ fn parse_args() -> Args {
         files,
         iterations,
         scenario,
+        concurrency,
     }
 }
 
@@ -137,10 +169,28 @@ fn main() -> anyhow::Result<()> {
     let args = parse_args();
 
     eprintln!(
-        "bench_mount: {} @ {} ({} iterations, scenario={:?}, files={:?})\n",
-        args.url, args.ref_name, args.iterations, args.scenario, args.files,
+        "bench_mount: {} @ {} ({} iterations, scenario={:?}, files={:?}{})\n",
+        args.url,
+        args.ref_name,
+        args.iterations,
+        args.scenario,
+        args.files,
+        if args.scenario.is_concurrent() {
+            format!(", concurrency={}", args.concurrency)
+        } else {
+            String::new()
+        },
     );
 
+    if args.scenario.is_concurrent() {
+        run_concurrent_main(&args)
+    } else {
+        run_paired_main(&args)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_paired_main(args: &Args) -> anyhow::Result<()> {
     let mut projgit_samples: Vec<ProjgitSample> = Vec::with_capacity(args.iterations);
     let mut git_samples: Vec<GitSample> = Vec::with_capacity(args.iterations);
 
@@ -148,18 +198,45 @@ fn main() -> anyhow::Result<()> {
         eprintln!("== iteration {i}/{} ==", args.iterations);
 
         eprint!("  projgit...   ");
-        let p = bench_projgit(&args)?;
+        let p = bench_projgit(args)?;
         eprintln!("ok");
         projgit_samples.push(p);
 
         eprint!("  git baseline ");
-        let g = bench_git_baseline(&args)?;
+        let g = bench_git_baseline(args)?;
         eprintln!("ok");
         git_samples.push(g);
     }
 
     eprintln!();
-    print_report(&args, &projgit_samples, &git_samples);
+    print_report(args, &projgit_samples, &git_samples);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
+    let mut samples: Vec<ConcurrentSample> = Vec::with_capacity(args.iterations);
+    for i in 1..=args.iterations {
+        eprintln!(
+            "== iteration {i}/{} (N={}) ==",
+            args.iterations, args.concurrency
+        );
+        eprint!("  setup (clone + daemon)...  ");
+        let s = match args.scenario {
+            Scenario::DaemonConcurrent => bench_projgit_daemon_concurrent(args)?,
+            // Stage 3 adds NaiveConcurrent.
+            Scenario::Single | Scenario::Sequential => unreachable!(),
+        };
+        eprintln!(
+            "ok (setup {} ms, wall {} ms, fail {})",
+            ms(s.setup),
+            ms(s.wall_clock),
+            s.failures,
+        );
+        samples.push(s);
+    }
+    eprintln!();
+    print_concurrent_report(args, &samples);
     Ok(())
 }
 
@@ -225,6 +302,9 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
     let mount2_cold_cat = match args.scenario {
         Scenario::Single => None,
         Scenario::Sequential => Some(projgit_remount_cold_cat(args, &cache_dir)?),
+        Scenario::DaemonConcurrent => {
+            unreachable!("daemon-concurrent dispatches via run_concurrent_main")
+        }
     };
 
     Ok(ProjgitSample {
@@ -568,6 +648,249 @@ fn median(mut v: Vec<Duration>) -> Duration {
 }
 
 // -----------------------------------------------------------------------------
+// Phase C: concurrent scenarios
+// -----------------------------------------------------------------------------
+
+/// Wall-clock timings for one iteration of a `*-concurrent` scenario.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct ConcurrentSample {
+    /// One-time setup cost: partial-clone (and, for `daemon-concurrent`,
+    /// daemon startup + Attach that triggers the daemon's own partial
+    /// clone). Reported separately from the measurement window so the
+    /// concurrent table stays comparable to the existing `single` /
+    /// `sequential` tables.
+    setup: Duration,
+    /// Per-thread cold-cat wall-clock, recorded from inside each
+    /// sidecar thread (mount + cold-cat + unmount). One entry per
+    /// successful thread.
+    per_thread: Vec<Duration>,
+    /// Wall clock from "all N threads spawned" to "all N joined".
+    /// The load-bearing headline number: how long it took to satisfy
+    /// N concurrent consumers cold-reading the same files.
+    wall_clock: Duration,
+    /// Number of threads that failed (mount error, cat error, daemon
+    /// hiccup, or — in the naive arm — a git lock collision).
+    failures: usize,
+}
+
+/// `daemon-concurrent`: one in-thread daemon + N sidecars, each
+/// holding `DaemonFetcher`, cold-catting `args.files` at the same
+/// time. The daemon's existing `Coalescer` (the in-flight
+/// single-flight inside `HydratingObjectStore::header()`) is the
+/// architectural property under test (audit A3 closure).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bench_projgit_daemon_concurrent(args: &Args) -> anyhow::Result<ConcurrentSample> {
+    use projgit_core::{
+        HydratingObjectStore, ObjectStore, Projection, ProjectionFsProvider, RootOverlay,
+    };
+    use projgit_daemon::protocol::{read_message, write_message, Request, Response};
+    use projgit_daemon::server::{run as daemon_run, DaemonConfig};
+    use projgit_daemon::DaemonFetcher;
+    use projgit_fuse::{mount_background, MountConfig};
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let n = args.concurrency;
+
+    // --- setup window ---------------------------------------------------------
+    let setup_start = Instant::now();
+
+    // Fresh cache root for this iteration. The daemon writes its
+    // partial clone into a hash-named subdir below this; both
+    // get cleaned by DirGuard at iteration end.
+    let cache_root = make_temp("projgit-bench-cache-d");
+    let _cache_guard = DirGuard(cache_root.clone());
+    let socket_path = make_temp("projgit-bench-sock").join("daemon.sock");
+    // `make_temp` creates the dir; remove it so the socket bind has
+    // a clean parent containing only the eventual socket file.
+    let _ = std::fs::remove_file(&socket_path);
+
+    let config = DaemonConfig {
+        socket_path: socket_path.clone(),
+        socket_mode: 0o600,
+        cache_dir: Some(cache_root.clone()),
+    };
+    let daemon_handle = thread::spawn(move || daemon_run(config));
+
+    // Wait for the daemon to bind its socket.
+    let bind_deadline = Instant::now() + Duration::from_secs(5);
+    while !socket_path.exists() {
+        if Instant::now() > bind_deadline {
+            anyhow::bail!("daemon never created socket at {}", socket_path.display());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Attach to the source URL. The daemon does the partial clone
+    // here (or reuses if cached); we get back the on-disk git_dir
+    // that every sidecar thread will open its own ObjectStore
+    // against. Partial-clone cost lives inside `setup`, not
+    // inside the measurement window.
+    let git_dir = {
+        let mut s = UnixStream::connect(&socket_path)?;
+        write_message(
+            &mut s,
+            &Request::Attach {
+                source: args.url.clone(),
+            },
+        )?;
+        match read_message::<_, Response>(&mut s)? {
+            Response::Attached { git_dir } => git_dir,
+            other => anyhow::bail!("daemon attach: unexpected {other:?}"),
+        }
+    };
+
+    // Pre-create N mountpoints so per-thread setup is just mount.
+    let mountpoints: Vec<PathBuf> = (0..n).map(|_| make_temp("projgit-bench-mp-d")).collect();
+    let _mp_guards: Vec<DirGuard> = mountpoints.iter().cloned().map(DirGuard).collect();
+
+    let setup = setup_start.elapsed();
+
+    // --- measurement window ---------------------------------------------------
+    let barrier = Arc::new(Barrier::new(n + 1));
+    let (tx, rx) = mpsc::channel::<Result<Duration, String>>();
+    let mut handles = Vec::with_capacity(n);
+
+    for (tid, mp) in mountpoints.iter().enumerate() {
+        let barrier = barrier.clone();
+        let tx = tx.clone();
+        let socket_path = socket_path.clone();
+        let git_dir = git_dir.clone();
+        let ref_name = args.ref_name.clone();
+        let files = args.files.clone();
+        let mp = mp.clone();
+
+        let handle = thread::Builder::new()
+            .name(format!("sidecar-{tid}"))
+            .spawn(move || {
+                // All threads gate on the barrier so wall clock
+                // measures contention, not thread-start staggering.
+                barrier.wait();
+                let t0 = Instant::now();
+                let result = (|| -> anyhow::Result<()> {
+                    let store = Arc::new(ObjectStore::open(&git_dir)?);
+                    let fetcher = DaemonFetcher::new(socket_path);
+                    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                    let provider = Arc::new(ProjectionFsProvider::new(
+                        Projection::Ref(ref_name),
+                        hydrating,
+                        RootOverlay::new(),
+                        (tid as u64) + 100,
+                    )?);
+                    let session =
+                        mount_background(provider, &mp, &MountConfig::default())?;
+                    wait_for_mount(&mp, Duration::from_secs(10))?;
+                    for f in &files {
+                        let _ = std::fs::read_to_string(mp.join(f))?;
+                    }
+                    drop(session);
+                    Ok(())
+                })();
+                let elapsed = t0.elapsed();
+                let _ = tx.send(result.map(|_| elapsed).map_err(|e| e.to_string()));
+            })?;
+        handles.push(handle);
+    }
+    drop(tx);
+
+    // Release threads simultaneously; this is `t=0` for the
+    // measurement window.
+    barrier.wait();
+    let measurement_start = Instant::now();
+
+    let mut per_thread = Vec::with_capacity(n);
+    let mut failures = 0usize;
+    for r in rx {
+        match r {
+            Ok(d) => per_thread.push(d),
+            Err(e) => {
+                failures += 1;
+                eprintln!("    thread failure: {e}");
+            }
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let wall_clock = measurement_start.elapsed();
+
+    // --- teardown -------------------------------------------------------------
+    let mut s = UnixStream::connect(&socket_path)?;
+    write_message(&mut s, &Request::Shutdown)?;
+    let _: Response = read_message(&mut s)?;
+    let _ = daemon_handle.join();
+
+    Ok(ConcurrentSample {
+        setup,
+        per_thread,
+        wall_clock,
+        failures,
+    })
+}
+
+/// Format a per-N table summarising the concurrent scenarios. Mirrors
+/// the existing `print_report` style: human-readable, copy-pastable
+/// into baseline.md.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn print_concurrent_report(args: &Args, samples: &[ConcurrentSample]) {
+    let setup_med = median(samples.iter().map(|s| s.setup).collect());
+    let wall_med = median(samples.iter().map(|s| s.wall_clock).collect());
+    let per_thread_all: Vec<Duration> = samples
+        .iter()
+        .flat_map(|s| s.per_thread.clone())
+        .collect();
+    let per_thread_p50 = if per_thread_all.is_empty() {
+        Duration::ZERO
+    } else {
+        median(per_thread_all.clone())
+    };
+    let total_failures: usize = samples.iter().map(|s| s.failures).sum();
+
+    println!("# bench_mount: {} @ {}\n", args.url, args.ref_name);
+    println!(
+        "Median of {} iterations, scenario `{:?}`, concurrency N={}. All times in milliseconds.\n",
+        args.iterations, args.scenario, args.concurrency,
+    );
+    println!("## Setup (per iteration)\n");
+    println!("| Step | Time |");
+    println!("|---|---:|");
+    println!(
+        "| Partial clone + daemon attach (or partial clone only for `naive-*`) | {} |",
+        ms(setup_med)
+    );
+    println!();
+    println!("## Measurement window\n");
+    println!(
+        "| Scenario | N | Wall clock | Per-thread p50 | Failures (sum across iters) |"
+    );
+    println!("|---|---:|---:|---:|---:|");
+    println!(
+        "| `{:?}` | {} | {} | {} | {} |",
+        args.scenario,
+        args.concurrency,
+        ms(wall_med),
+        ms(per_thread_p50),
+        total_failures,
+    );
+    if !per_thread_all.is_empty() {
+        let mut sorted = per_thread_all.clone();
+        sorted.sort();
+        let min = sorted[0];
+        let max = *sorted.last().unwrap();
+        println!();
+        println!(
+            "(per-thread range across all iterations: min {} ms, max {} ms, n={})",
+            ms(min),
+            ms(max),
+            per_thread_all.len()
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
 
@@ -589,8 +912,14 @@ fn git_available() -> bool {
 }
 
 fn make_temp(label: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Process-local monotonic counter so N parallel threads in the
+    // `*-concurrent` scenarios can't collide on `(pid, nanos)` — the
+    // same lesson the dotgit_index flake fix learned.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!(
-        "{label}-{}-{}",
+        "{label}-{}-{}-{id}",
         std::process::id(),
         Instant::now().elapsed().as_nanos(),
     ));
