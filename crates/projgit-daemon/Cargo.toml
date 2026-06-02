@@ -44,3 +44,17 @@ gix = { workspace = true }
 [features]
 default = []
 gvfs-fetcher = ["projgit-core/gvfs-fetcher"]
+
+# Stage 3 sidecar end-to-end test (`tests/sidecar_mount_smoke.rs`)
+# drives a FUSE mount from a DaemonFetcher; pulling projgit-fuse as
+# a dev-dep keeps the production crate Cargo.toml lean while still
+# exercising the full stack from the test.
+#
+# `tests/xprocess_mount_smoke.rs` additionally spawns the projgitd
+# and projgit binaries as separate OS processes and uses
+# `nix::sys::signal::kill` to drive their lifecycle — the `signal`
+# feature is not needed by the daemon itself (ctrlc handles that)
+# so it ships only in dev-deps.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+projgit-fuse = { path = "../projgit-fuse" }
+nix = { version = "0.29", features = ["fs", "user", "process", "signal"] }

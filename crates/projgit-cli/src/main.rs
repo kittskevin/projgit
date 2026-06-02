@@ -153,6 +153,27 @@ struct MountArgs {
     #[cfg(feature = "gvfs-fetcher")]
     #[arg(long, value_name = "URL")]
     gvfs_url: Option<String>,
+
+    /// **Sidecar mode** (Stage 3 of the projgitd plan, see
+    /// `docs/design/projgitd.md` §8).
+    ///
+    /// Connect to a running `projgitd` over the unix socket at
+    /// `<PATH>` and hydrate cold-path objects through it instead of
+    /// spawning a local fetcher. The daemon owns the upstream
+    /// connection, the partial-clone cache, and the in-flight
+    /// fetch coalescer that dedupes concurrent reads of the same
+    /// OID across N sidecars. This process still holds its own
+    /// `/dev/fuse` fd and runs the FUSE protocol loop locally, so
+    /// a daemon crash degrades to brief cold-fetch unavailability
+    /// instead of killing the mount (warm reads continue to work
+    /// because the sidecar reads pack bytes directly from the
+    /// shared on-disk CAS).
+    ///
+    /// With this flag, `--cache-dir`, `--remote`, and `--fetcher`
+    /// are ignored: the daemon already owns the cache and the
+    /// fetcher choice. `--offline` is rejected.
+    #[arg(long, value_name = "PATH")]
+    daemon_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -337,6 +358,16 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
         );
     }
 
+    // Stage 3 sidecar mode: the daemon owns the cache + the fetcher.
+    // We just discover its git_dir, open our own (shared) ObjectStore
+    // at that path, and use a DaemonFetcher to coordinate cold-path
+    // hydration. The FUSE protocol loop runs locally so a daemon
+    // crash degrades to brief cold-fetch unavailability rather than
+    // killing the mount.
+    if let Some(sock) = args.daemon_socket.clone() {
+        return cmd_mount_via_daemon(args, sock);
+    }
+
     // 1. Resolve `source` to a local git directory.
     let (git_dir, source_is_url) = if looks_like_url(&args.source) {
         let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
@@ -447,6 +478,92 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
             }
         }
     }
+}
+
+/// Sidecar-mode `mount`: talk to a running `projgitd`, discover its
+/// on-disk git_dir, open our own `ObjectStore` against the shared
+/// CAS, and serve FUSE locally with a `DaemonFetcher`. Stage 3 of
+/// the projgitd plan; see `docs/design/projgitd.md` §3 / §5 for the
+/// failure-mode reasoning.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
+    use projgit_core::{HydratingObjectStore, ObjectStore, ProjectionFsProvider};
+    use projgit_daemon::protocol::{read_message, write_message, Request, Response};
+    use projgit_daemon::DaemonFetcher;
+    use projgit_fuse::MountConfig;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    if args.offline {
+        bail!("--offline is incompatible with --daemon-socket; the daemon owns the fetcher");
+    }
+    if !socket.exists() {
+        bail!(
+            "daemon socket {} does not exist; is `projgitd` running?",
+            socket.display()
+        );
+    }
+
+    // 1. Attach: ask the daemon to bind to `source` (clones if it
+    //    hasn't already) and tell us where the on-disk CAS lives.
+    let git_dir = {
+        let mut s = UnixStream::connect(&socket)
+            .with_context(|| format!("connecting to daemon at {}", socket.display()))?;
+        write_message(
+            &mut s,
+            &Request::Attach {
+                source: args.source.clone(),
+            },
+        )
+        .context("writing Attach request")?;
+        match read_message::<_, Response>(&mut s).context("reading Attach response")? {
+            Response::Attached { git_dir } => git_dir,
+            Response::Err { code, message } => {
+                bail!("daemon refused Attach (code `{code}`): {message}");
+            }
+            other => bail!("unexpected response to Attach: {other:?}"),
+        }
+    };
+    eprintln!(
+        "projgit: attached to daemon at {} (shared CAS: {})",
+        socket.display(),
+        git_dir.display()
+    );
+
+    // 2. Open the shared on-disk ObjectStore. Two processes (this
+    //    sidecar + the daemon) read the same gix repo concurrently;
+    //    git's on-disk format supports this natively (mmap'd packs
+    //    + lock files on writes, which the sidecar never does).
+    let store = Arc::new(
+        ObjectStore::open(&git_dir)
+            .with_context(|| format!("opening object store at {}", git_dir.display()))?,
+    );
+
+    // 3. Resolve --ref / --commit / --subtree against the local
+    //    store. The daemon has already populated refs as part of
+    //    Attach (partial-clone wrote `.git/refs/`); the sidecar
+    //    sees them through gix's normal ref-resolution.
+    let projection = build_projection(&args, &store)?;
+
+    // 4. DaemonFetcher coordinates cold-path hydration with the
+    //    daemon. Warm paths read straight from the shared CAS and
+    //    never touch the socket.
+    let fetcher = DaemonFetcher::new(socket.clone());
+    let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
+
+    let overlay = build_root_overlay(&args, &projection, &store, &git_dir)?;
+    let mut cfg = MountConfig::default();
+    if args.allow_other {
+        cfg.acl = projgit_fuse::SessionACL::All;
+    }
+    let mp = args.mountpoint.clone();
+    let print_stats = args.stats;
+
+    let provider = Arc::new(
+        ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
+            .context("building ProjectionFsProvider")?,
+    );
+    run_mount(provider, &mp, &cfg, print_stats)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -972,7 +1089,11 @@ fn canonicalize_url_for_hash(url: &str) -> String {
     stripped.to_owned()
 }
 
+// `tests` for the helpers above. The `attach` subcommand helpers
+// further down were added after this module existed; allow the
+// resulting clippy lint rather than reorder the file.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
