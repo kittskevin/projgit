@@ -36,6 +36,7 @@ fn spawn_daemon(label: &str) -> (PathBuf, thread::JoinHandle<anyhow::Result<()>>
         socket_mode: 0o600,
         cache_dir: None,
         cache_depth: None,
+        trace: false,
     };
     let handle = thread::spawn(move || run(config));
     let start = Instant::now();

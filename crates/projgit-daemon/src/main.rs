@@ -46,6 +46,15 @@ fn main() -> anyhow::Result<()> {
         /// current snapshot.
         #[arg(long, value_name = "N")]
         depth: Option<u32>,
+
+        /// Emit one structured trace line per RPC on stderr.
+        /// Format: `trace: rpc=<name> served_us=<n>
+        /// inflight_at_recv=<n> [oid=<short>] [code=<err>]`.
+        /// Used to diagnose data-plane bottlenecks under load
+        /// (see docs/implementation/data-plane-investigation-plan.md).
+        /// Off by default — instrumentation is in the hot path.
+        #[arg(long)]
+        trace: bool,
     }
 
     let cli = Cli::parse();
@@ -63,6 +72,7 @@ fn main() -> anyhow::Result<()> {
     }
     config.socket_mode = socket_mode;
     config.cache_depth = cli.depth;
+    config.trace = cli.trace;
 
     // Signal handling lives in the binary, not the library, because
     // `ctrlc::set_handler` is a process-wide resource (set-once) and

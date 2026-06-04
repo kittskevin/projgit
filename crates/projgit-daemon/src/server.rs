@@ -34,7 +34,7 @@ use projgit_fuse::{mount_background, BackgroundSession, MountConfig, SessionACL}
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -67,6 +67,20 @@ pub struct DaemonConfig {
     /// Harbor-style eval/build agents; wrong for history-walking
     /// workloads. Defaults to `None` (full history).
     pub cache_depth: Option<u32>,
+    /// If `true`, emit one structured trace line on stderr per
+    /// RPC, capturing per-RPC wall time and the in-flight RPC
+    /// count at request-receive time. Used to diagnose
+    /// data-plane bottlenecks under load (the rust-lang/rust
+    /// scale failure: see
+    /// [`docs/implementation/data-plane-investigation-plan.md`]).
+    ///
+    /// Format (greppable, one line per RPC):
+    /// `trace: rpc=<name> served_us=<n> inflight_at_recv=<n>
+    /// [oid=<short>] [code=<err>]`
+    ///
+    /// Off by default — instrumentation is in the hot path so
+    /// even a cheap "if trace { ... }" check is worth gating.
+    pub trace: bool,
 }
 
 impl Default for DaemonConfig {
@@ -76,6 +90,7 @@ impl Default for DaemonConfig {
             socket_mode: 0o600,
             cache_dir: None,
             cache_depth: None,
+            trace: false,
         }
     }
 }
@@ -101,6 +116,14 @@ struct DaemonState {
     /// `Some(n)` applies `--depth=n` to URL partial clones.
     /// Propagated from [`DaemonConfig::cache_depth`].
     cache_depth: Option<u32>,
+    /// Per-RPC trace emission flag. Propagated from
+    /// [`DaemonConfig::trace`]. Sampled in `handle_connection`.
+    trace: bool,
+    /// In-flight RPC count. Incremented at request receive,
+    /// decremented after response. Used by the trace path to
+    /// surface pile-ups under load (`inflight_at_recv=N` in the
+    /// trace line).
+    inflight: AtomicUsize,
     shutdown_requested: AtomicBool,
     next_projection_id: AtomicU64,
     active: Mutex<Option<ActiveRepo>>,
@@ -176,11 +199,22 @@ impl DaemonState {
         cache_dir: Option<PathBuf>,
         cache_depth: Option<u32>,
     ) -> Self {
+        Self::with_config(socket_path, cache_dir, cache_depth, false)
+    }
+
+    fn with_config(
+        socket_path: PathBuf,
+        cache_dir: Option<PathBuf>,
+        cache_depth: Option<u32>,
+        trace: bool,
+    ) -> Self {
         Self {
             started_at: Instant::now(),
             socket_path,
             cache_dir,
             cache_depth,
+            trace,
+            inflight: AtomicUsize::new(0),
             shutdown_requested: AtomicBool::new(false),
             next_projection_id: AtomicU64::new(1),
             active: Mutex::new(None),
@@ -270,10 +304,11 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         config.socket_mode
     );
 
-    let state = Arc::new(DaemonState::with_depth(
+    let state = Arc::new(DaemonState::with_config(
         config.socket_path.clone(),
         config.cache_dir.clone(),
         config.cache_depth,
+        config.trace,
     ));
 
     // Accept loop. Non-blocking would be cleaner but a self-connect
@@ -313,7 +348,8 @@ pub fn run(config: DaemonConfig) -> Result<()> {
 
 /// Per-connection handler. V1 protocol is one request → one response →
 /// close, so we read once, dispatch, write once, and let the stream
-/// drop.
+/// drop. When `state.trace` is set, emits one trace line per RPC
+/// on stderr capturing wall time and in-flight count at receive.
 fn handle_connection(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
     let request: Request = match read_message(&mut stream) {
         Ok(req) => req,
@@ -334,7 +370,36 @@ fn handle_connection(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<
         }
     };
 
+    // Trace bookkeeping: increment in-flight before dispatch,
+    // decrement after response. Sample in-flight at receive so the
+    // emitted line records "how loaded was the daemon when this
+    // request arrived" (the pile-up signal).
+    let trace = state.trace;
+    let inflight_at_recv = if trace {
+        state.inflight.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        0
+    };
+    let rpc_label = request_label(&request);
+    let rpc_extra = request_extra(&request);
+    let start = if trace { Some(Instant::now()) } else { None };
+
     let response = dispatch(&state, request);
+
+    if let (true, Some(t0)) = (trace, start) {
+        let served_us = t0.elapsed().as_micros();
+        let code = response_error_code(&response);
+        state.inflight.fetch_sub(1, Ordering::Relaxed);
+        let code_part = code.map(|c| format!(" code={c}")).unwrap_or_default();
+        let extra_part = if rpc_extra.is_empty() {
+            String::new()
+        } else {
+            format!(" {rpc_extra}")
+        };
+        eprintln!(
+            "trace: rpc={rpc_label} served_us={served_us} inflight_at_recv={inflight_at_recv}{extra_part}{code_part}",
+        );
+    }
 
     if let Err(e) = write_message(&mut stream, &response) {
         // We've already computed the response; if the wire write
@@ -342,6 +407,45 @@ fn handle_connection(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<
         eprintln!("projgitd: response write failed: {e}");
     }
     Ok(())
+}
+
+/// Short label for a request variant. Used as the `rpc=` value
+/// in trace output.
+fn request_label(req: &Request) -> &'static str {
+    match req {
+        Request::Ping => "Ping",
+        Request::Status => "Status",
+        Request::Shutdown => "Shutdown",
+        Request::Mount { .. } => "Mount",
+        Request::Umount { .. } => "Umount",
+        Request::Attach { .. } => "Attach",
+        Request::Fetch { .. } => "Fetch",
+        Request::PrefetchHeaders { .. } => "PrefetchHeaders",
+    }
+}
+
+/// Per-RPC extra trace fields (OID for Fetch, batch size for
+/// PrefetchHeaders, etc.). Empty string when nothing to add.
+fn request_extra(req: &Request) -> String {
+    match req {
+        Request::Fetch { oid } => {
+            let short = oid.get(..8).unwrap_or(oid);
+            format!("oid={short}")
+        }
+        Request::PrefetchHeaders { oids } => format!("n_oids={}", oids.len()),
+        Request::Mount { mountpoint, .. } => format!("mp={}", mountpoint.display()),
+        _ => String::new(),
+    }
+}
+
+/// Surface the error code for trace output when the dispatch
+/// produced [`Response::Err`]. Returns `None` for successful
+/// responses.
+fn response_error_code(r: &Response) -> Option<&str> {
+    match r {
+        Response::Err { code, .. } => Some(code.as_str()),
+        _ => None,
+    }
 }
 
 /// Pure dispatch logic — factored out of `handle_connection` so it's
