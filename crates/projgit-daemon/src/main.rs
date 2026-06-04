@@ -28,6 +28,24 @@ fn main() -> anyhow::Result<()> {
         /// deployment and rely on `chgrp` of the socket file.
         #[arg(long, value_name = "MODE", default_value = "0600")]
         socket_mode: String,
+
+        /// Pass `--depth=N` to `git clone` when partial-cloning a
+        /// URL source. `--depth 1` is the load-bearing case:
+        /// shallow partial clone for big-history repos where the
+        /// metadata payload of a full partial clone is itself
+        /// multi-GB. Daemon-wide setting; applies to every
+        /// `Attach` for a URL source. Default: full history (no
+        /// `--depth`).
+        ///
+        /// Tradeoff: shallow projections can serve `cat` / `ls`
+        /// of the current snapshot fine, but `git log`,
+        /// `git blame`, `git diff <older>`, and
+        /// `git checkout <older>` won't work inside the
+        /// projection — there's no history to walk. Right
+        /// choice for eval/build agents that only need the
+        /// current snapshot.
+        #[arg(long, value_name = "N")]
+        depth: Option<u32>,
     }
 
     let cli = Cli::parse();
@@ -35,11 +53,16 @@ fn main() -> anyhow::Result<()> {
     let socket_mode = u32::from_str_radix(cli.socket_mode.trim_start_matches('0'), 8)
         .map_err(|e| anyhow::anyhow!("--socket-mode must be octal, got `{}`: {e}", cli.socket_mode))?;
 
+    if matches!(cli.depth, Some(0)) {
+        anyhow::bail!("--depth 0 is not supported; git rejects --depth=0");
+    }
+
     let mut config = DaemonConfig::default();
     if let Some(p) = cli.socket {
         config.socket_path = p;
     }
     config.socket_mode = socket_mode;
+    config.cache_depth = cli.depth;
 
     // Signal handling lives in the binary, not the library, because
     // `ctrlc::set_handler` is a process-wide resource (set-once) and

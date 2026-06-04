@@ -55,6 +55,18 @@ pub struct DaemonConfig {
     /// "the user defaults" (XDG_CACHE_HOME etc.). Used only the first
     /// time a URL source is mounted.
     pub cache_dir: Option<PathBuf>,
+    /// If `Some(n)`, pass `--depth=n` to `git clone` when partial-
+    /// cloning a URL source. `Some(1)` is the load-bearing case:
+    /// shallow partial clone for big-history repos where the
+    /// metadata payload of a full partial clone is itself multi-GB.
+    ///
+    /// Tradeoff: shallow clones serve `cat` / `ls` of the current
+    /// snapshot fine, but `git log` / `git blame` /
+    /// `git diff <older>` inside a projection built on top won't
+    /// work — there's no history to walk. Right choice for
+    /// Harbor-style eval/build agents; wrong for history-walking
+    /// workloads. Defaults to `None` (full history).
+    pub cache_depth: Option<u32>,
 }
 
 impl Default for DaemonConfig {
@@ -63,6 +75,7 @@ impl Default for DaemonConfig {
             socket_path: default_socket_path(),
             socket_mode: 0o600,
             cache_dir: None,
+            cache_depth: None,
         }
     }
 }
@@ -85,6 +98,9 @@ struct DaemonState {
     started_at: Instant,
     socket_path: PathBuf,
     cache_dir: Option<PathBuf>,
+    /// `Some(n)` applies `--depth=n` to URL partial clones.
+    /// Propagated from [`DaemonConfig::cache_depth`].
+    cache_depth: Option<u32>,
     shutdown_requested: AtomicBool,
     next_projection_id: AtomicU64,
     active: Mutex<Option<ActiveRepo>>,
@@ -148,11 +164,23 @@ struct MountEntry {
 }
 
 impl DaemonState {
+    /// Backward-compatible constructor for tests that don't care
+    /// about `cache_depth`. Delegates to [`Self::with_depth`].
+    #[allow(dead_code)]
     fn new(socket_path: PathBuf, cache_dir: Option<PathBuf>) -> Self {
+        Self::with_depth(socket_path, cache_dir, None)
+    }
+
+    fn with_depth(
+        socket_path: PathBuf,
+        cache_dir: Option<PathBuf>,
+        cache_depth: Option<u32>,
+    ) -> Self {
         Self {
             started_at: Instant::now(),
             socket_path,
             cache_dir,
+            cache_depth,
             shutdown_requested: AtomicBool::new(false),
             next_projection_id: AtomicU64::new(1),
             active: Mutex::new(None),
@@ -242,9 +270,10 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         config.socket_mode
     );
 
-    let state = Arc::new(DaemonState::new(
+    let state = Arc::new(DaemonState::with_depth(
         config.socket_path.clone(),
         config.cache_dir.clone(),
+        config.cache_depth,
     ));
 
     // Accept loop. Non-blocking would be cleaner but a self-connect
@@ -367,7 +396,7 @@ fn handle_mount(
 
     // First mount: attach the daemon to this source.
     if active.is_none() {
-        match attach_source(&source, state.cache_dir.as_deref()) {
+        match attach_source(&source, state.cache_dir.as_deref(), state.cache_depth) {
             Ok(repo) => *active = Some(repo),
             Err(e) => return err(codes::SOURCE_OPEN_FAILED, format!("{e:#}")),
         }
@@ -475,7 +504,7 @@ fn handle_attach(state: &Arc<DaemonState>, source: String) -> Response {
         Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
     };
     if active.is_none() {
-        match attach_source(&source, state.cache_dir.as_deref()) {
+        match attach_source(&source, state.cache_dir.as_deref(), state.cache_depth) {
             Ok(repo) => *active = Some(repo),
             Err(e) => return err(codes::SOURCE_OPEN_FAILED, format!("{e:#}")),
         }
@@ -602,19 +631,31 @@ fn looks_like_url(s: &str) -> bool {
 /// Open the source repo (URL -> partial clone into cache; local path
 /// -> open in place), choose the matching backend, and return a
 /// freshly-constructed `ActiveRepo`.
-fn attach_source(source: &str, cache_dir_override: Option<&Path>) -> Result<ActiveRepo> {
+fn attach_source(
+    source: &str,
+    cache_dir_override: Option<&Path>,
+    cache_depth: Option<u32>,
+) -> Result<ActiveRepo> {
     if looks_like_url(source) {
         let cache_dir = resolve_cache_dir(cache_dir_override)?;
         let dest = cache_dir.join(cache_subdir_for_url(source));
         if !dest.exists() {
+            let depth_note = match cache_depth {
+                Some(n) => format!(" (--depth={n})"),
+                None => String::new(),
+            };
             eprintln!(
-                "projgitd: partial-cloning {} into {}",
+                "projgitd: partial-cloning {} into {}{}",
                 source,
-                dest.display()
+                dest.display(),
+                depth_note,
             );
             std::fs::create_dir_all(&cache_dir)
                 .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
-            let opts = CloneOptions::new(source.to_owned(), dest.clone());
+            let mut opts = CloneOptions::new(source.to_owned(), dest.clone());
+            if let Some(n) = cache_depth {
+                opts = opts.with_depth(n);
+            }
             partial_clone(&opts).with_context(|| format!("cloning {source}"))?;
         } else {
             eprintln!("projgitd: reusing cached clone at {}", dest.display());

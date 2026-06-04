@@ -906,6 +906,7 @@ fn bench_projgit_daemon_concurrent(args: &Args) -> anyhow::Result<ConcurrentSamp
         socket_path: socket_path.clone(),
         socket_mode: 0o600,
         cache_dir: Some(cache_root.clone()),
+        cache_depth: None,
     };
     let daemon_handle = thread::spawn(move || daemon_run(config));
 
@@ -1579,6 +1580,7 @@ fn sparse_shared_projgit(args: &Args) -> anyhow::Result<SparseSharedConfig> {
         socket_path: socket_path.clone(),
         socket_mode: 0o600,
         cache_dir: Some(cache_root.clone()),
+        cache_depth: None,
     };
     let daemon_handle = thread::spawn(move || daemon_run(config));
 

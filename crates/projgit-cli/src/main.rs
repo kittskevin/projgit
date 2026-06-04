@@ -90,6 +90,24 @@ struct MountArgs {
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
 
+    /// Pass `--depth=N` to `git clone` when partial-cloning a URL
+    /// source. `--depth 1` is the shallow case: pull only the
+    /// current commit's metadata, no history. Orders of magnitude
+    /// smaller on deep-history repos.
+    ///
+    /// Tradeoff: shallow projections can `cat` / `ls` the current
+    /// snapshot fine, but `git log`, `git blame`,
+    /// `git diff <older>`, and `git checkout <older>` won't work
+    /// inside the projection — there's no history to walk. Right
+    /// choice for eval/build agents that only need the current
+    /// snapshot; wrong for history-walking workloads.
+    ///
+    /// Ignored for local-path sources (which don't clone) and for
+    /// `--daemon-socket` sidecar mode (the daemon owns clone
+    /// policy via its own `--depth` flag).
+    #[arg(long, value_name = "N")]
+    depth: Option<u32>,
+
     /// Remote name to fetch from (default `origin`). Ignored in
     /// `--offline` mode and for sources that have no remote.
     #[arg(long, default_value = "origin")]
@@ -207,6 +225,12 @@ struct MountMultiArgs {
     /// `source` is a URL.
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
+
+    /// Pass `--depth=N` to `git clone` when partial-cloning a URL
+    /// source. See `projgit mount --help` for the full tradeoff;
+    /// applies the same way here. Ignored for local sources.
+    #[arg(long, value_name = "N")]
+    depth: Option<u32>,
 
     /// Remote name to fetch from (default `origin`). Ignored in
     /// `--offline` mode and for local sources.
@@ -373,14 +397,25 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
         let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
         let dest = cache_dir.join(cache_subdir_for_url(&args.source));
         if !dest.exists() {
+            let depth_note = match args.depth {
+                Some(n) => format!(" (--depth={n})"),
+                None => String::new(),
+            };
             eprintln!(
-                "projgit: partial-cloning {} into {}",
+                "projgit: partial-cloning {} into {}{}",
                 args.source,
-                dest.display()
+                dest.display(),
+                depth_note,
             );
             std::fs::create_dir_all(&cache_dir)
                 .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
-            let opts = CloneOptions::new(args.source.clone(), dest.clone());
+            let mut opts = CloneOptions::new(args.source.clone(), dest.clone());
+            if let Some(n) = args.depth {
+                if n == 0 {
+                    bail!("--depth 0 is not supported; git rejects --depth=0");
+                }
+                opts = opts.with_depth(n);
+            }
             partial_clone(&opts).with_context(|| format!("cloning {}", args.source))?;
         } else {
             eprintln!("projgit: reusing cached clone at {}", dest.display());
@@ -628,14 +663,25 @@ fn cmd_mount_multi(args: MountMultiArgs) -> Result<()> {
         let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
         let dest = cache_dir.join(cache_subdir_for_url(&args.source));
         if !dest.exists() {
+            let depth_note = match args.depth {
+                Some(n) => format!(" (--depth={n})"),
+                None => String::new(),
+            };
             eprintln!(
-                "projgit: partial-cloning {} into {}",
+                "projgit: partial-cloning {} into {}{}",
                 args.source,
-                dest.display()
+                dest.display(),
+                depth_note,
             );
             std::fs::create_dir_all(&cache_dir)
                 .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
-            let opts = CloneOptions::new(args.source.clone(), dest.clone());
+            let mut opts = CloneOptions::new(args.source.clone(), dest.clone());
+            if let Some(n) = args.depth {
+                if n == 0 {
+                    bail!("--depth 0 is not supported; git rejects --depth=0");
+                }
+                opts = opts.with_depth(n);
+            }
             partial_clone(&opts).with_context(|| format!("cloning {}", args.source))?;
         } else {
             eprintln!("projgit: reusing cached clone at {}", dest.display());
