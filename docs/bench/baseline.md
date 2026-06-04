@@ -78,10 +78,29 @@ PROJGIT_NETWORK_TESTS=1 \
   partial clones. Results below in
   [sparse-access](#results--sparse-access-rust-langcargo--master).
   Headline: at N=10 on cargo, projgit-shared wins 1.59× on wall
-  clock and ~10× on disk vs N independent partial clones — the
-  multi-agent shared-CAS pitch is empirically validated.
+  clock and ~10× on disk vs N independent partial clones.
   Single-agent results are less favourable to projgit
   (mount overhead dominates short scripts).
+  > **Note (2026-06-04):** the 1.59× wall-clock headline is vs
+  > a strawman comparator. The worktree-comparator section below
+  > replaces that with the steelman a competent operator would
+  > use, and the wall-clock pitch flips — projgit loses to
+  > `worktree-depth1 on-demand` by **3.77×** at the same N=10
+  > cell. The disk pitch (~8–11× win) still holds. Read the
+  > worktree-comparator section for the corrected picture.
+- **`worktree-shared` (worktree comparator)** — *run 2026-06-04*.
+  Replaces the sparse-shared strawman (N independent partial
+  clones) with the steelman a competent operator would actually
+  reach for: one shared clone + N `git worktree add` agents.
+  Two orthogonal axes: `--worktree-strategy {full|depth1}` and
+  `--worktree-mode {pre-stage|on-demand}`. Results below in
+  [worktree comparator](#results--worktree-comparator-rust-langcargo--master-with-rust-langrust-follow-up).
+  Headline: `worktree-depth1 on-demand` wins wall clock at every
+  measured scale (~3–4× faster than projgit-shared on cargo at
+  N=10). projgit still wins disk by ~8–11× at cargo scale (~6×
+  predicted at rust scale). Critically: projgit's data plane
+  did not complete the `rust-lang/rust` cell in 36 minutes —
+  documented as a real engineering finding to investigate.
 
 ## What was measured
 
@@ -512,6 +531,220 @@ done
   most-comparable third sparse-access option, but it requires
   per-consumer cone-spec configuration that projgit doesn't.
   That's a UX win we acknowledge but don't bench here.
+
+## Results — worktree comparator (`rust-lang/cargo` @ master, with `rust-lang/rust` follow-up)
+
+Captured 2026-06-04 in the projgit devcontainer; same machine /
+network as the other sections above. Replaces the sparse-access
+section's strawman comparator (N independent partial clones)
+with the steelman a competent operator would actually reach for:
+one shared clone + N `git worktree add` agents. Two orthogonal
+axes:
+
+- `--worktree-strategy {full|depth1}` — `full` downloads
+  everything (history + working tree); `depth1` downloads only
+  the target ref snapshot.
+- `--worktree-mode {pre-stage|on-demand}` — `pre-stage` runs
+  all N `worktree add` calls sequentially in setup (operator
+  pre-provisions a worktree pool); `on-demand` runs each
+  agent's `worktree add` inside its measurement window in
+  parallel (agents spawn worktrees as they arrive).
+
+Design + plan: [`../design/worktree-comparator-bench.md`](../design/worktree-comparator-bench.md),
+[`../implementation/worktree-comparator-plan.md`](../implementation/worktree-comparator-plan.md).
+
+### `rust-lang/cargo` @ master, 10-file script, median of 3
+
+Full matrix (2 strategies × 2 modes × 2 N values), alongside the
+existing `projgit-shared` and `partial-cat-independent` cells
+from the sparse-access section for direct comparison.
+
+**N=4:**
+
+| Config | setup | wall | per-thread p50 | disk | total (setup+wall) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `worktree-depth1` on-demand | 2,266 | 703 | 692 | 93,049 KiB | **2,969** |
+| `worktree-depth1` pre-stage | 4,630 | 0.45 | 0.26 | 93,049 KiB | 4,630 |
+| `partial-cat-independent` | 2 | 6,488 | 6,434 | 98,196 KiB | 6,490 |
+| `worktree-full` on-demand | 7,621 | 746 | 707 | 163,604 KiB | 8,367 |
+| `worktree-full` pre-stage | 10,891 | 0.39 | 0.27 | 163,604 KiB | 10,891 |
+| `projgit-shared` (from sparse-access) | 2,943 | 7,007 | 7,007 | 24,591 KiB | 9,950 |
+
+**N=10:**
+
+| Config | setup | wall | per-thread p50 | disk | total (setup+wall) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `worktree-depth1` on-demand | 2,214 | 792 | 783 | 198,947 KiB | **3,006** |
+| `worktree-full` on-demand | 7,782 | 841 | 822 | 269,477 KiB | 8,623 |
+| `worktree-depth1` pre-stage | 8,917 | 0.81 | 0.51 | 198,948 KiB | 8,917 |
+| `projgit-shared` (from sparse-access) | 2,764 | 8,576 | 8,574 | 24,590 KiB | 11,340 |
+| `partial-cat-independent` | 4 | 13,611 | 9,670 | 245,490 KiB | 13,615 |
+| `worktree-full` pre-stage | 14,621 | 0.79 | 0.55 | 269,477 KiB | 14,622 |
+
+Wall-clock ratio at N=10: `projgit-shared` / `worktree-depth1
+on-demand` = **3.77×**. Disk ratio: `worktree-depth1
+on-demand` / `projgit-shared` = **8.09×**.
+
+### `rust-lang/rust` @ main, 10-file script, 1 iteration each
+
+Bigger target to probe scaling. ~13 s for a `--depth=1` clone,
+~225 MB working tree, deep history (multi-GB full clone, not
+benched here).
+
+| Config | N | setup | wall | per-thread p50 | disk | total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `worktree-depth1` on-demand | 4 | 14,541 | 5,562 | 5,562 | 1.14 GB | **20,103** |
+| `worktree-depth1` pre-stage | 4 | 30,882 | 1.09 | 0.95 | 1.14 GB | 30,883 |
+| `worktree-depth1` on-demand | 10 | 13,314 | 7,143 | 7,112 | 2.47 GB | **20,458** |
+| `worktree-depth1` pre-stage | 10 | 59,351 | 2.48 | 1.74 | 2.47 GB | 59,354 |
+| `projgit-shared` | 4 | — | — | — | — | **>36 min, killed** |
+
+**The `projgit-shared` cell did not complete in 36 minutes of
+wall time at N=4 on `rust-lang/rust` and was killed.** At kill
+time the daemon's CAS contained 33 pack files (~417 MB of
+metadata + lazy-fetched blobs). A single isolated
+`git cat-file --batch-check` lazy-fetch outside the bench takes
+~0.45 s on the same repo, so per-blob promisor cost is **not**
+the bottleneck; the slowness lives in projgit's data-plane
+orchestration under load (likely the per-mount prefetch worker
+× N sidecars × batched cat-file calls serializing through one
+mutex, but the precise cause wasn't isolated this session).
+Treat as a real engineering finding to investigate before
+projgit can credibly target this scale.
+
+### Reproduce
+
+```sh
+# cargo @ master matrix
+for strategy in depth1 full; do
+  for mode in pre-stage on-demand; do
+    for n in 4 10; do
+      PROJGIT_NETWORK_TESTS=1 \
+        cargo run -p projgit-cli --example bench_mount --release -- \
+        --scenario worktree-shared \
+        --worktree-strategy "$strategy" --worktree-mode "$mode" \
+        --concurrency "$n" --iterations 3 \
+        --url https://github.com/rust-lang/cargo --ref master \
+        --files "Cargo.toml,README.md,LICENSE-APACHE,LICENSE-MIT,\
+CHANGELOG.md,CONTRIBUTING.md,src/cargo/lib.rs,src/cargo/macros.rs,\
+Cargo.lock,build.rs"
+    done
+  done
+done
+
+# rust @ main worktree-depth1 cells (each 1 iter)
+for mode in pre-stage on-demand; do
+  for n in 4 10; do
+    PROJGIT_NETWORK_TESTS=1 \
+      cargo run -p projgit-cli --example bench_mount --release -- \
+      --scenario worktree-shared \
+      --worktree-strategy depth1 --worktree-mode "$mode" \
+      --concurrency "$n" --iterations 1 \
+      --url https://github.com/rust-lang/rust --ref main \
+      --files "README.md,Cargo.toml,LICENSE-APACHE,LICENSE-MIT,\
+CONTRIBUTING.md,CODE_OF_CONDUCT.md,RELEASES.md,\
+compiler/rustc/Cargo.toml,compiler/rustc/src/main.rs,library/Cargo.toml"
+  done
+done
+```
+
+### What this shows
+
+- **The sparse-access section's "projgit wins wall clock 1.59×"
+  is wrong against the steelman.** Against `worktree-depth1
+  on-demand` on cargo at N=10, `projgit-shared` *loses* wall
+  clock by **3.77×** (11.3 s vs 3.0 s). The sparse-access
+  comparator (N independent partial clones) was a strawman; the
+  comparator a competent operator would actually deploy
+  (worktree + on-demand) beats projgit decisively on speed.
+
+- **projgit still wins on disk decisively, ~8–11× at N=10.**
+  Robust across modes and strategies — worktree variants all
+  materialise N working trees, and projgit's CAS contains
+  metadata + only the touched blobs. At rust-lang/rust scale
+  the worktree-depth1 N=10 disk total is ~2.5 GB (would scale
+  ~225 MB per added agent); projgit's would have been ~420 MB
+  (~6× less) if the bench had completed. The disk pitch is the
+  one wall-clock-independent structural win.
+
+- **on-demand beats pre-stage on cargo.** N=10 totals: on-demand
+  3.0 s vs pre-stage 8.9 s. Pre-stage's sequential
+  `worktree add` loop scales linearly with N; on-demand
+  parallelises across N threads. At rust scale the gap widens:
+  N=10 on-demand 20.5 s vs pre-stage 59.4 s. The "operator
+  pre-provisions a worktree pool" model is uniformly slower
+  than "let agents spawn their own worktrees in parallel" for
+  the workloads we measured.
+
+- **projgit's data plane doesn't scale to big-history repos in
+  its current form.** The `rust-lang/rust` projgit-shared cell
+  didn't complete in 36 minutes. The cause isn't per-blob
+  promisor cost (verified ~0.45 s isolated); it's the
+  orchestration under load. This is the most important finding
+  for projgit's roadmap: the architectural pitch doesn't
+  validate at scale until this is investigated and fixed. Three
+  plausible causes worth investigating (in rough order of
+  likelihood):
+  1. Per-mount prefetch worker × N sidecars × batched
+     cat-file fetches all serializing through one
+     `Mutex<BatchChild>` in the daemon — a single shared
+     `cat-file --batch-check` processing N×prefetch-batch
+     OIDs head-of-line-blocks every sidecar.
+  2. Lookup-driven tree-walk on big repos triggers cascading
+     prefetches (each `lookup` in deep paths reads its tree,
+     posts that dir's OIDs to its mount's prefetch worker, all
+     of which queue at the daemon).
+  3. Some daemon-side cache or coalescer state grows
+     unboundedly under load. Less likely given the cargo result
+     was clean, but worth ruling out.
+
+- **The headline pitch needs to change.** With both comparator
+  arms in hand, the honest framing is: projgit's load-bearing
+  perf claim is **disk efficiency** (~6–10×), not wall clock;
+  its containerization-cleanness is the architectural argument
+  for choosing it over worktrees (worktrees don't bind-mount
+  cleanly into containers; per-worktree state lives in the
+  shared `.git`; cross-tenant `.git` writeability is a real
+  hole). Wall clock is currently a loss at every scale
+  measured and a non-completion at big-repo scale.
+
+### Caveats specific to worktree comparator
+
+- **Containerization is not benched.** The architectural
+  argument for projgit over worktrees is operational: worktrees
+  need two bind-mounts per container (the worktree dir + the
+  shared `.git/objects`); per-worktree state (HEAD, index)
+  lives in the shared `.git/worktrees/<name>/`, so any
+  container with access to the shared `.git` sees every other
+  agent's state; the shared `.git/objects` is writeable by
+  every consumer, so a misbehaving agent can corrupt the
+  shared store. None of this is measurable in a wall-clock
+  bench. See [`../design/container-deployment.md`](../design/container-deployment.md) §6
+  (Harbor Scenario A) for why this matters operationally.
+
+- **`rust-lang/rust` `projgit-shared` cell killed at 36 min,
+  not run to completion.** This is reported as a failure, not
+  a number. A future investigation needs to either fix the
+  orchestration cost or document that the bench's daemon
+  configuration doesn't apply at this scale.
+
+- **Only `worktree-depth1` benched on `rust-lang/rust`.** Full
+  clone wasn't run (multi-GB download; would have added 5–15
+  minutes per cell). Likely worse than depth1 at this scale by
+  the same multiplier as cargo (~1.5–2× total time, ~50% more
+  disk).
+
+- **Network variance dominates on the rust cell.** Single
+  iteration each (no median). Numbers should be read as
+  order-of-magnitude, not three-digit precision.
+
+- **The `pre-stage` vs `on-demand` gap is real but
+  bench-shape-dependent.** Pre-stage's sequential worktree-add
+  loop is my implementation choice; an operator's actual
+  pre-staging script could parallelise it. If they did, the
+  pre-stage cell would converge with on-demand. The bench's
+  pre-stage numbers reflect "naive operator pre-provisions
+  serially"; a smarter operator would close the gap.
 
 ## What this shows
 
