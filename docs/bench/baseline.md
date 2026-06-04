@@ -746,6 +746,149 @@ done
   pre-stage numbers reflect "naive operator pre-provisions
   serially"; a smarter operator would close the gap.
 
+## Diagnostic — data-plane investigation (`rust-lang/rust` @ main, 2026-06-04)
+
+Motivated by the worktree-comparator finding that
+`projgit-shared` did not complete the N=4 cell on
+`rust-lang/rust` in 36 minutes (previous result without shallow
+or trace). Built `--depth=N` shallow partial-clone support
+(commit `4869594`, projgit-core + cli + daemon) and per-RPC
+trace instrumentation in the daemon (commit `ed7ad90`), then
+re-ran a minimal repro: `sparse-shared` N=2, 1 iteration, 3
+files, `--daemon-depth 1` + `--daemon-trace`.
+
+### Result summary
+
+| Config | setup | wall | per-thread p50 | disk | ratio (pci/pjs) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `projgit-shared` (shallow + trace) | 1,169 ms | 15,298 ms | 15,298 ms | 2,540 KiB | — |
+| `partial-cat-independent` | 1 ms | 55,807 ms | 55,807 ms | 852,303 KiB | wall **3.65×** / disk **335×** |
+
+Two big news items:
+
+1. **Shallow (`--depth=1`) is the difference between "doesn't
+   complete in 36 min" and "completes in 16 s"** on this repo.
+   Setup dropped from >40 s (full partial clone) to 1.2 s
+   (shallow partial clone). Disk dropped to 2.5 MB (vs the
+   prior attempt's 417 MB partial-clone snapshot). At this
+   workload size projgit-shared still wins the comparator by
+   3.65× wall and 335× disk.
+2. **Per-RPC trace confirms the orchestration bottleneck.**
+   The full trace output (8 RPCs across one iteration):
+
+   ```
+   trace: rpc=Attach           served_us=1,157,244 inflight_at_recv=1
+   trace: rpc=Fetch            served_us=  452,923 inflight_at_recv=1 oid=ed35016e
+   trace: rpc=Fetch            served_us=  453,031 inflight_at_recv=2 oid=ed35016e
+   trace: rpc=PrefetchHeaders  served_us=15,285,592 inflight_at_recv=3 n_oids=31
+   trace: rpc=Fetch            served_us=14,833,042 inflight_at_recv=3 oid=67c7a9d6
+   trace: rpc=Fetch            served_us=14,833,009 inflight_at_recv=4 oid=67c7a9d6
+   trace: rpc=PrefetchHeaders  served_us=15,285,629 inflight_at_recv=4 n_oids=31
+   trace: rpc=Shutdown         served_us=       18 inflight_at_recv=1
+   ```
+
+### What this shows (root cause of the rust-scale hang)
+
+**Hypothesis (1) from the investigation plan is confirmed:**
+per-mount prefetch worker × N sidecars × batched cat-file
+calls all serialize through one `Mutex<BatchChild>` in the
+daemon (`GitCliFetcher::batch`), and on-demand `Fetch` RPCs
+are head-of-line blocked behind in-flight `PrefetchHeaders`
+batches.
+
+Specifically:
+
+- Each sidecar's `ProjectionFsProvider` spawns a per-mount
+  prefetch worker. On the first `ls` of the mountpoint, each
+  worker posts the root tree's OIDs (~31 for rust-lang/rust's
+  root) to its mount's prefetch queue.
+- The worker calls
+  `HydratingObjectStore::prefetch_headers(batch)` →
+  `DaemonFetcher::prefetch_headers` → RPC → daemon's
+  `GitCliFetcher::prefetch_headers` → `BatchChild::query_batch`.
+  `prefetch_headers` does **not** go through the per-OID
+  `Coalescer` (only `fetch_object` does); two simultaneous
+  `PrefetchHeaders(31)` calls from two sidecars produce two
+  full 31-OID batches at the cat-file mutex.
+- Each cat-file query triggers a promisor lazy fetch
+  (~0.5 s per blob isolated). 31 blobs serialised through
+  one cat-file child = ~15 s per batch. Two batches serialise
+  → 30 s of cat-file work, but they run sequentially behind
+  the same mutex so the wall clock is bounded by the slower
+  one (~15 s) since the second batch's local-presence check
+  finds many OIDs already fetched by the first.
+- **The on-demand `Fetch` for `Cargo.toml` (oid `67c7a9d6`)
+  arrived in the middle and was forced to wait the entire
+  ~15 s for the cat-file mutex.** That's the 14,833 ms
+  served-time in the trace: 99 % mutex wait, ~1 % actual
+  fetch. The head-of-line blocking story.
+
+**Implication for the data-plane roadmap:** the cat-file pool
+(speculated about and deferred from Phase C) is now the
+load-bearing fix. K parallel `cat-file --batch-check` children
+would let `PrefetchHeaders` batches run alongside on-demand
+`Fetch` requests on separate children, removing the
+head-of-line block. Sizing K probably wants to be at least
+`N_sidecars + 1` so prefetch fan-out doesn't starve on-demand
+fetches.
+
+Hypothesis (2) (lookup-driven cascading prefetch) is **not
+disproven** but is **not the dominant cost here** — the trace
+shows the cost concentrated in two `PrefetchHeaders` calls,
+not many lookup-triggered ones. Hypothesis (3) (unbounded
+daemon state) is **not visible** in the trace; nothing grew
+without bound during this run.
+
+### What also shows up
+
+- **`--depth=1` is operationally required at rust-lang/rust
+  scale.** Without it, `Attach` alone takes >40 s (full
+  partial clone of deep history). With it, 1.2 s. The
+  default-off design ships shallow as a flag so history-
+  walking workloads keep working; Harbor-style agents
+  flip it on.
+- **Coalescer DOES work for `Fetch`** (per-OID
+  single-flight). Both sidecars asked for the same README
+  blob (`ed35016e`); the trace shows both served in ~453 ms
+  with the second seeing `inflight_at_recv=2`. So one
+  upstream fetch served two sidecars. Without the Coalescer
+  this would have been two separate fetches.
+- **The Coalescer does NOT cover `PrefetchHeaders`.** The
+  two `PrefetchHeaders(31)` calls each got a full mutex turn
+  even though their OID sets fully overlap. Per-batch
+  coalescing (or moving prefetch through `Coalescer.do_or_join`
+  at the OID level) is a smaller follow-up fix.
+
+### Reproduce
+
+```sh
+# Shallow + trace, minimal N. Completes in ~16 s.
+PROJGIT_NETWORK_TESTS=1 \
+  cargo run -p projgit-cli --example bench_mount --release -- \
+  --scenario sparse-shared --concurrency 2 --iterations 1 \
+  --daemon-depth 1 --daemon-trace \
+  --url https://github.com/rust-lang/rust --ref main \
+  --files README.md,Cargo.toml,LICENSE-APACHE
+```
+
+### Caveats specific to the diagnostic
+
+- **Single iteration**, single N=2. The trace shape is the
+  finding; absolute timings have network variance.
+- **`--depth=1` skips most history.** Cat-file negotiation
+  cost would be larger with full history. The 15 s
+  per-batch number is the *shallow* case; without shallow
+  each batched fetch could be much slower.
+- **Trace flag has overhead even when off.** Per-RPC
+  `state.trace` check + AtomicUsize on every connection.
+  Measured impact on the smoke is sub-ms; not benched at
+  high concurrency. If it shows up, the trace path can be
+  gated by a `#[cold]` branch.
+- **`PrefetchHeaders` going through the coalescer at the
+  batch level is not implemented yet.** Mentioned above as
+  a smaller follow-up; the cat-file pool is the primary fix
+  this diagnostic justifies.
+
 ## What this shows
 
 - **§1.6 amortisation is real.** Across both targets, the second

@@ -8,21 +8,27 @@
 > code.
 >
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-06-04, after the worktree-comparator bench
-> ran and substantially reframed the pitch. Headline: against
-> the steelman (`worktree-depth1 on-demand`), `projgit-shared`
-> *loses* wall clock by 3.77× at N=10 on cargo, and **did not
-> complete in 36 minutes** on `rust-lang/rust`. Disk pitch
-> (~8–11× win on cargo, ~6× predicted on rust) is the only
-> robust structural win across scales. The earlier sparse-access
-> '1.59× wall' claim was vs a strawman comparator. The current
-> #1 priority is investigating why projgit's data plane stalls
-> at big-history repos — see [`../bench/baseline.md`](../bench/baseline.md) §worktree-comparator.
-> Prior in the same multi-day session: sparse-access bench ran
-> 2026-06-02, Phase C concurrent bench ran 2026-06-02, `projgitd`
-> Stage 3 shipped, the dotgit A2 ref-visibility rung landed, and
-> Stage 4 was indefinitely deferred per its design-doc stop
-> condition.
+> Last updated: 2026-06-04, after the data-plane investigation
+> shipped (Stages 0–4). The rust-lang/rust hang is now
+> **diagnosed**: per-mount prefetch worker × N sidecars ×
+> batched cat-file calls all serialise through one
+> `Mutex<BatchChild>` in the daemon, head-of-line blocking
+> on-demand `Fetch` RPCs (commit `ed7ad90`'s trace output is
+> recorded in [`../bench/baseline.md`](../bench/baseline.md)
+> §Diagnostic). The cat-file pool (deferred from Phase C as
+> speculation) is now the load-bearing fix. Also landed:
+> shallow partial-clone support (`--depth=N`) at every layer
+> (commit `4869594`), which independently moved the rust
+> bench from ">36 minutes, didn't complete" to "~16 s,
+> completes, projgit wins 3.65× wall and 335× disk vs the
+> partial-cat-independent comparator".
+>
+> Prior in the multi-day session: worktree-comparator bench
+> (2026-06-04), sparse-access bench (2026-06-02), Phase C
+> concurrent bench (2026-06-02), `projgitd` Stage 3, dotgit A2,
+> Stage 4 indefinitely deferred. Long context; the
+> [bench/baseline.md](../bench/baseline.md) sections are now
+> the load-bearing artifact, not these commit lists.
 
 If you're resuming work on this project after a break (or you're a fresh
 AI session), read this file first. It's the shortest path back to context.
@@ -569,6 +575,55 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   data-plane finding (c) is investigated and fixed. Four
   commits (Stage 0 design+plan, Stage 1 implementation, Stage
   2 capture, this handoff update).
+- **Data-plane investigation + shallow partial clone (2026-06-04).**
+  Shipped two parallel tracks responding to the worktree-comparator
+  finding (c) (projgit-shared didn't complete on `rust-lang/rust`):
+  shallow `--depth=N` support at every layer (Stage 1) plus daemon
+  per-RPC `--trace` instrumentation (Stage 2), then ran a minimal
+  diagnostic on `rust-lang/rust` with both enabled (Stage 3) and
+  captured findings in [`../bench/baseline.md`](../bench/baseline.md)
+  §Diagnostic. Design + plan in
+  [`data-plane-investigation-plan.md`](data-plane-investigation-plan.md).
+  **Three findings**:
+  (a) **Diagnosis confirmed (hypothesis 1 from the plan).** The
+  rust-scale hang is per-mount prefetch worker × N sidecars ×
+  batched cat-file calls all serializing through one
+  `Mutex<BatchChild>` in the daemon. Trace output shows two
+  simultaneous `PrefetchHeaders(31 OIDs)` calls each consume
+  ~15 s of cat-file time, and on-demand `Fetch` RPCs that
+  arrive in the middle are head-of-line blocked behind the
+  prefetch batches (one `Fetch` had 14.8 s wall time, of which
+  ~99 % was mutex wait, ~1 % actual fetch work). Per-blob
+  promisor cost in isolation is ~0.45 s on the same repo — the
+  slowness is orchestration, not git.
+  (b) **Shallow partial clone is independently load-bearing at
+  big-history repos.** Without `--depth=1`, `Attach` on
+  `rust-lang/rust` is >40 s (full partial clone of deep
+  history). With `--depth=1`, 1.2 s. Disk dropped from ~417 MB
+  to ~2.5 MB on the same iteration. Shipped as opt-in flag at
+  every layer (`projgit mount --depth N`, `projgitd --depth N`,
+  `bench_mount --daemon-depth N`); default unchanged because
+  shallow projections can't serve `git log` / `git blame` /
+  history navigation.
+  (c) **The Coalescer works for `Fetch` but doesn't cover
+  `PrefetchHeaders`.** Trace shows two sidecars asking for the
+  same README blob produced one upstream fetch (Coalescer
+  dedup), but two `PrefetchHeaders(31)` calls with fully
+  overlapping OID sets each got a full mutex turn. Per-batch
+  coalescing is a smaller follow-up fix.
+
+  **Combined wins from this session**: with shallow + the
+  existing architecture, the rust-lang/rust `sparse-shared`
+  N=2 cell now completes in ~16 s and projgit-shared beats
+  `partial-cat-independent` by **3.65× wall** + **335× disk**
+  (the worktree-comparator's strawman comparator). The
+  cat-file pool fix should drop wall further by ~10× (per-blob
+  cost would dominate instead of mutex wait).
+
+  Five commits (Stage 0 design+plan, Stage 1 shallow, Stage 2
+  trace, Stage 3 bench `--daemon-depth`+`--daemon-trace` flags,
+  this Stage 4 capture+handoff). 4 new clone unit tests; full
+  workspace `cargo test --all-targets` + clippy green.
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
@@ -851,66 +906,57 @@ decision points live in
 [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
 the working doc that gets updated as each stage lands.
 
-1. **Data-plane investigation: why doesn't `projgit-shared`
-   complete on `rust-lang/rust`?** The new top item, in response
-   to the worktree-comparator bench finding (c). The N=4
-   `sparse-shared` cell on `rust-lang/rust` didn't complete in
-   36 minutes of wall time. Single-shot per-blob promisor fetch
-   outside the bench takes ~0.45 s on the same repo — per-blob
-   cost is *not* the bottleneck. The slowness is in projgit's
-   data-plane orchestration under load. Likely causes (in order
-   of probability):
-   1. Per-mount prefetch worker × N sidecars × batched
-      `cat-file --batch-check` fetches all serializing through
-      one `Mutex<BatchChild>` in the daemon — head-of-line
-      blocking under load.
-   2. Lookup-driven tree-walk on big repos triggers cascading
-      prefetches (each FUSE `lookup` reads its tree, posts that
-      dir's OIDs to the mount's prefetch worker, which queues
-      at the daemon).
-   3. Daemon-side cache or coalescer state growing unboundedly
-      under load. Less likely (cargo cell was clean) but worth
-      ruling out.
-   First step: instrument the daemon's request handler with
-   per-RPC timing + queue depth, run a minimal repro (N=2 or 3
-   on rust, single iteration), see where time actually goes.
-   Until this is understood and addressed, the projgit pitch
-   at big-repo scale is unsupported by measurement. **The
-   cat-file pool (deferred from Phase C) becomes a candidate
-   solution if cause (1) is confirmed**; until then it's still
-   speculation. This is the highest-leverage move for restoring
-   the wall-clock pitch.
-2. **`projgitd` Stage 5 — production polish.** systemd unit,
+1. **Cat-file pool in the daemon's `GitCliFetcher`** (was
+   speculative; now the diagnosed fix from the 2026-06-04
+   data-plane investigation). Replace the single shared
+   `Mutex<Option<BatchChild>>` with a pool of K children;
+   `raw_fetch` and `prefetch_headers` acquire any free child
+   instead of serializing through one. Sizing: K probably wants
+   to be at least `N_sidecars + 1` so prefetch fan-out doesn't
+   starve on-demand fetches. Should drop the rust-lang/rust
+   `sparse-shared` wall from ~15 s to ~1–2 s (per-blob cost
+   would dominate instead of mutex wait). The diagnostic trace
+   is in [`../bench/baseline.md`](../bench/baseline.md)
+   §Diagnostic. **This is the highest-leverage perf change on
+   the queue.**
+2. **Per-batch Coalescer for `PrefetchHeaders`** (smaller
+   follow-up to #1). The trace showed two sidecars'
+   `PrefetchHeaders(31 OIDs)` calls each got a full mutex turn
+   even though their OID sets fully overlapped. Either route
+   `prefetch_headers` through the existing per-OID
+   `Coalescer.do_or_join`, or add a per-batch coalescer keyed
+   on a hash of the OID set. Independent of #1; would help even
+   without the pool.
+3. **`projgitd` Stage 5 — production polish.** systemd unit,
    PID file / restart policy, persistent daemon state for fast
    recovery (so daemon-restart doesn't re-resolve refs), health
    checks, `tracing-subscriber` wiring for the existing `-v` flag,
-   structured logging. Demoted from #1: polishing a daemon that
-   doesn't scale to big repos is the wrong order. But still
-   high-leverage once #1 lands (the persistent-state work in
-   particular protects the daemon's only-robust pitch axis —
-   disk-amortisation across batches).
-3. **Pitch language updates downstream of the worktree-comparator
-   finding.** README and top-level project description still
-   imply a wall-clock pitch. Update to lead with disk + container-
-   ization, explicitly acknowledge the wall-clock loss at every
-   measured scale, and link to #1 as the path back to parity.
-   Wait until after #1 ships — the answer to #1 may restore
-   some of the pitch language.
-4. **B3: CI bench job.** README + bench doc claim the bench
+   structured logging. Wait until #1 + #2 land so persistent
+   state covers a daemon that actually scales.
+4. **Pitch language updates downstream of the worktree-comparator
+   and data-plane findings.** README + top-level project
+   description still imply a wall-clock pitch. Update once #1
+   lands and the rust-scale numbers are re-measured — if the
+   pool brings projgit to wall-clock parity with `worktree-depth1
+   on-demand`, the pitch can be "matches worktree on speed plus
+   wins ~10× on disk plus containerization-clean". If it doesn't,
+   the pitch stays "disk + containerization, wall clock
+   workload-dependent". Gated on #1.
+5. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
    bench and compares to the checked-in baseline. The bench
-   suite is now complete (single + sequential + Phase C + sparse-
-   access + worktree-comparator) so this protects a meaningful
-   surface. Worth doing alongside #1 to lock in whatever the
-   data-plane investigation produces.
-5. **Phase 3d. Production `projgit-winfsp`** on top of the
+   suite is now complete (single + sequential + Phase C +
+   sparse-access + worktree-comparator + the diagnostic
+   recipe). Worth doing alongside #1 to lock in the perf gain
+   when it lands.
+6. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-6. **Container deployment recipe doc.** User-facing `docs/` page
+7. **Container deployment recipe doc.** User-facing `docs/` page
    covering `/etc/fuse.conf`, `bind-propagation`, a sample
    systemd unit, an example Docker invocation, **and the new
    sidecar deployment shape** (`projgitd` on the host or in a
@@ -920,23 +966,23 @@ the working doc that gets updated as each stage lands.
    and [`docs/design/projgitd.md`](../design/projgitd.md); this is
    the cookbook side. The [scripts/docker-smoke/](../../scripts/docker-smoke/)
    recipe shipped with Stage 3d is the runnable seed.
-7. **Bench follow-ups** (optional, conditional on #1 completing
-   or Harbor's workload characterisation suggesting they're
-   needed):
+8. **Bench follow-ups** (optional, conditional on #1 completing):
+   - **Re-bench rust-lang/rust at N=4 and N=10** with the
+     cat-file pool. Validates the predicted ~10× wall-clock
+     improvement.
    - **Higher-N worktree-comparator** (N=100, README's headline).
      `worktree-depth1 on-demand` at N=10 scales flat (~20 s on
-     rust); at N=100 it would likely hit FS / FD limits and
-     projgit (post-#1) might regain wall-clock parity. Bench
-     accepts `--concurrency 100`.
+     rust); at N=100 it might hit FS / FD limits and
+     projgit (post-#1) could regain wall-clock parity.
    - **Full-clone worktree on `rust-lang/rust`.** Predicted
      5–10 minutes setup; would set the upper-bound "operator
-     was lazy" baseline at big-repo scale. Skipped this session
-     for time.
-   - **Divergent-access** (Phase C2). Each agent reads a
-     disjoint file slice. Tests the daemon's serialisation cost
-     at workloads where the coalescer doesn't help. If
-     projgit-shared still loses badly here, the cat-file pool
-     becomes a real follow-up; otherwise speculation.
+     was lazy" baseline at big-repo scale.
+   - **140 GB target workload.** Currently a synthetic-bench
+     idea (user-context-shared scale). Real or synthetic, the
+     bench should validate projgit at the actual deployment
+     size. Gated on #1 because below the bottleneck-fix
+     threshold there's no chance of completion in reasonable
+     time.
    None of these are load-bearing for shipping projgit; do them
    only if pitch claims need stronger backing in their specific
    regime.

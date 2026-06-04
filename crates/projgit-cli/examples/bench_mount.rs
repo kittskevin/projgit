@@ -145,6 +145,16 @@ struct Args {
     /// Pre-staging mode for `worktree-shared`. Default `PreStage`.
     /// Ignored by other scenarios.
     worktree_mode: WorktreeMode,
+    /// `Some(n)`: pass `--depth=n` to the daemon's partial clone
+    /// when running `daemon-concurrent` / `sparse-shared`.
+    /// `None` (default): full history. Doesn't affect worktree or
+    /// `naive-*` scenarios.
+    daemon_depth: Option<u32>,
+    /// `true`: spin the in-thread daemon with `trace: true` so it
+    /// emits per-RPC trace lines on stderr. Off by default
+    /// (instrumentation has overhead even when off-by-default
+    /// checks dominate).
+    daemon_trace: bool,
 }
 
 fn parse_args() -> Args {
@@ -155,6 +165,8 @@ fn parse_args() -> Args {
     let mut scenario = Scenario::Single;
     let mut worktree_strategy = WorktreeStrategy::Depth1;
     let mut worktree_mode = WorktreeMode::PreStage;
+    let mut daemon_depth: Option<u32> = None;
+    let mut daemon_trace = false;
     let mut concurrency = DEFAULT_CONCURRENCY;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -228,6 +240,21 @@ fn parse_args() -> Args {
                     }
                 };
             }
+            "--daemon-depth" => {
+                let v = it.next().expect("--daemon-depth needs a value");
+                let n: u32 = v.parse().unwrap_or_else(|_| {
+                    eprintln!("--daemon-depth must be a positive integer");
+                    std::process::exit(2)
+                });
+                if n == 0 {
+                    eprintln!("--daemon-depth 0 is not supported; git rejects --depth=0");
+                    std::process::exit(2);
+                }
+                daemon_depth = Some(n);
+            }
+            "--daemon-trace" => {
+                daemon_trace = true;
+            }
             "--concurrency" => {
                 let v = it.next().expect("--concurrency needs a value");
                 concurrency = v.parse().unwrap_or_else(|_| {
@@ -261,6 +288,8 @@ fn parse_args() -> Args {
         concurrency,
         worktree_strategy,
         worktree_mode,
+        daemon_depth,
+        daemon_trace,
     }
 }
 
@@ -906,8 +935,8 @@ fn bench_projgit_daemon_concurrent(args: &Args) -> anyhow::Result<ConcurrentSamp
         socket_path: socket_path.clone(),
         socket_mode: 0o600,
         cache_dir: Some(cache_root.clone()),
-        cache_depth: None,
-        trace: false,
+        cache_depth: args.daemon_depth,
+        trace: args.daemon_trace,
     };
     let daemon_handle = thread::spawn(move || daemon_run(config));
 
@@ -1581,8 +1610,8 @@ fn sparse_shared_projgit(args: &Args) -> anyhow::Result<SparseSharedConfig> {
         socket_path: socket_path.clone(),
         socket_mode: 0o600,
         cache_dir: Some(cache_root.clone()),
-        cache_depth: None,
-        trace: false,
+        cache_depth: args.daemon_depth,
+        trace: args.daemon_trace,
     };
     let daemon_handle = thread::spawn(move || daemon_run(config));
 
