@@ -81,6 +81,18 @@ pub struct DaemonConfig {
     /// Off by default — instrumentation is in the hot path so
     /// even a cheap "if trace { ... }" check is worth gating.
     pub trace: bool,
+    /// Number of `git cat-file --batch-check` children the
+    /// daemon's [`GitCliFetcher`] keeps in its `BatchChildPool`.
+    /// `1` matches the pre-pool behaviour (single shared child,
+    /// head-of-line blocked under sidecar fan-out). Defaults to
+    /// [`GitCliFetcher::default_pool_size`]
+    /// (`min(available_parallelism, 8)`).
+    ///
+    /// Used by [`attach_source`] when constructing the
+    /// `GitCliFetcher` for a URL source. Per-source: the value at
+    /// first Attach binds for the daemon's lifetime; changing
+    /// `--pool-size` requires a daemon restart.
+    pub pool_size: usize,
 }
 
 impl Default for DaemonConfig {
@@ -91,6 +103,7 @@ impl Default for DaemonConfig {
             cache_dir: None,
             cache_depth: None,
             trace: false,
+            pool_size: GitCliFetcher::default_pool_size(),
         }
     }
 }
@@ -119,6 +132,10 @@ struct DaemonState {
     /// Per-RPC trace emission flag. Propagated from
     /// [`DaemonConfig::trace`]. Sampled in `handle_connection`.
     trace: bool,
+    /// `BatchChildPool` size for [`GitCliFetcher`]. Propagated
+    /// from [`DaemonConfig::pool_size`]; used by [`attach_source`]
+    /// when constructing the per-URL-source fetcher.
+    pool_size: usize,
     /// In-flight RPC count. Incremented at request receive,
     /// decremented after response. Used by the trace path to
     /// surface pile-ups under load (`inflight_at_recv=N` in the
@@ -199,14 +216,20 @@ impl DaemonState {
         cache_dir: Option<PathBuf>,
         cache_depth: Option<u32>,
     ) -> Self {
-        Self::with_config(socket_path, cache_dir, cache_depth, false)
+        // Test-only path; pin pool_size to 1 so behaviour matches
+        // the pre-pool single-child code path tests historically
+        // exercised. Production constructs DaemonState via
+        // [`Self::with_full_config`] from `run()`, which takes
+        // `pool_size` from `DaemonConfig`.
+        Self::with_full_config(socket_path, cache_dir, cache_depth, false, 1)
     }
 
-    fn with_config(
+    fn with_full_config(
         socket_path: PathBuf,
         cache_dir: Option<PathBuf>,
         cache_depth: Option<u32>,
         trace: bool,
+        pool_size: usize,
     ) -> Self {
         Self {
             started_at: Instant::now(),
@@ -214,6 +237,7 @@ impl DaemonState {
             cache_dir,
             cache_depth,
             trace,
+            pool_size,
             inflight: AtomicUsize::new(0),
             shutdown_requested: AtomicBool::new(false),
             next_projection_id: AtomicU64::new(1),
@@ -304,11 +328,12 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         config.socket_mode
     );
 
-    let state = Arc::new(DaemonState::with_config(
+    let state = Arc::new(DaemonState::with_full_config(
         config.socket_path.clone(),
         config.cache_dir.clone(),
         config.cache_depth,
         config.trace,
+        config.pool_size,
     ));
 
     // Accept loop. Non-blocking would be cleaner but a self-connect
@@ -500,7 +525,12 @@ fn handle_mount(
 
     // First mount: attach the daemon to this source.
     if active.is_none() {
-        match attach_source(&source, state.cache_dir.as_deref(), state.cache_depth) {
+        match attach_source(
+            &source,
+            state.cache_dir.as_deref(),
+            state.cache_depth,
+            state.pool_size,
+        ) {
             Ok(repo) => *active = Some(repo),
             Err(e) => return err(codes::SOURCE_OPEN_FAILED, format!("{e:#}")),
         }
@@ -608,7 +638,12 @@ fn handle_attach(state: &Arc<DaemonState>, source: String) -> Response {
         Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
     };
     if active.is_none() {
-        match attach_source(&source, state.cache_dir.as_deref(), state.cache_depth) {
+        match attach_source(
+            &source,
+            state.cache_dir.as_deref(),
+            state.cache_depth,
+            state.pool_size,
+        ) {
             Ok(repo) => *active = Some(repo),
             Err(e) => return err(codes::SOURCE_OPEN_FAILED, format!("{e:#}")),
         }
@@ -739,6 +774,7 @@ fn attach_source(
     source: &str,
     cache_dir_override: Option<&Path>,
     cache_depth: Option<u32>,
+    pool_size: usize,
 ) -> Result<ActiveRepo> {
     if looks_like_url(source) {
         let cache_dir = resolve_cache_dir(cache_dir_override)?;
@@ -769,7 +805,7 @@ fn attach_source(
             ObjectStore::open(&git_dir)
                 .with_context(|| format!("opening object store at {}", git_dir.display()))?,
         );
-        let fetcher = GitCliFetcher::open(store.clone())
+        let fetcher = GitCliFetcher::open_with_pool_size(store.clone(), pool_size)
             .context("opening GitCliFetcher (needs `git` on PATH)")?;
         let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
         Ok(ActiveRepo {

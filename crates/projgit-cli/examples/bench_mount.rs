@@ -155,6 +155,12 @@ struct Args {
     /// (instrumentation has overhead even when off-by-default
     /// checks dominate).
     daemon_trace: bool,
+    /// `Some(n)`: spin the in-thread daemon with
+    /// `pool_size: n` (K parallel `git cat-file --batch-check`
+    /// children in the daemon's `GitCliFetcher`). `None`
+    /// (default): use the daemon's own default
+    /// (`min(available_parallelism, 8)`). Rejected at 0.
+    daemon_pool_size: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -167,6 +173,7 @@ fn parse_args() -> Args {
     let mut worktree_mode = WorktreeMode::PreStage;
     let mut daemon_depth: Option<u32> = None;
     let mut daemon_trace = false;
+    let mut daemon_pool_size: Option<usize> = None;
     let mut concurrency = DEFAULT_CONCURRENCY;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -255,6 +262,18 @@ fn parse_args() -> Args {
             "--daemon-trace" => {
                 daemon_trace = true;
             }
+            "--daemon-pool-size" => {
+                let v = it.next().expect("--daemon-pool-size needs a value");
+                let n: usize = v.parse().unwrap_or_else(|_| {
+                    eprintln!("--daemon-pool-size must be a positive integer");
+                    std::process::exit(2)
+                });
+                if n == 0 {
+                    eprintln!("--daemon-pool-size 0 is not supported; pool must have at least one slot");
+                    std::process::exit(2);
+                }
+                daemon_pool_size = Some(n);
+            }
             "--concurrency" => {
                 let v = it.next().expect("--concurrency needs a value");
                 concurrency = v.parse().unwrap_or_else(|_| {
@@ -268,7 +287,7 @@ fn parse_args() -> Args {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single|sparse-shared|worktree-shared] [--concurrency N] [--worktree-strategy full|depth1] [--worktree-mode pre-stage|on-demand]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent, sparse-shared, worktree-shared scenarios)\n  default --worktree-strategy: depth1\n  default --worktree-mode: pre-stage (both only used by worktree-shared)",
+                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single|sparse-shared|worktree-shared] [--concurrency N] [--worktree-strategy full|depth1] [--worktree-mode pre-stage|on-demand] [--daemon-depth N] [--daemon-trace] [--daemon-pool-size N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent, sparse-shared, worktree-shared scenarios)\n  default --worktree-strategy: depth1\n  default --worktree-mode: pre-stage (both only used by worktree-shared)\n  --daemon-depth, --daemon-trace, --daemon-pool-size only used by daemon-concurrent / sparse-shared",
                     DEFAULT_FILES.join(","),
                 );
                 std::process::exit(0);
@@ -290,6 +309,7 @@ fn parse_args() -> Args {
         worktree_mode,
         daemon_depth,
         daemon_trace,
+        daemon_pool_size,
     }
 }
 
@@ -937,6 +957,9 @@ fn bench_projgit_daemon_concurrent(args: &Args) -> anyhow::Result<ConcurrentSamp
         cache_dir: Some(cache_root.clone()),
         cache_depth: args.daemon_depth,
         trace: args.daemon_trace,
+        pool_size: args
+            .daemon_pool_size
+            .unwrap_or_else(|| DaemonConfig::default().pool_size),
     };
     let daemon_handle = thread::spawn(move || daemon_run(config));
 
@@ -1612,6 +1635,9 @@ fn sparse_shared_projgit(args: &Args) -> anyhow::Result<SparseSharedConfig> {
         cache_dir: Some(cache_root.clone()),
         cache_depth: args.daemon_depth,
         trace: args.daemon_trace,
+        pool_size: args
+            .daemon_pool_size
+            .unwrap_or_else(|| DaemonConfig::default().pool_size),
     };
     let daemon_handle = thread::spawn(move || daemon_run(config));
 

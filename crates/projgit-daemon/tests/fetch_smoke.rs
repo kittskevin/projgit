@@ -86,6 +86,7 @@ fn spawn_daemon(label: &str) -> (PathBuf, thread::JoinHandle<anyhow::Result<()>>
         cache_dir: None,
         cache_depth: None,
         trace: false,
+        pool_size: 1,
     };
     let handle = thread::spawn(move || run(config));
     let start = Instant::now();

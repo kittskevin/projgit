@@ -55,6 +55,21 @@ fn main() -> anyhow::Result<()> {
         /// Off by default — instrumentation is in the hot path.
         #[arg(long)]
         trace: bool,
+
+        /// Number of `git cat-file --batch-check` children the
+        /// daemon's `GitCliFetcher` keeps in its pool. Round-robin
+        /// dispatch removes the head-of-line block diagnosed on
+        /// 2026-06-04 where one shared child serialised every
+        /// sidecar's prefetch + on-demand fetch through a single
+        /// mutex (see docs/bench/baseline.md §Diagnostic).
+        ///
+        /// Default: `min(available_parallelism, 8)`. Pick K close
+        /// to your expected sidecar fan-out for best parallelism
+        /// (the cat-file pool plan suggests K >= N_sidecars + 1).
+        /// `N=0` is rejected at parse time — a zero-sized pool is
+        /// not a useful configuration.
+        #[arg(long, value_name = "N")]
+        pool_size: Option<usize>,
     }
 
     let cli = Cli::parse();
@@ -66,6 +81,10 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("--depth 0 is not supported; git rejects --depth=0");
     }
 
+    if matches!(cli.pool_size, Some(0)) {
+        anyhow::bail!("--pool-size 0 is not supported; pool must have at least one slot");
+    }
+
     let mut config = DaemonConfig::default();
     if let Some(p) = cli.socket {
         config.socket_path = p;
@@ -73,6 +92,9 @@ fn main() -> anyhow::Result<()> {
     config.socket_mode = socket_mode;
     config.cache_depth = cli.depth;
     config.trace = cli.trace;
+    if let Some(n) = cli.pool_size {
+        config.pool_size = n;
+    }
 
     // Signal handling lives in the binary, not the library, because
     // `ctrlc::set_handler` is a process-wide resource (set-once) and
