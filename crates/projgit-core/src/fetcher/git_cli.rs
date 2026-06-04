@@ -54,7 +54,8 @@ use gix::ObjectId;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Errors produced while constructing a [`GitCliFetcher`].
 #[derive(Debug, thiserror::Error)]
@@ -178,6 +179,144 @@ impl Drop for BatchChild {
     }
 }
 
+/// A pool of `BatchChild` slots, each lazily spawned on first use
+/// and respawned after a transport failure. Replaces the single
+/// `Mutex<Option<BatchChild>>` so multiple callers
+/// (`raw_fetch`, `prefetch_headers`, both for the per-mount prefetch
+/// worker and on-demand FUSE fetches across N sidecars) can run
+/// concurrent `cat-file --batch-check` round-trips without
+/// head-of-line blocking each other through one shared child.
+///
+/// Sizing: see [`GitCliFetcher::default_pool_size`] for the default;
+/// callers can override with [`GitCliFetcher::open_with_pool_size`].
+///
+/// Acquisition is round-robin try-lock: each call walks slots
+/// starting at a shared atomic counter and returns the first slot
+/// it can `try_lock`. If every slot is busy on the first pass, it
+/// falls back to a blocking lock on the starting slot. This is
+/// "good enough" fairness: under sustained load the round-robin
+/// counter advances every acquire, so no slot starves
+/// permanently; under burst load (K parallel callers, K slots
+/// free) every caller gets a slot immediately. Fairness was
+/// considered a non-issue for V1 because per-call cost is in the
+/// hundreds-of-ms (cat-file round-trip + promisor fetch), well
+/// above any plausible per-acquire latency cost.
+///
+/// On respawn after I/O failure: the failing caller leaves its
+/// slot as `None` so the next caller for that slot spawns a
+/// fresh child. Other slots stay alive — one broken pipe doesn't
+/// poison the pool.
+struct BatchChildPool {
+    /// One slot per pool entry. `None` between slot construction
+    /// and first use, and between an I/O failure and the next
+    /// caller's respawn. `Some(_)` otherwise. Always `Vec.len() >= 1`.
+    slots: Vec<Mutex<Option<BatchChild>>>,
+    /// Round-robin starting index for `acquire`. AtomicUsize so
+    /// callers don't contend on a counter mutex; wraps modulo
+    /// `slots.len()` at use site.
+    next: AtomicUsize,
+    git_dir: PathBuf,
+}
+
+impl BatchChildPool {
+    /// Construct a pool of `k` slots, all initially empty. Lazy
+    /// spawn: no child processes are started until [`Self::acquire`]
+    /// is called. `k` must be `>= 1`; callers should validate.
+    fn new(k: usize, git_dir: PathBuf) -> Self {
+        debug_assert!(k >= 1, "BatchChildPool size must be >= 1");
+        let mut slots = Vec::with_capacity(k);
+        for _ in 0..k {
+            slots.push(Mutex::new(None));
+        }
+        Self {
+            slots,
+            next: AtomicUsize::new(0),
+            git_dir,
+        }
+    }
+
+    /// Hand out one slot's guard. Round-robin try-lock; falls back
+    /// to a blocking lock on the starting slot if all are busy.
+    ///
+    /// The returned [`PoolGuard`] holds the slot's [`MutexGuard`];
+    /// the slot stays locked until the guard is dropped. Callers
+    /// should keep the guard alive only for one round trip.
+    fn acquire(&self) -> PoolGuard<'_> {
+        let n = self.slots.len();
+        // Advance the round-robin counter atomically so different
+        // callers start scanning at different slots even under
+        // contention. Modulo at use; AtomicUsize wraps naturally
+        // and we never read its absolute value.
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        // Pass 1: try_lock each slot in round-robin order.
+        for i in 0..n {
+            let idx = (start + i) % n;
+            if let Ok(guard) = self.slots[idx].try_lock() {
+                return PoolGuard {
+                    inner: guard,
+                    git_dir: &self.git_dir,
+                };
+            }
+        }
+        // All slots busy. Block on the starting slot. (No fairness
+        // claim against the other K-1 slots; the next round-robin
+        // caller will start one slot ahead, so starvation is
+        // bounded by K.)
+        let guard = self
+            .slots[start]
+            .lock()
+            .expect("BatchChildPool slot mutex poisoned");
+        PoolGuard {
+            inner: guard,
+            git_dir: &self.git_dir,
+        }
+    }
+}
+
+/// One acquired slot from a [`BatchChildPool`]. Drops release the
+/// underlying mutex; do not hold across awaits or unrelated work.
+///
+/// Provides the same operations the old `slot.as_mut().expect(...)`
+/// pattern exposed in `raw_fetch` and `prefetch_headers`:
+/// `with_child` (lazy-spawn then call a closure with `&mut BatchChild`),
+/// and `reset` (tear down the child after an I/O failure so the
+/// next caller for this slot respawns).
+struct PoolGuard<'a> {
+    inner: MutexGuard<'a, Option<BatchChild>>,
+    git_dir: &'a std::path::Path,
+}
+
+impl<'a> PoolGuard<'a> {
+    /// Lazily spawn the slot's child (if absent), then invoke
+    /// `f(&mut BatchChild)`. Spawn failures surface as
+    /// `Err(io::Error)`; the closure's own return value comes back
+    /// in the `Ok` arm verbatim (so callers can return their own
+    /// `Result` from `f` and pattern-match it).
+    fn with_child<F, R>(&mut self, f: F) -> std::io::Result<R>
+    where
+        F: FnOnce(&mut BatchChild) -> R,
+    {
+        if self.inner.is_none() {
+            let child = BatchChild::spawn(self.git_dir)?;
+            *self.inner = Some(child);
+        }
+        let child = self.inner.as_mut().expect("just inserted");
+        Ok(f(child))
+    }
+
+    /// Tear down the slot's child (typically after an I/O error)
+    /// so the next caller for this slot respawns a fresh one.
+    fn reset(&mut self) {
+        *self.inner = None;
+    }
+
+    /// Test-only accessor: is a child currently alive in this slot?
+    #[cfg(test)]
+    fn has_child(&self) -> bool {
+        self.inner.is_some()
+    }
+}
+
 /// A [`Fetcher`] that shells out to the system `git` to drive the
 /// promisor-remote fetch path.
 ///
@@ -187,21 +326,53 @@ impl Drop for BatchChild {
 /// issue exactly one `git` invocation.
 pub struct GitCliFetcher {
     store: Arc<ObjectStore>,
-    git_dir: PathBuf,
     coalescer: Coalescer<ObjectId, ()>,
-    /// Long-lived `git cat-file --batch-check` child. Lazy: spawned
-    /// on the first miss, respawned after a transport failure.
-    /// `None` means "no child currently alive."
-    batch: Mutex<Option<BatchChild>>,
+    /// Pool of long-lived `git cat-file --batch-check` children.
+    /// K slots; each lazy-spawned, respawned on I/O failure.
+    /// Acquired round-robin per call to `raw_fetch` /
+    /// `prefetch_headers` so concurrent callers don't head-of-line
+    /// block through one shared child. See [`BatchChildPool`].
+    batch: BatchChildPool,
 }
 
 impl GitCliFetcher {
+    /// Pool size when callers don't pick one explicitly.
+    /// `min(available_parallelism, 8)`: the upper bound is a hedge
+    /// against pathological host configs (e.g. 96-core CI boxes
+    /// where K=96 children would burn RAM for no benefit on
+    /// projgit's actual workloads). The lower bound (1) only
+    /// fires if `available_parallelism()` itself fails. Stage 2
+    /// of the cat-file pool plan picks a final default empirically;
+    /// 8 is the V1 choice (matches `min(num_cpus, 8)` from the plan).
+    pub fn default_pool_size() -> usize {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        n.clamp(1, 8)
+    }
+
     /// Construct a fetcher that drives `git` against the same
     /// `.git/` directory the [`ObjectStore`] reads from.
     ///
     /// Verifies `git --version` runs successfully so callers fail
     /// fast at construction rather than at the first cache miss.
+    ///
+    /// Pool size: [`Self::default_pool_size`]. For explicit control
+    /// (the daemon picks K based on `DaemonConfig.pool_size`; tests
+    /// pin K=1 to verify single-child regression), use
+    /// [`Self::open_with_pool_size`].
     pub fn open(store: Arc<ObjectStore>) -> Result<Self, GitCliFetcherError> {
+        Self::open_with_pool_size(store, Self::default_pool_size())
+    }
+
+    /// Like [`Self::open`] but with an explicit pool size. `k` is
+    /// clamped to `>= 1` (a zero-sized pool is a programming bug
+    /// the daemon's CLI parse should already reject; this clamp is
+    /// belt-and-braces).
+    pub fn open_with_pool_size(
+        store: Arc<ObjectStore>,
+        k: usize,
+    ) -> Result<Self, GitCliFetcherError> {
         let ok = Command::new("git")
             .arg("--version")
             .stdout(Stdio::null())
@@ -215,52 +386,56 @@ impl GitCliFetcher {
             ));
         }
         let git_dir = store.git_dir().to_path_buf();
+        let k = k.max(1);
         Ok(Self {
             store,
-            git_dir,
             coalescer: Coalescer::new(),
-            batch: Mutex::new(None),
+            batch: BatchChildPool::new(k, git_dir),
         })
     }
 
     /// Issue the actual fetch. Internal; bypasses the coalescer so
     /// the coalescer can call us once.
     ///
-    /// One round-trip through the long-lived `git cat-file
-    /// --batch-check` child. If the child has died we tear down the
-    /// dead handle and respawn once so a transient transport failure
-    /// doesn't poison the entire mount session.
+    /// One round-trip through a `git cat-file --batch-check` child
+    /// from the pool. If the child has died we tear down the dead
+    /// handle and respawn once on the same slot so a transient
+    /// transport failure doesn't poison the entire mount session.
     ///
     /// **Double-checked locking with the prefetch worker.** Both the
-    /// prefetch worker and on-demand fetches contend for the
-    /// `batch` mutex. If a prefetch batch lands the OID's pack
-    /// while we're waiting for the lock, we'd otherwise re-query
-    /// for an OID that's already local. Re-check `store.contains`
-    /// after acquiring the lock and short-circuit on hit.
+    /// prefetch worker and on-demand fetches acquire pool slots. If
+    /// a prefetch batch lands the OID's pack while we're waiting
+    /// for a slot, we'd otherwise re-query for an OID that's
+    /// already local. Re-check `store.contains` after acquiring the
+    /// slot and short-circuit on hit.
     fn raw_fetch(&self, oid: ObjectId) -> Result<(), FetcherError> {
         let mut last_io_err: Option<std::io::Error> = None;
         for _attempt in 0..2 {
             let response = {
-                let mut slot = self.batch.lock().unwrap();
+                let mut slot = self.batch.acquire();
                 // Double-checked: another caller (typically the
-                // prefetch worker) may have made the OID local
-                // between our outer fast-path check and acquiring
-                // this lock.
+                // prefetch worker on a different slot) may have
+                // made the OID local between our outer fast-path
+                // check and acquiring this slot.
                 if self.store.contains(oid) {
                     return Ok(());
                 }
-                if slot.is_none() {
-                    *slot = Some(BatchChild::spawn(&self.git_dir).map_err(|e| {
-                        FetcherError::Backend(oid, format!("spawn git cat-file: {e}"))
-                    })?);
-                }
-                let child = slot.as_mut().expect("just inserted");
-                match child.query(oid) {
-                    Ok(line) => Ok(line),
-                    Err(e) => {
-                        // Tear down the failed child so the next
-                        // call gets a fresh one.
-                        *slot = None;
+                match slot.with_child(|child| child.query(oid)) {
+                    Err(spawn_err) => {
+                        // Spawn failure surfaces as Backend (not
+                        // Transport-retryable) — matches the
+                        // pre-pool single-child error mapping.
+                        return Err(FetcherError::Backend(
+                            oid,
+                            format!("spawn git cat-file: {spawn_err}"),
+                        ));
+                    }
+                    Ok(Ok(line)) => Ok(line),
+                    Ok(Err(e)) => {
+                        // Tear down the failed child on this slot
+                        // so the next caller for this slot
+                        // respawns. Other slots stay alive.
+                        slot.reset();
                         Err(e)
                     }
                 }
@@ -410,40 +585,45 @@ impl Fetcher for GitCliFetcher {
         }
 
         if !to_query.is_empty() {
-            // Two attempts: respawn the child on broken pipe.
+            // Two attempts: respawn the child on broken pipe. Each
+            // attempt acquires a fresh slot from the pool (so if
+            // the first attempt failed on slot N and a different
+            // caller has been using slot N+1 happily, the retry
+            // can land there instead of waiting on the just-reset
+            // slot N).
             let mut last_io_err: Option<std::io::Error> = None;
             let mut batch_lines: Option<Vec<String>> = None;
             for _attempt in 0..2 {
-                let mut slot = self.batch.lock().unwrap();
-                if slot.is_none() {
-                    match BatchChild::spawn(&self.git_dir) {
-                        Ok(c) => *slot = Some(c),
-                        Err(e) => {
-                            // Whole batch fails on spawn error.
-                            for oid in &to_query {
-                                probes_by_oid.insert(
+                let mut slot = self.batch.acquire();
+                match slot.with_child(|child| child.query_batch(&to_query)) {
+                    Err(spawn_err) => {
+                        // Whole batch fails on spawn error. Don't
+                        // burn the second attempt on a spawn
+                        // failure — git is broken at the OS level.
+                        for oid in &to_query {
+                            probes_by_oid.insert(
+                                *oid,
+                                HeaderProbe::Error(
                                     *oid,
-                                    HeaderProbe::Error(
+                                    FetcherError::Backend(
                                         *oid,
-                                        FetcherError::Backend(
-                                            *oid,
-                                            format!("spawn git cat-file: {e}"),
-                                        ),
+                                        format!("spawn git cat-file: {spawn_err}"),
                                     ),
-                                );
-                            }
-                            return reorder_probes(oids, probes_by_oid);
+                                ),
+                            );
                         }
+                        return reorder_probes(oids, probes_by_oid);
                     }
-                }
-                let child = slot.as_mut().expect("just inserted");
-                match child.query_batch(&to_query) {
-                    Ok(lines) => {
+                    Ok(Ok(lines)) => {
                         batch_lines = Some(lines);
                         break;
                     }
-                    Err(e) => {
-                        *slot = None;
+                    Ok(Err(e)) => {
+                        // Tear down the failed slot; retry will
+                        // re-acquire (possibly the same slot,
+                        // possibly a different one) and spawn
+                        // afresh if needed.
+                        slot.reset();
                         last_io_err = Some(e);
                     }
                 }
@@ -607,7 +787,11 @@ mod tests {
         let head_oid = ObjectId::from_hex(head.trim().as_bytes()).unwrap();
 
         let store = Arc::new(ObjectStore::open(tmp.join(".git")).unwrap());
-        let f = GitCliFetcher::open(store.clone()).unwrap();
+        // Pin K=1 so the assertion below ("the single slot stayed
+        // alive") is meaningful — with K>1 the round-robin could
+        // legitimately leave any one slot empty and the assertion
+        // would be fragile.
+        let f = GitCliFetcher::open_with_pool_size(store.clone(), 1).unwrap();
 
         let bogus = ObjectId::from_hex(b"0000000000000000000000000000000000000001").unwrap();
 
@@ -623,10 +807,110 @@ mod tests {
             ));
         }
         assert!(
-            f.batch.lock().unwrap().is_some(),
+            f.batch.acquire().has_child(),
             "batch child should remain alive across many queries"
         );
         assert!(store.contains(head_oid));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Regression guard for the single-child path. After Stage 1
+    /// of the cat-file pool plan, `GitCliFetcher` always holds a
+    /// `BatchChildPool`; K=1 should be behaviour-equivalent to the
+    /// pre-pool `Mutex<Option<BatchChild>>`. Specifically: many
+    /// sequential `raw_fetch` calls reuse the same slot's child
+    /// (no respawn per call). This test asserts the K=1 invariant
+    /// the pre-pool implementation relied on.
+    #[test]
+    fn pool_k1_reuses_single_child_across_sequential_calls() {
+        let tmp =
+            std::env::temp_dir().join(format!("projgit-gitcli-pool-k1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        if Command::new("git")
+            .args(["init", "-q", "-b", "main", tmp.to_str().unwrap()])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIP: git CLI not available");
+            return;
+        }
+        let store = Arc::new(ObjectStore::open(tmp.join(".git")).unwrap());
+        let f = GitCliFetcher::open_with_pool_size(store.clone(), 1).unwrap();
+        assert_eq!(f.batch.slots.len(), 1);
+
+        let bogus = ObjectId::from_hex(b"0000000000000000000000000000000000000001").unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                f.raw_fetch(bogus),
+                Err(FetcherError::Refused(oid, _)) if oid == bogus
+            ));
+            // After each call the slot's child should still be
+            // alive — "missing" is a normal cat-file response, not
+            // an I/O failure that resets the slot.
+            assert!(
+                f.batch.acquire().has_child(),
+                "K=1 single slot should retain its child across calls"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Sanity check that K=4 actually dispatches multiple slots
+    /// under concurrent load. Not a strict perf assertion (the
+    /// underlying `git cat-file` may finish faster than thread
+    /// scheduling can interleave); instead, fire N concurrent
+    /// `raw_fetch` calls and assert that **at least 2** distinct
+    /// slots got populated. With K=1 the strict equivalent assertion
+    /// would fail; with K=4 it should pass deterministically because
+    /// `BatchChildPool::acquire` advances its round-robin counter
+    /// on every call regardless of contention.
+    #[test]
+    fn pool_k4_dispatches_across_multiple_slots() {
+        let tmp =
+            std::env::temp_dir().join(format!("projgit-gitcli-pool-k4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        if Command::new("git")
+            .args(["init", "-q", "-b", "main", tmp.to_str().unwrap()])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIP: git CLI not available");
+            return;
+        }
+        let store = Arc::new(ObjectStore::open(tmp.join(".git")).unwrap());
+        let f = Arc::new(GitCliFetcher::open_with_pool_size(store.clone(), 4).unwrap());
+        assert_eq!(f.batch.slots.len(), 4);
+
+        let bogus = ObjectId::from_hex(b"0000000000000000000000000000000000000001").unwrap();
+
+        // Fan out 8 calls across 8 threads; each call advances
+        // BatchChildPool.next, so multiple slots should end up
+        // spawned. The round-robin counter is the deterministic
+        // mechanism — we don't need real parallel cat-file dispatch
+        // to make the assertion hold.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let f2 = f.clone();
+            handles.push(std::thread::spawn(move || {
+                let _ = f2.raw_fetch(bogus);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let spawned: usize = (0..f.batch.slots.len())
+            .filter(|&i| f.batch.slots[i].lock().unwrap().is_some())
+            .count();
+        assert!(
+            spawned >= 2,
+            "K=4 pool should populate at least 2 distinct slots under 8-way concurrent load; got {spawned}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
