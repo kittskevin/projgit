@@ -75,6 +75,33 @@ enum Scenario {
     /// architectural property under measurement and the shared
     /// CAS is the disk-bytes property under measurement.
     SparseShared,
+    /// Worktree comparator: replaces sparse-shared's strawman
+    /// (N independent partial clones) with the steelman a
+    /// competent operator would actually reach for — one
+    /// `git clone` + N `git worktree add`. Two orthogonal axes
+    /// vary via `--worktree-strategy` and `--worktree-mode`.
+    /// See `docs/design/worktree-comparator-bench.md`.
+    WorktreeShared,
+}
+
+/// Clone strategy for the `worktree-shared` scenario. `Full`
+/// downloads everything (history + working tree); `Depth1`
+/// downloads only the target ref's snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeStrategy {
+    Full,
+    Depth1,
+}
+
+/// Pre-staging mode for the `worktree-shared` scenario.
+/// `PreStage` runs all N `git worktree add` calls in setup
+/// (operator pre-provisions a worktree pool); `OnDemand` runs
+/// each thread's `worktree add` inside the measurement window
+/// (agents create worktrees as they arrive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeMode {
+    PreStage,
+    OnDemand,
 }
 
 impl Scenario {
@@ -86,10 +113,17 @@ impl Scenario {
         matches!(self, Scenario::SparseSingle | Scenario::SparseShared)
     }
 
+    fn is_worktree(self) -> bool {
+        matches!(self, Scenario::WorktreeShared)
+    }
+
     fn uses_concurrency(self) -> bool {
         matches!(
             self,
-            Scenario::DaemonConcurrent | Scenario::NaiveConcurrent | Scenario::SparseShared
+            Scenario::DaemonConcurrent
+                | Scenario::NaiveConcurrent
+                | Scenario::SparseShared
+                | Scenario::WorktreeShared
         )
     }
 }
@@ -105,6 +139,12 @@ struct Args {
     /// `naive-concurrent` scenarios. Ignored by `single` /
     /// `sequential`. Default `DEFAULT_CONCURRENCY`.
     concurrency: usize,
+    /// Clone strategy for `worktree-shared`. Default `Depth1`.
+    /// Ignored by other scenarios.
+    worktree_strategy: WorktreeStrategy,
+    /// Pre-staging mode for `worktree-shared`. Default `PreStage`.
+    /// Ignored by other scenarios.
+    worktree_mode: WorktreeMode,
 }
 
 fn parse_args() -> Args {
@@ -113,6 +153,8 @@ fn parse_args() -> Args {
     let mut files: Vec<String> = DEFAULT_FILES.iter().map(|s| (*s).to_owned()).collect();
     let mut iterations = DEFAULT_ITERATIONS;
     let mut scenario = Scenario::Single;
+    let mut worktree_strategy = WorktreeStrategy::Depth1;
+    let mut worktree_mode = WorktreeMode::PreStage;
     let mut concurrency = DEFAULT_CONCURRENCY;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -151,9 +193,36 @@ fn parse_args() -> Args {
                     "naive-concurrent" => Scenario::NaiveConcurrent,
                     "sparse-single" => Scenario::SparseSingle,
                     "sparse-shared" => Scenario::SparseShared,
+                    "worktree-shared" => Scenario::WorktreeShared,
                     other => {
                         eprintln!(
-                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single, sparse-shared)"
+                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single, sparse-shared, worktree-shared)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+            }
+            "--worktree-strategy" => {
+                let v = it.next().expect("--worktree-strategy needs a value");
+                worktree_strategy = match v.as_str() {
+                    "full" => WorktreeStrategy::Full,
+                    "depth1" => WorktreeStrategy::Depth1,
+                    other => {
+                        eprintln!(
+                            "unknown --worktree-strategy: {other} (expected: full, depth1)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+            }
+            "--worktree-mode" => {
+                let v = it.next().expect("--worktree-mode needs a value");
+                worktree_mode = match v.as_str() {
+                    "pre-stage" => WorktreeMode::PreStage,
+                    "on-demand" => WorktreeMode::OnDemand,
+                    other => {
+                        eprintln!(
+                            "unknown --worktree-mode: {other} (expected: pre-stage, on-demand)"
                         );
                         std::process::exit(2);
                     }
@@ -172,7 +241,7 @@ fn parse_args() -> Args {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single|sparse-shared] [--concurrency N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent and sparse-shared scenarios)",
+                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single|sparse-shared|worktree-shared] [--concurrency N] [--worktree-strategy full|depth1] [--worktree-mode pre-stage|on-demand]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent, sparse-shared, worktree-shared scenarios)\n  default --worktree-strategy: depth1\n  default --worktree-mode: pre-stage (both only used by worktree-shared)",
                     DEFAULT_FILES.join(","),
                 );
                 std::process::exit(0);
@@ -190,6 +259,8 @@ fn parse_args() -> Args {
         iterations,
         scenario,
         concurrency,
+        worktree_strategy,
+        worktree_mode,
     }
 }
 
@@ -227,6 +298,8 @@ fn main() -> anyhow::Result<()> {
         run_concurrent_main(&args)
     } else if args.scenario.is_sparse() {
         run_sparse_main(&args)
+    } else if args.scenario.is_worktree() {
+        run_worktree_main(&args)
     } else {
         run_paired_main(&args)
     }
@@ -271,7 +344,8 @@ fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
             Scenario::Single
             | Scenario::Sequential
             | Scenario::SparseSingle
-            | Scenario::SparseShared => unreachable!(),
+            | Scenario::SparseShared
+            | Scenario::WorktreeShared => unreachable!(),
         };
         eprintln!(
             "ok (setup {} ms, wall {} ms, fail {})",
@@ -421,7 +495,8 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
         Scenario::DaemonConcurrent
         | Scenario::NaiveConcurrent
         | Scenario::SparseSingle
-        | Scenario::SparseShared => {
+        | Scenario::SparseShared
+        | Scenario::WorktreeShared => {
             unreachable!("*-concurrent and sparse-* dispatch via their own run_*_main")
         }
     };
@@ -1840,6 +1915,262 @@ fn print_sparse_shared_report(args: &Args, samples: &[SparseSharedSample]) {
     println!();
     println!(
         "Ratios (partial-cat-independent / projgit-shared): wall {wall_ratio:.2}x, disk {disk_ratio:.2}x"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Worktree comparator: one shared clone + N `git worktree add`
+// -----------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_worktree_main(args: &Args) -> anyhow::Result<()> {
+    let mut samples: Vec<SparseSharedConfig> = Vec::with_capacity(args.iterations);
+    for i in 1..=args.iterations {
+        eprintln!(
+            "== iteration {i}/{} (N={}, strategy={:?}, mode={:?}) ==",
+            args.iterations, args.concurrency, args.worktree_strategy, args.worktree_mode
+        );
+        eprint!("  worktree-shared...  ");
+        let s = bench_worktree_shared(args)?;
+        eprintln!(
+            "ok (setup {} ms, wall {} ms, disk {} KiB, fail {})",
+            ms(s.setup),
+            ms(s.wall_clock),
+            s.disk_bytes / 1024,
+            s.failures,
+        );
+        samples.push(s);
+    }
+    eprintln!();
+    print_worktree_shared_report(args, &samples);
+    Ok(())
+}
+
+/// Worktree comparator: one shared clone (full or `--depth=1`) plus
+/// N `git worktree add` invocations, run either in setup
+/// (`pre-stage` mode) or per-thread inside the measurement window
+/// (`on-demand` mode). Per-thread script is the same `ls` + read
+/// `args.files` pattern used by `sparse-shared`, so cells compose
+/// directly with the existing sparse-access bench numbers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bench_worktree_shared(args: &Args) -> anyhow::Result<SparseSharedConfig> {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let n = args.concurrency;
+    let strategy = args.worktree_strategy;
+    let mode = args.worktree_mode;
+
+    // --- setup window ---------------------------------------------------------
+    let setup_start = Instant::now();
+
+    let shared_clone = make_temp("projgit-bench-wt-shared");
+    let _shared_guard = DirGuard(shared_clone.clone());
+    // `make_temp` created the dir; remove so `git clone` has a clean target.
+    let _ = std::fs::remove_dir_all(&shared_clone);
+
+    // One clone, paid in setup regardless of mode (this is the
+    // "operator pre-fetches the repo metadata before any agent
+    // arrives" assumption — the cost we're amortising).
+    let clone_args: Vec<&str> = match strategy {
+        WorktreeStrategy::Full => vec![
+            "clone",
+            "--branch",
+            args.ref_name.as_str(),
+            args.url.as_str(),
+            shared_clone.to_str().expect("utf-8 tmp path"),
+        ],
+        WorktreeStrategy::Depth1 => vec![
+            "clone",
+            "--depth=1",
+            "--branch",
+            args.ref_name.as_str(),
+            args.url.as_str(),
+            shared_clone.to_str().expect("utf-8 tmp path"),
+        ],
+    };
+    run_git(None, &clone_args)?;
+
+    // Pre-compute worktree dir paths so both modes can refer to
+    // them the same way.
+    let worktree_dirs: Vec<PathBuf> = (0..n)
+        .map(|_| make_temp("projgit-bench-wt-add"))
+        .collect();
+    let _wt_guards: Vec<DirGuard> = worktree_dirs.iter().cloned().map(DirGuard).collect();
+    // `make_temp` created each; remove so `worktree add` has a clean target.
+    for d in &worktree_dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    if mode == WorktreeMode::PreStage {
+        // Operator pre-stages all N worktrees in setup. Sequential
+        // (not parallel) because pre-staging models a startup-time
+        // provisioning loop, not a parallel surge.
+        for wt in &worktree_dirs {
+            run_git(
+                Some(&shared_clone),
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    wt.to_str().expect("utf-8 tmp path"),
+                    &args.ref_name,
+                ],
+            )?;
+        }
+    }
+
+    let setup = setup_start.elapsed();
+
+    // --- measurement window ---------------------------------------------------
+    let barrier = Arc::new(Barrier::new(n + 1));
+    let (tx, rx) = mpsc::channel::<Result<Duration, String>>();
+    let mut handles = Vec::with_capacity(n);
+
+    for (tid, wt) in worktree_dirs.iter().enumerate() {
+        let barrier = barrier.clone();
+        let tx = tx.clone();
+        let shared_clone = shared_clone.clone();
+        let ref_name = args.ref_name.clone();
+        let files = args.files.clone();
+        let wt = wt.clone();
+
+        let handle = thread::Builder::new()
+            .name(format!("wt-{tid}"))
+            .spawn(move || {
+                barrier.wait();
+                let t0 = Instant::now();
+                let result = (|| -> anyhow::Result<()> {
+                    if mode == WorktreeMode::OnDemand {
+                        // Each agent creates its own worktree
+                        // inside the measurement window.
+                        run_git(
+                            Some(&shared_clone),
+                            &[
+                                "worktree",
+                                "add",
+                                "--detach",
+                                wt.to_str().expect("utf-8 tmp path"),
+                                &ref_name,
+                            ],
+                        )?;
+                    }
+                    // Script: `ls` worktree root + read each file.
+                    let _ = read_dir_names(&wt)?;
+                    for f in &files {
+                        let _ = std::fs::read_to_string(wt.join(f))?;
+                    }
+                    Ok(())
+                })();
+                let elapsed = t0.elapsed();
+                let _ = tx.send(result.map(|_| elapsed).map_err(|e| e.to_string()));
+            })?;
+        handles.push(handle);
+    }
+    drop(tx);
+
+    barrier.wait();
+    let measurement_start = Instant::now();
+
+    let mut per_thread = Vec::with_capacity(n);
+    let mut failures = 0usize;
+    for r in rx {
+        match r {
+            Ok(d) => per_thread.push(d),
+            Err(e) => {
+                failures += 1;
+                eprintln!("    thread failure: {e}");
+            }
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let wall_clock = measurement_start.elapsed();
+
+    // Total bytes on disk: shared clone (which contains .git +
+    // its working tree) + all N worktree dirs. The shared clone
+    // and the worktree dirs are siblings (we put worktrees in
+    // their own temp dirs), so summing them is the right
+    // accounting.
+    let mut disk_bytes = disk_bytes_of(&shared_clone)?;
+    for wt in &worktree_dirs {
+        if let Ok(b) = disk_bytes_of(wt) {
+            disk_bytes += b;
+        }
+    }
+
+    Ok(SparseSharedConfig {
+        setup,
+        wall_clock,
+        per_thread,
+        disk_bytes,
+        failures,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn print_worktree_shared_report(args: &Args, samples: &[SparseSharedConfig]) {
+    let med_axis = |xs: &[u128]| -> u128 {
+        let mut v: Vec<u128> = xs.to_vec();
+        v.sort();
+        v[v.len() / 2]
+    };
+    let med_dur = |pick: fn(&SparseSharedConfig) -> Duration| {
+        let xs: Vec<u128> = samples.iter().map(|s| pick(s).as_micros()).collect();
+        Duration::from_micros(med_axis(&xs) as u64)
+    };
+    let med_bytes = |pick: fn(&SparseSharedConfig) -> u64| -> u64 {
+        let xs: Vec<u128> = samples.iter().map(|s| pick(s) as u128).collect();
+        med_axis(&xs) as u64
+    };
+
+    let setup = med_dur(|s| s.setup);
+    let wall = med_dur(|s| s.wall_clock);
+    let disk = med_bytes(|s| s.disk_bytes);
+    let fail: usize = samples.iter().map(|s| s.failures).sum();
+    let per_thread_all: Vec<Duration> = samples
+        .iter()
+        .flat_map(|s| s.per_thread.clone())
+        .collect();
+    let p50 = if per_thread_all.is_empty() {
+        Duration::ZERO
+    } else {
+        let mut v: Vec<u128> = per_thread_all.iter().map(|d| d.as_micros()).collect();
+        v.sort();
+        Duration::from_micros(v[v.len() / 2] as u64)
+    };
+    let total = setup + wall;
+
+    println!("# bench_mount: {} @ {}\n", args.url, args.ref_name);
+    println!(
+        "Worktree comparator. Median of {} iterations, N={}, strategy={:?}, mode={:?}. Times in ms; disk in KiB.\n",
+        args.iterations, args.concurrency, args.worktree_strategy, args.worktree_mode
+    );
+    println!(
+        "Script (per agent): `ls` worktree root + read {} file(s): {:?}\n",
+        args.files.len(),
+        args.files
+    );
+    println!("| Config | setup | wall clock | per-thread p50 | disk total | total (setup+wall) | failures |");
+    println!("|---|---:|---:|---:|---:|---:|---:|");
+    println!(
+        "| `worktree-{}` {} | {} | {} | {} | {} | {} | {} |",
+        match args.worktree_strategy {
+            WorktreeStrategy::Full => "full",
+            WorktreeStrategy::Depth1 => "depth1",
+        },
+        match args.worktree_mode {
+            WorktreeMode::PreStage => "pre-stage",
+            WorktreeMode::OnDemand => "on-demand",
+        },
+        ms(setup),
+        ms(wall),
+        ms(p50),
+        disk / 1024,
+        ms(total),
+        fail,
     );
 }
 
