@@ -8,17 +8,20 @@
 > code.
 >
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-06-02, after the sparse-access bench ran
-> (multi-agent shared-CAS pitch empirically validated on
-> `rust-lang/cargo`: at N=10, projgit-shared wins 1.59× on wall
-> clock and ~10× on disk vs N independent partial clones; the
-> daemon's load-bearing value is amortising per-agent clone
-> setup, not coalescing per-agent fetches — see
-> [`../bench/baseline.md`](../bench/baseline.md) §sparse-access).
-> Earlier in the same session: Phase C concurrent bench ran,
-> `projgitd` Stage 3 shipped (sidecar holds the FUSE fd; daemon
-> is pure data plane), the dotgit A2 ref-visibility rung landed,
-> and Stage 4 was indefinitely deferred per its design-doc stop
+> Last updated: 2026-06-04, after the worktree-comparator bench
+> ran and substantially reframed the pitch. Headline: against
+> the steelman (`worktree-depth1 on-demand`), `projgit-shared`
+> *loses* wall clock by 3.77× at N=10 on cargo, and **did not
+> complete in 36 minutes** on `rust-lang/rust`. Disk pitch
+> (~8–11× win on cargo, ~6× predicted on rust) is the only
+> robust structural win across scales. The earlier sparse-access
+> '1.59× wall' claim was vs a strawman comparator. The current
+> #1 priority is investigating why projgit's data plane stalls
+> at big-history repos — see [`../bench/baseline.md`](../bench/baseline.md) §worktree-comparator.
+> Prior in the same multi-day session: sparse-access bench ran
+> 2026-06-02, Phase C concurrent bench ran 2026-06-02, `projgitd`
+> Stage 3 shipped, the dotgit A2 ref-visibility rung landed, and
+> Stage 4 was indefinitely deferred per its design-doc stop
 > condition.
 
 If you're resuming work on this project after a break (or you're a fresh
@@ -503,6 +506,69 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   agents sharing one clone" not "100 agents fetching through one
   coalescer". Four commits (Stage 1 sparse-single, Stage 2
   sparse-shared, Stage 3 capture, this handoff update).
+  > **Update 2026-06-04:** finding (a) was vs a strawman
+  > comparator. The worktree-comparator bench (next bullet)
+  > replaced N independent partial clones with N `git worktree
+  > add` and the wall-clock pitch flipped — projgit-shared
+  > loses to `worktree-depth1 on-demand` by 3.77× at the same
+  > N=10 cell. Disk pitch (~8×) still holds. Finding (c)'s
+  > 'shared CAS amortisation wins' framing also needs updating:
+  > it wins vs the strawman, not the steelman.
+- **Worktree-comparator bench (2026-06-04).** New
+  `worktree-shared` scenario on `bench_mount.rs` with two
+  orthogonal flags (`--worktree-strategy {full|depth1}` and
+  `--worktree-mode {pre-stage|on-demand}`) covering the four-way
+  matrix of the steelman comparator a competent operator would
+  reach for: one shared `git clone` + N `git worktree add`
+  agents. Captured full matrix on `rust-lang/cargo` (median of
+  3) plus a 4-cell follow-up on `rust-lang/rust` (1 iter each)
+  to probe scaling. Full table + writeup in
+  [`../bench/baseline.md`](../bench/baseline.md) §worktree-comparator;
+  design in [`../design/worktree-comparator-bench.md`](../design/worktree-comparator-bench.md);
+  plan in [`worktree-comparator-plan.md`](worktree-comparator-plan.md).
+  **Four findings, in order of importance for the project:**
+  (a) **the wall-clock pitch is broken at every scale measured.**
+  On cargo at N=10, `projgit-shared` (~11.3 s) loses to
+  `worktree-depth1 on-demand` (~3.0 s) by **3.77×**. The
+  sparse-access '1.59× win' claim was vs N independent partial
+  clones (a strawman); against the comparator any competent
+  operator would deploy, projgit-shared loses.
+  (b) **the disk pitch is the only robust structural win.** ~8×
+  at cargo N=10; would have been ~6× at rust if the bench had
+  completed. Holds across worktree strategies and modes because
+  every worktree variant materialises N working trees while
+  projgit holds metadata + only the touched blobs.
+  (c) **projgit's data plane did not complete on `rust-lang/rust`.**
+  The N=4 `projgit-shared` cell on `rust-lang/rust` ran for 36
+  minutes without completing and was killed. At kill time the
+  daemon's CAS had ~33 pack files (~417 MB of metadata +
+  lazy-fetched blobs). Single isolated `cat-file --batch-check`
+  promisor fetches outside the bench take ~0.45 s on the same
+  repo, so per-blob promisor cost is **not** the bottleneck —
+  the slowness lives in projgit's data-plane orchestration
+  under load (likely the per-mount prefetch worker × N sidecars
+  × batched cat-file calls all serializing through one
+  `Mutex<BatchChild>`, but the precise cause wasn't isolated
+  this session). **This is the most important finding for
+  projgit's roadmap** and reshapes the next-up queue.
+  (d) **`on-demand` beats `pre-stage` for worktrees at every
+  cell.** Pre-stage's sequential `worktree add` loop scales
+  linearly with N (cargo N=10: pre-stage 8.9 s vs on-demand
+  3.0 s; rust N=10: 59.4 s vs 20.5 s). The 'operator
+  pre-provisions a worktree pool' deployment shape is
+  uniformly slower than letting agents spawn worktrees in
+  parallel.
+
+  **Pitch reframing the worktree-comparator forces:** projgit's
+  load-bearing claim against worktrees is now disk efficiency
+  (~6–11×) plus containerization-cleanness (worktrees need
+  two bind-mounts per container; per-worktree state lives in
+  the shared `.git`; cross-tenant `.git` writeability is a real
+  hole — see [`../design/container-deployment.md`](../design/container-deployment.md) §6).
+  The wall-clock pitch is gone at measured scales until the
+  data-plane finding (c) is investigated and fixed. Four
+  commits (Stage 0 design+plan, Stage 1 implementation, Stage
+  2 capture, this handoff update).
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
@@ -785,27 +851,66 @@ decision points live in
 [`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
 the working doc that gets updated as each stage lands.
 
-1. **`projgitd` Stage 5 — production polish.** systemd unit,
+1. **Data-plane investigation: why doesn't `projgit-shared`
+   complete on `rust-lang/rust`?** The new top item, in response
+   to the worktree-comparator bench finding (c). The N=4
+   `sparse-shared` cell on `rust-lang/rust` didn't complete in
+   36 minutes of wall time. Single-shot per-blob promisor fetch
+   outside the bench takes ~0.45 s on the same repo — per-blob
+   cost is *not* the bottleneck. The slowness is in projgit's
+   data-plane orchestration under load. Likely causes (in order
+   of probability):
+   1. Per-mount prefetch worker × N sidecars × batched
+      `cat-file --batch-check` fetches all serializing through
+      one `Mutex<BatchChild>` in the daemon — head-of-line
+      blocking under load.
+   2. Lookup-driven tree-walk on big repos triggers cascading
+      prefetches (each FUSE `lookup` reads its tree, posts that
+      dir's OIDs to the mount's prefetch worker, which queues
+      at the daemon).
+   3. Daemon-side cache or coalescer state growing unboundedly
+      under load. Less likely (cargo cell was clean) but worth
+      ruling out.
+   First step: instrument the daemon's request handler with
+   per-RPC timing + queue depth, run a minimal repro (N=2 or 3
+   on rust, single iteration), see where time actually goes.
+   Until this is understood and addressed, the projgit pitch
+   at big-repo scale is unsupported by measurement. **The
+   cat-file pool (deferred from Phase C) becomes a candidate
+   solution if cause (1) is confirmed**; until then it's still
+   speculation. This is the highest-leverage move for restoring
+   the wall-clock pitch.
+2. **`projgitd` Stage 5 — production polish.** systemd unit,
    PID file / restart policy, persistent daemon state for fast
    recovery (so daemon-restart doesn't re-resolve refs), health
    checks, `tracing-subscriber` wiring for the existing `-v` flag,
-   structured logging. Now the leading next-up item: with the
-   sparse-access bench validating the multi-agent pitch, hardening
-   the daemon for real deployment is the highest-leverage move.
-2. **B3: CI bench job.** README + bench doc claim the bench
+   structured logging. Demoted from #1: polishing a daemon that
+   doesn't scale to big repos is the wrong order. But still
+   high-leverage once #1 lands (the persistent-state work in
+   particular protects the daemon's only-robust pitch axis —
+   disk-amortisation across batches).
+3. **Pitch language updates downstream of the worktree-comparator
+   finding.** README and top-level project description still
+   imply a wall-clock pitch. Update to lead with disk + container-
+   ization, explicitly acknowledge the wall-clock loss at every
+   measured scale, and link to #1 as the path back to parity.
+   Wait until after #1 ships — the answer to #1 may restore
+   some of the pitch language.
+4. **B3: CI bench job.** README + bench doc claim the bench
    protects against regression; CI runs only fmt/clippy/test.
    Add a perf job to `.github/workflows/ci.yml` that runs the
-   bench and compares to the checked-in baseline. Now genuinely
-   ready since the bench shape is more complete (the
-   sparse-access scenarios should be in the CI matrix from day
-   one, not just the existing single/sequential).
-3. **Phase 3d. Production `projgit-winfsp`** on top of the
+   bench and compares to the checked-in baseline. The bench
+   suite is now complete (single + sequential + Phase C + sparse-
+   access + worktree-comparator) so this protects a meaningful
+   surface. Worth doing alongside #1 to lock in whatever the
+   data-plane investigation produces.
+5. **Phase 3d. Production `projgit-winfsp`** on top of the
    `FspService*` lifecycle. Consume `ProjectionFsProvider`
    directly, exactly like Phase 4's CLI does on Linux. The
    riskiest remaining piece. Best done in a fresh focused session
    on the Windows host; first decide whether the Linux-focused
    workload makes this worth the cost (C1 leans "no").
-4. **Container deployment recipe doc.** User-facing `docs/` page
+6. **Container deployment recipe doc.** User-facing `docs/` page
    covering `/etc/fuse.conf`, `bind-propagation`, a sample
    systemd unit, an example Docker invocation, **and the new
    sidecar deployment shape** (`projgitd` on the host or in a
@@ -815,28 +920,26 @@ the working doc that gets updated as each stage lands.
    and [`docs/design/projgitd.md`](../design/projgitd.md); this is
    the cookbook side. The [scripts/docker-smoke/](../../scripts/docker-smoke/)
    recipe shipped with Stage 3d is the runnable seed.
-5. **Bench follow-ups** (optional, conditional on Harbor's actual
-   workload). Three plausible extensions, only worth running if
-   the basic pitch needs more nuance:
-   - **Higher-N sparse-shared** (N=100, README's headline). At
-     N=10 projgit-shared already wins 1.59×/10×; at N=100 the
-     win should grow (more per-agent clones to amortise) but
-     could also expose new bottlenecks (in-thread daemon CPU,
-     file-descriptor limits). Bench accepts `--concurrency 100`.
-   - **Bigger / monorepo target.** `rust-lang/rust` or
-     `torvalds/linux` (multi-GB working tree, modest partial
-     clone). Where partial-clone disk savings would materialise
-     in single-agent runs too. Would generalise the
-     single-agent depth1-vs-partial-clone finding from cargo.
+7. **Bench follow-ups** (optional, conditional on #1 completing
+   or Harbor's workload characterisation suggesting they're
+   needed):
+   - **Higher-N worktree-comparator** (N=100, README's headline).
+     `worktree-depth1 on-demand` at N=10 scales flat (~20 s on
+     rust); at N=100 it would likely hit FS / FD limits and
+     projgit (post-#1) might regain wall-clock parity. Bench
+     accepts `--concurrency 100`.
+   - **Full-clone worktree on `rust-lang/rust`.** Predicted
+     5–10 minutes setup; would set the upper-bound "operator
+     was lazy" baseline at big-repo scale. Skipped this session
+     for time.
    - **Divergent-access** (Phase C2). Each agent reads a
      disjoint file slice. Tests the daemon's serialisation cost
-     (one cat-file child) at workloads where the coalescer
-     doesn't help. If projgit-shared still wins on disk but
-     loses badly on wall clock, the cat-file pool becomes a
-     real follow-up; otherwise the pool stays speculation.
+     at workloads where the coalescer doesn't help. If
+     projgit-shared still loses badly here, the cat-file pool
+     becomes a real follow-up; otherwise speculation.
    None of these are load-bearing for shipping projgit; do them
-   only if Harbor's deployment characterisation suggests the
-   default bench doesn't cover their case.
+   only if pitch claims need stronger backing in their specific
+   regime.
 
 **Items folded into the projgitd plan and removed from the
 standalone list:**
