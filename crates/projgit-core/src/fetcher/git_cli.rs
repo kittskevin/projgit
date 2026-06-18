@@ -56,6 +56,29 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
+
+/// Set `PROJGIT_CATFILE_TRACE=1` to make `GitCliFetcher` emit per-
+/// call timing on stderr. Each `raw_fetch` and `prefetch_headers`
+/// prints `cattrace: op=<raw_fetch|prefetch_headers> wait_us=<n>
+/// work_us=<n> [oid=<short>] [n_oids=<n>]`, where `wait_us` is the
+/// time spent acquiring a pool slot and `work_us` is the time
+/// spent inside `with_child` (spawn + cat-file round trip + git's
+/// own promisor fetch). Used to disambiguate "pool contention"
+/// from "git/network serialisation" when the daemon-level RPC
+/// trace shows long served-times that the pool size can't fix.
+///
+/// Off by default; reads the env var once per process via
+/// `OnceLock` to avoid the per-call getenv cost when disabled.
+fn cattrace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PROJGIT_CATFILE_TRACE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
 
 /// Errors produced while constructing a [`GitCliFetcher`].
 #[derive(Debug, thiserror::Error)]
@@ -409,18 +432,40 @@ impl GitCliFetcher {
     /// already local. Re-check `store.contains` after acquiring the
     /// slot and short-circuit on hit.
     fn raw_fetch(&self, oid: ObjectId) -> Result<(), FetcherError> {
+        let trace = cattrace_enabled();
         let mut last_io_err: Option<std::io::Error> = None;
         for _attempt in 0..2 {
+            let acquire_start = if trace { Some(Instant::now()) } else { None };
             let response = {
                 let mut slot = self.batch.acquire();
+                let work_start = if trace { Some(Instant::now()) } else { None };
                 // Double-checked: another caller (typically the
                 // prefetch worker on a different slot) may have
                 // made the OID local between our outer fast-path
                 // check and acquiring this slot.
                 if self.store.contains(oid) {
+                    if let (Some(t0), Some(t1)) = (acquire_start, work_start) {
+                        let wait_us = t1.duration_since(t0).as_micros();
+                        let short = oid.to_string();
+                        eprintln!(
+                            "cattrace: op=raw_fetch wait_us={wait_us} work_us=0 short_circuit=1 oid={}",
+                            &short[..short.len().min(8)],
+                        );
+                    }
                     return Ok(());
                 }
-                match slot.with_child(|child| child.query(oid)) {
+                let r = slot.with_child(|child| child.query(oid));
+                if let (Some(t0), Some(t1)) = (acquire_start, work_start) {
+                    let now = Instant::now();
+                    let wait_us = t1.duration_since(t0).as_micros();
+                    let work_us = now.duration_since(t1).as_micros();
+                    let short = oid.to_string();
+                    eprintln!(
+                        "cattrace: op=raw_fetch wait_us={wait_us} work_us={work_us} oid={}",
+                        &short[..short.len().min(8)],
+                    );
+                }
+                match r {
                     Err(spawn_err) => {
                         // Spawn failure surfaces as Backend (not
                         // Transport-retryable) — matches the
@@ -585,6 +630,7 @@ impl Fetcher for GitCliFetcher {
         }
 
         if !to_query.is_empty() {
+            let trace = cattrace_enabled();
             // Two attempts: respawn the child on broken pipe. Each
             // attempt acquires a fresh slot from the pool (so if
             // the first attempt failed on slot N and a different
@@ -594,8 +640,20 @@ impl Fetcher for GitCliFetcher {
             let mut last_io_err: Option<std::io::Error> = None;
             let mut batch_lines: Option<Vec<String>> = None;
             for _attempt in 0..2 {
+                let acquire_start = if trace { Some(Instant::now()) } else { None };
                 let mut slot = self.batch.acquire();
-                match slot.with_child(|child| child.query_batch(&to_query)) {
+                let work_start = if trace { Some(Instant::now()) } else { None };
+                let r = slot.with_child(|child| child.query_batch(&to_query));
+                if let (Some(t0), Some(t1)) = (acquire_start, work_start) {
+                    let now = Instant::now();
+                    let wait_us = t1.duration_since(t0).as_micros();
+                    let work_us = now.duration_since(t1).as_micros();
+                    eprintln!(
+                        "cattrace: op=prefetch_headers wait_us={wait_us} work_us={work_us} n_oids={}",
+                        to_query.len(),
+                    );
+                }
+                match r {
                     Err(spawn_err) => {
                         // Whole batch fails on spawn error. Don't
                         // burn the second attempt on a spawn

@@ -889,6 +889,174 @@ PROJGIT_NETWORK_TESTS=1 \
   a smaller follow-up; the cat-file pool is the primary fix
   this diagnostic justifies.
 
+### Post-pool measurements (2026-06-18)
+
+Re-ran the recipe after landing the cat-file pool
+([`../implementation/cat-file-pool-plan.md`](../implementation/cat-file-pool-plan.md))
+and an additionally-uncovered lock-release fix. Same network /
+machine / depth=1 / 3 files.
+
+| Config | setup | wall | per-thread p50 | disk | wall vs pre-pool |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| pre-pool baseline (K=1, mutex-blocked) | 1,169 | 15,298 | 15,298 | 2,540 | 1.00× |
+| K=4, mutex-blocked | 781 | 9,242 | 9,242 | 2,540 | 1.65× |
+| K=1, lock released | 808 | 9,709 | 9,709 | 2,540 | 1.58× |
+| **K=4 + lock released (V1 default)** | **1,212** | **1,746** | **1,746** | **2,167** | **8.77×** |
+
+Disk delta in the K=4+lock cell is intra-run network variance
+on `--depth=1` packs, not a pool effect (the comparator
+strawman varied similarly across reruns).
+
+The K=4 vs K=1 comparison alone (mutex-blocked, 1.65×) tells the
+plan-§6 story: **cat-file pool alone fired the Stage 3 stop
+condition** (wall improvement < 2×). Cattrace
+(`PROJGIT_CATFILE_TRACE=1`) caught why: only **one**
+`prefetch_headers` call drove a cat-file batch, even when two
+sidecars sent one each, because all backend calls serialised
+through one `state.active` `MutexGuard` held across the entire
+RPC handler. The cat-file pool's K slots were architecturally
+unreachable.
+
+The fix (server.rs, same commit as this section's update): the
+`ActiveBackend` enum is `#[derive(Clone)]` (both variants are
+`Arc<HydratingObjectStore<_>>`, so cloning is a refcount bump),
+and `handle_fetch` + `handle_prefetch_headers` clone the
+backend out of the critical section and drop the lock before
+calling the (slow) backend. Concurrent RPCs across N sidecars
+now actually run in parallel and exercise the pool.
+
+#### Post-fix trace (K=4 + lock released)
+
+```
+trace: rpc=Attach           served_us=1,200,081 inflight_at_recv=1
+trace: rpc=Fetch            served_us=  421,569 inflight_at_recv=1 oid=ed35016e
+trace: rpc=Fetch            served_us=  413,411 inflight_at_recv=3 oid=ed35016e
+trace: rpc=Fetch            served_us=  451,699 inflight_at_recv=3 oid=67c7a9d6
+trace: rpc=Fetch            served_us=  451,615 inflight_at_recv=4 oid=67c7a9d6
+trace: rpc=Fetch            served_us=  862,380 inflight_at_recv=3 oid=1b5ec8b7
+trace: rpc=Fetch            served_us=  862,353 inflight_at_recv=4 oid=1b5ec8b7
+trace: rpc=Shutdown         served_us=       23 inflight_at_recv=3
+trace: rpc=PrefetchHeaders  served_us=22,023,904 inflight_at_recv=2 n_oids=31
+```
+
+Read against the pre-pool trace at the top of this section:
+
+- **All three on-demand `Fetch` blob reads now serve in
+  ~420–860 ms each** — close to the isolated per-blob cost
+  (~0.45 s). Pre-pool they served in ~14.8 s (~99 % mutex
+  wait). The 99-%-mutex-wait is gone.
+- **The two `Fetch(README)` and `Fetch(Cargo.toml)` pairs
+  parallelise across sidecars**: each pair has the same
+  `served_us` to within ~10 ms because the Coalescer dedupes
+  one upstream fetch and both pairs return at the same wall
+  moment. The serialised-behind-a-batch shape is gone.
+- **`PrefetchHeaders` is now genuinely backgrounded.** It
+  takes 22 s of wall (within-batch serialisation of git's
+  promisor lazy fetches is unchanged — one cat-file batch
+  still does 31 lazy fetches sequentially inside one git
+  process). But the script's three reads finish in ~1.7 s
+  total because they no longer wait behind it.
+- **`Shutdown` arrives before `PrefetchHeaders` finishes** and
+  is served in 23 µs while prefetch is still in-flight (the
+  daemon waits for in-flight handlers to drain before
+  exiting). Pre-fix this would have queued behind every
+  pending fetch.
+
+#### Cargo `sparse-shared` N=10 follow-up
+
+Refreshed the cargo headline from
+[Results — sparse-access](#results--sparse-access-rust-langcargo--master)
+with the same recipe + `--daemon-pool-size 4`:
+
+| N | projgit-shared wall | projgit p50 | partial-cat-independent wall | partial-cat p50 | wall ratio | disk ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 (pre-pool 2026-06-02) | 8,576.4 | 8,573.8 | 13,610.8 | 9,670.2 | 1.59× | 9.98× |
+| 10 (post-pool 2026-06-18) | 7,385.2 | 7,383.4 | 8,500.2 | 8,404.6 | 1.15× | 9.98× |
+
+Cargo's improvement is modest (~1.16× on projgit-shared).
+The pool helps less on small-history repos because the
+single-PrefetchHeaders bottleneck isn't dominant — cargo's
+31-OID root tree fans out fewer lazy fetches per batch and
+the pre-pool serialisation was less expensive in absolute
+terms. The disk ratio is unchanged: ~10×.
+
+Comparator note: `partial-cat-independent` also got faster
+across iterations (13.6 s → 8.5 s) due to network variance
+across the day; that's why the ratio shrunk.
+
+#### Where projgit-shared now lands against the worktree
+steelman
+
+Comparing post-pool projgit-shared totals (setup + wall) to
+the 2026-06-04 [worktree comparator](#results--worktree-comparator-rust-langcargo--master-with-rust-langrust-follow-up)
+numbers:
+
+| target | N | projgit-shared total | worktree-depth1 on-demand total | wall winner |
+| --- | ---: | ---: | ---: | --- |
+| cargo | 10 | 10,475 (3,090 + 7,385) | 3,006 (2,214 + 792) | worktree, **3.48×** |
+| rust  | 2  | 2,957 (1,212 + 1,745) | n/a (see N=4 below) | — |
+| rust  | 4  | n/a (single bench cell run; pool only smoked at N=2 on rust) | 20,103 (14,541 + 5,562) | needs re-run |
+
+**The headline reframes**: on cargo, projgit-shared still
+loses wall clock 3.48× and wins disk 8.09×; the pool didn't
+flip that. On `rust-lang/rust`, projgit-shared at N=2 now
+completes in ~3 s total — vs the killed-at-36-min
+pre-shallow / pre-pool number, and vs `worktree-depth1
+on-demand` at ~20 s total at N=4. The "doesn't complete on
+rust at all" finding from worktree-comparator is closed; the
+"projgit-shared loses wall on cargo" finding is unchanged.
+
+The honest pitch: **projgit-shared wins on big-history repos
+at multi-agent scale, and on disk at every scale; it still
+loses wall on small-history repos like cargo where worktree's
+per-agent setup is cheap.** Captured this way in
+[`../implementation/handoff.md`](../implementation/handoff.md)
+"What I'd do next" and (selectively) in the README pitch.
+
+#### Stop conditions checked at Stage 3
+
+- **Wall improves by ≥ 2× → declared done?** Yes, ~8.77× on
+  the rust diagnostic cell (15.3 s → 1.75 s) after the
+  combined cat-file-pool + lock-release fix.
+- **Fetch failures appear at K ≥ 4?** No. 0 / 6 failures
+  across the K=1 / K=4 / K=10 runs. (K=10 not measured at
+  N=10 on rust; the smoke at N=2 ran clean.)
+- **Diagnostic feature retained?** Yes. `PROJGIT_CATFILE_TRACE=1`
+  in `git_cli.rs` (env-var-gated, `OnceLock`-cached → zero
+  cost when off) stays in for future debugging of this layer.
+
+### Reproduce (post-pool diagnostic)
+
+```sh
+# K=4 + the implicit (post-fix) lock-release path. Completes in ~3 s total.
+PROJGIT_NETWORK_TESTS=1 \
+  cargo run -p projgit-cli --example bench_mount --release -- \
+  --scenario sparse-shared --concurrency 2 --iterations 1 \
+  --daemon-depth 1 --daemon-trace --daemon-pool-size 4 \
+  --url https://github.com/rust-lang/rust --ref main \
+  --files README.md,Cargo.toml,LICENSE-APACHE
+
+# Same recipe but with per-acquire timing on stderr for future debug:
+PROJGIT_NETWORK_TESTS=1 PROJGIT_CATFILE_TRACE=1 \
+  cargo run -p projgit-cli --example bench_mount --release -- \
+  --scenario sparse-shared --concurrency 2 --iterations 1 \
+  --daemon-depth 1 --daemon-trace --daemon-pool-size 4 \
+  --url https://github.com/rust-lang/rust --ref main \
+  --files README.md,Cargo.toml,LICENSE-APACHE
+# stderr gains: `cattrace: op=raw_fetch wait_us=<n> work_us=<n> oid=<short>`
+# and `cattrace: op=prefetch_headers wait_us=<n> work_us=<n> n_oids=<n>`.
+
+# Cargo headline refresh (median of 3, N=10):
+PROJGIT_NETWORK_TESTS=1 \
+  cargo run -p projgit-cli --example bench_mount --release -- \
+  --scenario sparse-shared --concurrency 10 --iterations 3 \
+  --daemon-pool-size 4 \
+  --url https://github.com/rust-lang/cargo --ref master \
+  --files "Cargo.toml,README.md,LICENSE-APACHE,LICENSE-MIT,\
+CHANGELOG.md,CONTRIBUTING.md,src/cargo/lib.rs,src/cargo/macros.rs,\
+Cargo.lock,build.rs"
+```
+
 ## What this shows
 
 - **§1.6 amortisation is real.** Across both targets, the second

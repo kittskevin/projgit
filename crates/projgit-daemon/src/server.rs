@@ -159,6 +159,16 @@ struct ActiveRepo {
 /// Variant per concrete `Fetcher` type. `ProjectionFsProvider<F>` is
 /// generic over `F`, so we dispatch on the variant when building a
 /// provider instead of trying to type-erase Fetcher itself.
+///
+/// `Clone` is cheap: both variants wrap an `Arc`, so cloning bumps a
+/// refcount. Used by [`handle_fetch`] and [`handle_prefetch_headers`]
+/// to release `state.active` before calling the (slow) backend, so
+/// data-plane RPCs across N sidecars run concurrently instead of
+/// serialising through one mutex. (Pre-fix, cattrace measurement on
+/// 2026-06-04 caught the state.active mutex completely masking the
+/// cat-file pool: K children couldn't help when only one RPC could
+/// be inside `repo.backend.*` at a time.)
+#[derive(Clone)]
 enum ActiveBackend {
     Noop(Arc<HydratingObjectStore<NoopFetcher>>),
     GitCli(Arc<HydratingObjectStore<GitCliFetcher>>),
@@ -673,17 +683,25 @@ fn handle_fetch(state: &Arc<DaemonState>, oid_hex: String) -> Response {
         Ok(o) => o,
         Err(e) => return err(codes::BAD_OID, e),
     };
-    let active = match state.active.lock() {
-        Ok(g) => g,
-        Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+    // Clone the Arc-wrapped backend out of the critical section so
+    // the (slow) `fetch_one` call runs without holding state.active.
+    // Concurrent Fetch / PrefetchHeaders RPCs across N sidecars
+    // can then proceed in parallel and actually exercise the
+    // cat-file pool's K slots. See ActiveBackend's Clone derive.
+    let backend = {
+        let active = match state.active.lock() {
+            Ok(g) => g,
+            Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+        };
+        let Some(repo) = active.as_ref() else {
+            return err(
+                codes::NOT_ATTACHED,
+                "daemon has no active source yet; send Attach first",
+            );
+        };
+        repo.backend.clone()
     };
-    let Some(repo) = active.as_ref() else {
-        return err(
-            codes::NOT_ATTACHED,
-            "daemon has no active source yet; send Attach first",
-        );
-    };
-    match repo.backend.fetch_one(oid) {
+    match backend.fetch_one(oid) {
         Ok(()) => Response::Ok,
         Err(e) => err(codes::FETCH_FAILED, e),
     }
@@ -700,17 +718,24 @@ fn handle_prefetch_headers(state: &Arc<DaemonState>, oid_hexes: Vec<String>) -> 
             Err(e) => return err(codes::BAD_OID, e),
         }
     }
-    let active = match state.active.lock() {
-        Ok(g) => g,
-        Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+    // Same pattern as handle_fetch: clone backend out, drop the
+    // lock, then call. Without this, two sidecars firing concurrent
+    // PrefetchHeaders RPCs would serialise at state.active and the
+    // cat-file pool's K slots would sit idle.
+    let backend = {
+        let active = match state.active.lock() {
+            Ok(g) => g,
+            Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+        };
+        let Some(repo) = active.as_ref() else {
+            return err(
+                codes::NOT_ATTACHED,
+                "daemon has no active source yet; send Attach first",
+            );
+        };
+        repo.backend.clone()
     };
-    let Some(repo) = active.as_ref() else {
-        return err(
-            codes::NOT_ATTACHED,
-            "daemon has no active source yet; send Attach first",
-        );
-    };
-    let probes = repo.backend.prefetch_headers(&oids);
+    let probes = backend.prefetch_headers(&oids);
     Response::HeaderProbes {
         probes: probes.into_iter().map(probe_to_wire).collect(),
     }
