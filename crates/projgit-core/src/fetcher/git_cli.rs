@@ -676,6 +676,18 @@ impl Fetcher for GitCliFetcher {
             })
     }
 
+    /// Override: on the promisor partial-clone path, resolving an
+    /// object's header via `cat-file --batch-check` faults the
+    /// *full* object in (the promisor remote sends complete
+    /// objects), so a header batch *is* a bytes batch here. Reuse
+    /// the coalesced [`Self::prefetch_headers`] round trip rather
+    /// than N single-OID fetches. Best-effort like all prefetch: a
+    /// `Present` for an OID a peer is still fetching self-heals via
+    /// the on-demand `fetch_object` floor on the next read.
+    fn fetch_objects(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
+        self.prefetch_headers(oids)
+    }
+
     /// Batch-query the long-lived `git cat-file --batch-check`
     /// child for the headers of all `oids` in one round trip.
     ///

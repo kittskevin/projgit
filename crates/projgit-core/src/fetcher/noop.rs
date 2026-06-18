@@ -35,4 +35,16 @@ mod tests {
         let err = f.fetch_object(oid).unwrap_err();
         assert!(matches!(err, FetcherError::NotHydratable(o) if o == oid));
     }
+
+    #[test]
+    fn noop_fetch_objects_errors_per_oid_in_order() {
+        use crate::HeaderProbe;
+        let f = NoopFetcher::new();
+        let a = gix::ObjectId::null(gix::hash::Kind::Sha1);
+        let b = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let probes = f.fetch_objects(&[a, b]);
+        assert_eq!(probes.len(), 2);
+        assert!(matches!(&probes[0], HeaderProbe::Error(o, _) if *o == a));
+        assert!(matches!(&probes[1], HeaderProbe::Error(o, _) if *o == b));
+    }
 }

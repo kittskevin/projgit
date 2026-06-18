@@ -83,6 +83,32 @@ pub trait Fetcher: Send + Sync {
             })
             .collect()
     }
+
+    /// Make a batch of objects fully *resident* (bytes on disk) in
+    /// as few upstream round trips as the implementation can manage.
+    ///
+    /// Unlike [`Self::prefetch_headers`] -- which only guarantees
+    /// each present OID's *header* is decodable -- this guarantees
+    /// the object *bytes* are resident, so a subsequent
+    /// `read_blob` / `read_tree` is served locally without a further
+    /// upstream round trip. It backs the cache tier's bulk
+    /// blob-byte prefetch (Architecture B; see
+    /// `docs/design/cache-transform-tier.md` §6 and §15).
+    ///
+    /// Returns one [`HeaderProbe`] per input OID, in the same order:
+    /// `Present` / `PresentWithHeader` mean resident, `Error` means
+    /// the object could not be made resident. Per-OID errors do not
+    /// abort the batch. The default impl loops [`Self::fetch_object`];
+    /// implementations that can hydrate many objects in one round
+    /// trip (notably [`GitCliFetcher`]) override this.
+    fn fetch_objects(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
+        oids.iter()
+            .map(|oid| match self.fetch_object(*oid) {
+                Ok(()) => HeaderProbe::Present(*oid),
+                Err(e) => HeaderProbe::Error(*oid, e),
+            })
+            .collect()
+    }
 }
 
 /// One result from a [`Fetcher::prefetch_headers`] batch.
@@ -297,6 +323,34 @@ impl<F: Fetcher> HydratingObjectStore<F> {
         oids.iter()
             .map(|oid| by_oid.remove(oid).unwrap_or(HeaderProbe::Present(*oid)))
             .collect()
+    }
+
+    /// Make a batch of objects fully *resident* (bytes on disk) via
+    /// the fetcher, publishing any headers learned to the store's
+    /// header cache. Mirrors [`Self::prefetch_headers`] but
+    /// guarantees object *bytes*, not just headers (see
+    /// [`Fetcher::fetch_objects`]). Returns one [`HeaderProbe`] per
+    /// input OID, in order. Per-OID errors do not abort the batch;
+    /// the on-demand `read_blob` / `read_tree` path remains the
+    /// correctness floor for anything not landed here.
+    pub fn fetch_objects(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
+        if oids.is_empty() {
+            return Vec::new();
+        }
+        let probes = self.fetcher.fetch_objects(oids);
+        for probe in &probes {
+            match probe {
+                HeaderProbe::PresentWithHeader(oid, kind, size)
+                | HeaderProbe::HeaderOnly(oid, kind, size) => {
+                    self.store.put_header_cache(*oid, *kind, *size);
+                }
+                HeaderProbe::Present(oid) => {
+                    let _ = self.store.header(*oid);
+                }
+                HeaderProbe::Error(_, _) => {}
+            }
+        }
+        probes
     }
 }
 
