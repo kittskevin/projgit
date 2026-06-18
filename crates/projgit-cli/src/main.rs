@@ -364,6 +364,26 @@ fn init_logging(verbose: u8) {
 // `mount`
 // ---------------------------------------------------------------------------
 
+/// Spawn a background eager-tree warm of `projection`'s tree closure
+/// into the shared store, so the first `os.walk` over the mount is
+/// network-free without blocking the mount. Best-effort: anything not
+/// warmed self-heals on the on-demand path. Mirrors the daemon's
+/// `handle_mount` warm for the standalone and sidecar mount paths.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_tree_warm<F>(
+    hydrating: &std::sync::Arc<projgit_core::HydratingObjectStore<F>>,
+    projection: &projgit_core::Projection,
+) where
+    F: projgit_core::Fetcher + 'static,
+{
+    if let Ok(root_tree) = projection.root_tree(hydrating.store()) {
+        let h = std::sync::Arc::clone(hydrating);
+        std::thread::spawn(move || {
+            let _ = h.warm_tree_closure(root_tree);
+        });
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cmd_mount(args: MountArgs) -> Result<()> {
     #[cfg(feature = "gvfs-fetcher")]
@@ -470,6 +490,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
             bail!("--fetcher gvfs requires a URL source and cannot be combined with --offline");
         }
         let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
+        spawn_tree_warm(&hydrating, &projection);
         let provider = Arc::new(
             ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
                 .context("building ProjectionFsProvider")?,
@@ -481,6 +502,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
                 let fetcher = GitCliFetcher::open(store.clone())
                     .context("opening GitCliFetcher (needs `git` on PATH)")?;
                 let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                spawn_tree_warm(&hydrating, &projection);
                 let provider = Arc::new(
                     ProjectionFsProvider::new(
                         projection, hydrating, overlay, /* projection_id */ 1,
@@ -503,6 +525,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
                 }
                 .context("opening GvfsFetcher")?;
                 let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                spawn_tree_warm(&hydrating, &projection);
                 let provider = Arc::new(
                     ProjectionFsProvider::new(
                         projection, hydrating, overlay, /* projection_id */ 1,
@@ -585,6 +608,11 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
     //    never touch the socket.
     let fetcher = DaemonFetcher::new(socket.clone());
     let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
+
+    // Eager-tree warm in the background (sidecar path) so the first
+    // os.walk is network-free; tree-fetches route through the daemon
+    // via FetchMany. Mirrors the daemon's handle_mount warm.
+    spawn_tree_warm(&hydrating, &projection);
 
     let overlay = build_root_overlay(&args, &projection, &store, &git_dir)?;
     let mut cfg = MountConfig::default();
