@@ -156,6 +156,23 @@ impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
         self.prefetch.stats()
     }
 
+    /// Post a directory's file/symlink blob OIDs to the prefetch
+    /// worker: header warming always (for `stat`), plus blob-byte
+    /// warming when `PROJGIT_PREFETCH_BLOBS` is set (Architecture B).
+    /// Headers are posted first so the worker's size cap sees warm
+    /// sizes (the worker is single-threaded + FIFO).
+    fn post_prefetch(&self, oids: Vec<gix::ObjectId>) {
+        if oids.is_empty() {
+            return;
+        }
+        if crate::prefetch::blob_prefetch_enabled() {
+            self.prefetch.post_headers(oids.clone());
+            self.prefetch.post_blobs(oids);
+        } else {
+            self.prefetch.post_headers(oids);
+        }
+    }
+
     // -- internals --
 
     /// Recover the virtual path for a known inode. Returns `None` if
@@ -443,7 +460,7 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
                     kind,
                 });
             }
-            self.prefetch.post_headers(prefetch_oids);
+            self.post_prefetch(prefetch_oids);
             return Ok(out);
         }
 
@@ -480,7 +497,7 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
                         kind,
                     });
                 }
-                self.prefetch.post_headers(prefetch_oids);
+                self.post_prefetch(prefetch_oids);
                 Ok(out)
             }
             AttrSnapshot::SyntheticDir { children, path } => {

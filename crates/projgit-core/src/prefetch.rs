@@ -35,10 +35,11 @@
 //! join the thread.
 
 use crate::fetcher::{Fetcher, HeaderProbe, HydratingObjectStore};
+use crate::object_store::ObjectKind;
 use gix::ObjectId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 /// Maximum number of outstanding tasks the channel will hold.
@@ -54,6 +55,10 @@ const MAX_BATCH: usize = 64;
 /// will add more variants here without breaking T1.
 pub(crate) enum PrefetchTask {
     Headers(Vec<ObjectId>),
+    /// Bulk-warm blob *bytes* for a directory's files (Architecture
+    /// B). Gated by `PROJGIT_PREFETCH_BLOBS`; the worker applies a
+    /// size cap so only small files are speculatively hydrated.
+    Blobs(Vec<ObjectId>),
 }
 
 /// Counters surfaced via [`PrefetchHandle::stats`] and ultimately
@@ -75,6 +80,12 @@ pub struct PrefetchStats {
     pub headers_published: u64,
     /// OIDs that ended up in `HeaderProbe::Error`.
     pub oids_failed: u64,
+    /// Blob OIDs whose bytes were warmed via bulk fetch (Architecture
+    /// B blob prefetch).
+    pub blobs_warmed: u64,
+    /// Blob OIDs skipped by the prefetch size cap (too large, or size
+    /// unknown, to speculatively hydrate).
+    pub blobs_skipped: u64,
 }
 
 #[derive(Default)]
@@ -85,6 +96,8 @@ struct AtomicStats {
     oids_resolved: AtomicU64,
     headers_published: AtomicU64,
     oids_failed: AtomicU64,
+    blobs_warmed: AtomicU64,
+    blobs_skipped: AtomicU64,
 }
 
 impl AtomicStats {
@@ -96,6 +109,8 @@ impl AtomicStats {
             oids_resolved: self.oids_resolved.load(Ordering::Relaxed),
             headers_published: self.headers_published.load(Ordering::Relaxed),
             oids_failed: self.oids_failed.load(Ordering::Relaxed),
+            blobs_warmed: self.blobs_warmed.load(Ordering::Relaxed),
+            blobs_skipped: self.blobs_skipped.load(Ordering::Relaxed),
         }
     }
 }
@@ -144,6 +159,28 @@ impl PrefetchHandle {
             return;
         };
         match tx.try_send(PrefetchTask::Headers(oids)) {
+            Ok(()) => {
+                self.stats.posted.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Post a batch of blob OIDs for byte-warming (Architecture B).
+    /// Non-blocking; drops on a full channel. Only meaningful when
+    /// [`blob_prefetch_enabled`]; callers gate before posting. Post
+    /// **after** the matching `post_headers` so the worker's size cap
+    /// sees warm sizes (the worker is single-threaded + FIFO).
+    pub(crate) fn post_blobs(&self, oids: Vec<ObjectId>) {
+        if oids.is_empty() {
+            return;
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        match tx.try_send(PrefetchTask::Blobs(oids)) {
             Ok(()) => {
                 self.stats.posted.fetch_add(1, Ordering::Relaxed);
             }
@@ -202,9 +239,73 @@ fn worker_loop<F: Fetcher + 'static>(
                     }
                 }
             }
+            PrefetchTask::Blobs(oids) => {
+                let cap = blob_size_cap_bytes();
+                for chunk in oids.chunks(MAX_BATCH) {
+                    let (keep, skipped) = blobs_under_cap(&store, chunk, cap);
+                    stats.blobs_skipped.fetch_add(skipped, Ordering::Relaxed);
+                    if keep.is_empty() {
+                        continue;
+                    }
+                    let probes = store.fetch_objects(&keep);
+                    stats.batches_sent.fetch_add(1, Ordering::Relaxed);
+                    let warmed = probes
+                        .iter()
+                        .filter(|p| !matches!(p, HeaderProbe::Error(_, _)))
+                        .count();
+                    stats.blobs_warmed.fetch_add(warmed as u64, Ordering::Relaxed);
+                }
+            }
         }
     }
     // Sender dropped; exit cleanly.
+}
+
+/// Blob OIDs whose known size is within `cap`. Consults the (warm)
+/// header cache via `ObjectStore::header`; the FIFO worker processes
+/// a directory's `Headers` task before its `Blobs` task, so sizes are
+/// cached by the time this runs. Blobs with unknown size or over the
+/// cap are skipped (counted in the returned total) and left to the
+/// on-demand path.
+fn blobs_under_cap<F: Fetcher>(
+    store: &HydratingObjectStore<F>,
+    oids: &[ObjectId],
+    cap: u64,
+) -> (Vec<ObjectId>, u64) {
+    let mut keep = Vec::with_capacity(oids.len());
+    let mut skipped = 0u64;
+    for &oid in oids {
+        match store.store().header(oid) {
+            Ok((ObjectKind::Blob, size)) if size <= cap => keep.push(oid),
+            _ => skipped += 1,
+        }
+    }
+    (keep, skipped)
+}
+
+/// Whether Architecture-B blob prefetch is enabled. Off by default;
+/// set `PROJGIT_PREFETCH_BLOBS=1` to warm a directory's small-file
+/// blob bytes on `readdir`. Read once per process.
+pub(crate) fn blob_prefetch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PROJGIT_PREFETCH_BLOBS")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+/// Size cap (bytes) for blob prefetch; blobs larger than this are not
+/// speculatively hydrated. Default 1 MiB; override with
+/// `PROJGIT_PREFETCH_BLOB_CAP_BYTES`. Read once per process.
+fn blob_size_cap_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("PROJGIT_PREFETCH_BLOB_CAP_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024 * 1024)
+    })
 }
 
 #[cfg(test)]
@@ -243,6 +344,71 @@ mod tests {
         assert_eq!(s.dropped, 0);
 
         drop(handle);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn blobs_under_cap_filters_large() {
+        let tmp =
+            std::env::temp_dir().join(format!("projgit-prefetch-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        if std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", tmp.to_str().unwrap()])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIP: git CLI not available");
+            return;
+        }
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&tmp)
+                .args(args)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["config", "user.email", "t@e.invalid"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(tmp.join("small.txt"), b"hi\n").unwrap();
+        std::fs::write(tmp.join("big.bin"), vec![0u8; 100_000]).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "x"]);
+        let head_hex = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&tmp)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let head = gix::ObjectId::from_hex(head_hex.trim().as_bytes()).unwrap();
+
+        let store = Arc::new(ObjectStore::open(tmp.join(".git")).unwrap());
+        let root = store.commit_tree(head).unwrap();
+        let entries = store.read_tree(root).unwrap();
+        let oid_of = |n: &str| {
+            entries
+                .iter()
+                .find(|e| String::from_utf8_lossy(&e.name) == n)
+                .unwrap()
+                .oid
+        };
+        let small = oid_of("small.txt");
+        let big = oid_of("big.bin");
+
+        let hydrating = HydratingObjectStore::new(store, NoopFetcher);
+        let (keep, skipped) = blobs_under_cap(&hydrating, &[small, big], 50_000);
+        assert_eq!(keep, vec![small], "only the small blob is within the cap");
+        assert_eq!(skipped, 1, "the 100KB blob is skipped");
+
+        drop(hydrating);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
