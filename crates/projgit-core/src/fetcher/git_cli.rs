@@ -340,6 +340,80 @@ impl<'a> PoolGuard<'a> {
     }
 }
 
+/// Non-blocking single-flight for in-flight `prefetch_headers`
+/// batches. See [`docs/design/prefetch-coalescing.md`].
+///
+/// When N sidecars mount the same commit and each does the same
+/// first `ls`, every sidecar's prefetch worker posts the same
+/// root-tree OID batch through the *shared* daemon `GitCliFetcher`.
+/// Without coordination each batch independently lazy-fetches the
+/// same objects (N× upstream work). This set lets a caller **claim**
+/// the OIDs it's about to fetch; a concurrent caller for an
+/// already-claimed OID **skips** it (best-effort: the claim owner
+/// warms the shared CAS, and prefetch is only a cache-warming hint —
+/// the on-demand `lookup` path remains the source of truth).
+///
+/// Deliberately separate from the per-OID `fetch_object`
+/// [`Coalescer`]: an on-demand `Fetch` must **never** block on an
+/// in-flight prefetch batch (that would re-introduce the
+/// head-of-line stall the 2026-06-18 cat-file-pool work removed).
+/// Prefetch peers *skip*, they don't *wait*; on-demand reads never
+/// consult this set at all.
+#[derive(Default)]
+struct PrefetchClaims {
+    inflight: Mutex<std::collections::HashSet<ObjectId>>,
+}
+
+impl PrefetchClaims {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim every newly-seen OID in `candidates`; return the subset
+    /// this caller now owns (the *lead* set). OIDs already claimed by
+    /// a concurrent caller are omitted (the caller should *skip*
+    /// them, not fetch them). The returned [`ClaimGuard`] releases
+    /// exactly the lead OIDs on drop — including on panic, so a
+    /// failed batch can't leak claims and wedge future prefetches.
+    fn claim(&self, candidates: &[ObjectId]) -> ClaimGuard<'_> {
+        let mut set = self.inflight.lock().unwrap();
+        let mut lead = Vec::new();
+        for &oid in candidates {
+            if set.insert(oid) {
+                lead.push(oid);
+            }
+        }
+        ClaimGuard { owner: self, lead }
+    }
+}
+
+/// RAII release for the OIDs a [`PrefetchClaims::claim`] call won.
+/// Holds the lead set; dropping it removes exactly those OIDs from
+/// the in-flight set.
+struct ClaimGuard<'a> {
+    owner: &'a PrefetchClaims,
+    lead: Vec<ObjectId>,
+}
+
+impl ClaimGuard<'_> {
+    /// The OIDs this caller owns and should batch-fetch.
+    fn lead(&self) -> &[ObjectId] {
+        &self.lead
+    }
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if self.lead.is_empty() {
+            return;
+        }
+        let mut set = self.owner.inflight.lock().unwrap();
+        for oid in &self.lead {
+            set.remove(oid);
+        }
+    }
+}
+
 /// A [`Fetcher`] that shells out to the system `git` to drive the
 /// promisor-remote fetch path.
 ///
@@ -356,6 +430,11 @@ pub struct GitCliFetcher {
     /// `prefetch_headers` so concurrent callers don't head-of-line
     /// block through one shared child. See [`BatchChildPool`].
     batch: BatchChildPool,
+    /// Single-flight for overlapping `prefetch_headers` batches
+    /// across concurrent callers (notably N daemon sidecars
+    /// prefetching the same commit's root tree). See
+    /// [`PrefetchClaims`] and `docs/design/prefetch-coalescing.md`.
+    prefetch_claims: PrefetchClaims,
 }
 
 impl GitCliFetcher {
@@ -414,6 +493,7 @@ impl GitCliFetcher {
             store,
             coalescer: Coalescer::new(),
             batch: BatchChildPool::new(k, git_dir),
+            prefetch_claims: PrefetchClaims::new(),
         })
     }
 
@@ -629,8 +709,47 @@ impl Fetcher for GitCliFetcher {
             probes_by_oid.insert(oid, HeaderProbe::Present(oid));
         }
 
-        if !to_query.is_empty() {
-            let trace = cattrace_enabled();
+        let trace = cattrace_enabled();
+
+        // Coalesce overlapping prefetch batches across concurrent
+        // callers. Claim the OIDs we intend to fetch; any OID a
+        // peer (e.g. another daemon sidecar prefetching the same
+        // commit's root tree) has already claimed comes back as
+        // `skipped` and we do NOT re-fetch it. See `PrefetchClaims`
+        // and docs/design/prefetch-coalescing.md.
+        let claim = self.prefetch_claims.claim(&to_query);
+        let lead = claim.lead();
+        let lead_set: std::collections::HashSet<ObjectId> = lead.iter().copied().collect();
+
+        // Resolve skipped OIDs best-effort: a peer owns the fetch,
+        // so read whatever the shared store has *now* (the peer may
+        // already have landed some). Emit `PresentWithHeader` when
+        // the header is locally readable, else a plain `Present` —
+        // the on-demand `lookup` path is the source of truth and
+        // self-heals anything still absent by read time.
+        let mut skipped_count = 0usize;
+        for &oid in &to_query {
+            if lead_set.contains(&oid) {
+                continue;
+            }
+            skipped_count += 1;
+            let probe = match self.store.header(oid) {
+                Ok((kind, size)) => HeaderProbe::PresentWithHeader(oid, kind, size),
+                Err(_) => HeaderProbe::Present(oid),
+            };
+            probes_by_oid.insert(oid, probe);
+        }
+
+        if trace && !to_query.is_empty() {
+            eprintln!(
+                "cattrace: op=prefetch_coalesce total={} lead={} skipped={}",
+                to_query.len(),
+                lead.len(),
+                skipped_count,
+            );
+        }
+
+        if !lead.is_empty() {
             // Two attempts: respawn the child on broken pipe. Each
             // attempt acquires a fresh slot from the pool (so if
             // the first attempt failed on slot N and a different
@@ -643,14 +762,14 @@ impl Fetcher for GitCliFetcher {
                 let acquire_start = if trace { Some(Instant::now()) } else { None };
                 let mut slot = self.batch.acquire();
                 let work_start = if trace { Some(Instant::now()) } else { None };
-                let r = slot.with_child(|child| child.query_batch(&to_query));
+                let r = slot.with_child(|child| child.query_batch(lead));
                 if let (Some(t0), Some(t1)) = (acquire_start, work_start) {
                     let now = Instant::now();
                     let wait_us = t1.duration_since(t0).as_micros();
                     let work_us = now.duration_since(t1).as_micros();
                     eprintln!(
                         "cattrace: op=prefetch_headers wait_us={wait_us} work_us={work_us} n_oids={}",
-                        to_query.len(),
+                        lead.len(),
                     );
                 }
                 match r {
@@ -658,7 +777,7 @@ impl Fetcher for GitCliFetcher {
                         // Whole batch fails on spawn error. Don't
                         // burn the second attempt on a spawn
                         // failure — git is broken at the OS level.
-                        for oid in &to_query {
+                        for oid in lead {
                             probes_by_oid.insert(
                                 *oid,
                                 HeaderProbe::Error(
@@ -689,8 +808,8 @@ impl Fetcher for GitCliFetcher {
 
             match batch_lines {
                 Some(lines) => {
-                    debug_assert_eq!(lines.len(), to_query.len());
-                    for (oid, line) in to_query.iter().zip(lines.iter()) {
+                    debug_assert_eq!(lines.len(), lead.len());
+                    for (oid, line) in lead.iter().zip(lines.iter()) {
                         match Self::parse_line(*oid, line) {
                             Ok(ParsedResponse::Header { kind, size }) => {
                                 if !self.store.contains(*oid) {
@@ -731,7 +850,7 @@ impl Fetcher for GitCliFetcher {
                     let msg = last_io_err
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "exhausted retries".to_owned());
-                    for oid in &to_query {
+                    for oid in lead {
                         probes_by_oid.insert(
                             *oid,
                             HeaderProbe::Error(
@@ -971,5 +1090,90 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn oid_n(n: u32) -> ObjectId {
+        ObjectId::from_hex(format!("{n:040x}").as_bytes()).expect("valid 40-hex oid")
+    }
+
+    /// Deterministic test of the prefetch claim primitive: the
+    /// first claim of a set leads every OID; a concurrent-style
+    /// second claim of an overlapping set leads only the
+    /// not-yet-claimed OIDs; dropping a guard releases exactly its
+    /// lead OIDs so a later claim leads them again. This is the
+    /// mechanism that lets N daemon sidecars prefetching the same
+    /// root tree issue one batch instead of N
+    /// (docs/design/prefetch-coalescing.md).
+    #[test]
+    fn prefetch_claims_lead_skip_release() {
+        let claims = PrefetchClaims::new();
+        let (a, b, c) = (oid_n(1), oid_n(2), oid_n(3));
+
+        // First claim of {a, b}: leads both.
+        let g1 = claims.claim(&[a, b]);
+        assert_eq!(g1.lead(), &[a, b]);
+
+        // Overlapping claim of {b, c} while g1 is held: b is in
+        // flight, so only c is led.
+        let g2 = claims.claim(&[b, c]);
+        assert_eq!(g2.lead(), &[c]);
+
+        // Release g1 (frees a, b). A claim of {a, b, c} now leads
+        // a, b again; c is still held by g2.
+        drop(g1);
+        let g3 = claims.claim(&[a, b, c]);
+        assert_eq!(g3.lead(), &[a, b]);
+
+        // Release everything; a fresh claim leads the whole set.
+        drop(g2);
+        drop(g3);
+        let g4 = claims.claim(&[a, b, c]);
+        assert_eq!(g4.lead(), &[a, b, c]);
+    }
+
+    /// Under real threads, two overlapping claims must partition the
+    /// OID set: every OID is led by exactly one caller, never both.
+    /// `claim` takes the inner mutex once and processes all
+    /// candidates under it, so the two racing claims serialize — one
+    /// leads the contested OIDs, the other skips them. A barrier
+    /// keeps both guards alive simultaneously so the second claim
+    /// genuinely sees the first's in-flight set.
+    #[test]
+    fn prefetch_claims_concurrent_partition() {
+        let claims = Arc::new(PrefetchClaims::new());
+        let oids: Vec<ObjectId> = (1..=8).map(oid_n).collect();
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let claims = claims.clone();
+            let oids = oids.clone();
+            let start = start.clone();
+            let hold = hold.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let guard = claims.claim(&oids);
+                let lead: Vec<ObjectId> = guard.lead().to_vec();
+                // Keep the guard alive until both threads have
+                // claimed, so neither releases before the other
+                // observes the in-flight set.
+                hold.wait();
+                drop(guard);
+                lead
+            }));
+        }
+        let leads: Vec<Vec<ObjectId>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Disjoint: no OID led by both threads.
+        let set0: std::collections::HashSet<ObjectId> = leads[0].iter().copied().collect();
+        let overlap = leads[1].iter().filter(|o| set0.contains(*o)).count();
+        assert_eq!(overlap, 0, "no OID may be led by two callers at once");
+        // Exactly-once: every input OID led by precisely one caller.
+        assert_eq!(
+            leads[0].len() + leads[1].len(),
+            oids.len(),
+            "each OID must be led exactly once across the two claims"
+        );
     }
 }

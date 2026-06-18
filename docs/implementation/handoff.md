@@ -8,7 +8,8 @@
 > code.
 >
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-06-18, after cat-file-pool Stage 1-3 landed.
+> Last updated: 2026-06-18, after cat-file-pool Stage 1-3 landed
+> and prefetch coalescing shipped.
 > Rust-scale data-plane bottleneck is now fixed in two parts:
 > (1) `GitCliFetcher` moved from single-child cat-file to a
 > K-slot `BatchChildPool`; (2) daemon RPC handlers release
@@ -642,7 +643,21 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
     continues in background.
   - Cargo sparse-shared N=10 refresh: projgit-shared 7.39 s
     wall vs 8.50 s comparator (1.15x wall, 9.98x disk).
-- **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
+- **Prefetch coalescing (2026-06-18).** Closed the duplicate-
+  prefetch finding the post-pool trace surfaced: N daemon
+  sidecars prefetching the same commit's root tree each drove a
+  full 31-OID `PrefetchHeaders` batch (62 upstream fetches where
+  31 would do). `GitCliFetcher` now holds a `PrefetchClaims`
+  set (non-blocking per-OID single-flight, separate from the
+  `fetch_object` coalescer so on-demand reads never block on a
+  prefetch batch). `prefetch_headers` claims its missing OIDs;
+  the lead caller batches them, peers `skip` and return
+  best-effort probes. Verified on the rust N=2 diagnostic: one
+  sidecar `lead=31 skipped=0`, the other `lead=0 skipped=31`
+  (zero duplicate fetches), wall ~0.9-1.2 s (from ~1.75 s
+  pool-only). Design in
+  [`../design/prefetch-coalescing.md`](../design/prefetch-coalescing.md);
+  2 new always-on unit tests (57 projgit-core total).
   crates were removed from the public repo surface; the useful findings
   are preserved in
   [`docs/design/winfsp-implementation-plan.md`](../design/winfsp-implementation-plan.md).
@@ -914,28 +929,27 @@ two design docs.)
 
 ## What I'd do next
 
-Reprioritized 2026-06-18 after cat-file-pool Stage 1-3 shipped.
-The prior top item (cat-file pool) is done. Remaining queue:
+Reprioritized 2026-06-18 after cat-file-pool Stage 1-3 and
+prefetch coalescing shipped. The prior top two items (cat-file
+pool, prefetch coalescing) are done. Remaining queue:
 
-1. **Per-batch Coalescer for `PrefetchHeaders`** (new #1).
-  Pool + handler lock release removed on-demand Fetch head-of-line
-  blocking, but concurrent sidecars can still duplicate prefetch
-  work on overlapping OID batches. Route prefetch through the
-  existing per-OID coalescer or add a set-keyed batch coalescer.
-2. **`projgitd` Stage 5 — production polish.**
+1. **`projgitd` Stage 5 — production polish.**
   systemd unit, restart policy, health checks, persistent daemon
   state, and structured logging (`tracing-subscriber`).
-3. **CI bench job (B3).**
+2. **CI bench job (B3).**
   Add a perf job to `.github/workflows/ci.yml` to guard baseline
-  regressions now that the key bottleneck fix is landed.
-4. **Container deployment recipe doc.**
+  regressions now that the key bottleneck fixes are landed.
+3. **Container deployment recipe doc.**
   Operator cookbook for host/sidecar deployment, mount propagation,
   and daemon socket wiring.
-5. **Phase 3d production WinFsp backend.**
+4. **Phase 3d production WinFsp backend.**
   Resume only if Windows target deployment is still in scope.
-6. **Optional bench follow-ups.**
-  rust N=4/N=10 post-pool matrix, higher-N worktree comparator,
-  and target-scale workload validation.
+5. **Optional bench follow-ups.**
+  rust N=4/N=10 post-pool matrix (only N=2 measured so far),
+  higher-N worktree comparator, and target-scale workload
+  validation. The prefetch-coalescing disk/upstream win in
+  particular should be most visible at high N — worth a
+  dedicated N=10 rust capture.
 
 **Items folded into the projgitd plan and removed from the
 standalone list:**

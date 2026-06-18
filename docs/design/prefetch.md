@@ -63,7 +63,10 @@ is implemented in `projgit-core`; later tiers remain design notes.
   amortised connection; we focus on *what to ask for*, not *how to
   send the bytes*.
 - **Cross-mount learning** (this lives in a future `projgitd`
-  design, not here).
+  design, not here). Note: *coalescing* overlapping prefetch
+  batches across sidecars at the shared daemon fetcher — a
+  related but distinct concern — is designed in
+  [`prefetch-coalescing.md`](prefetch-coalescing.md).
 - **Prefetching commit graphs / refs / tags.** All projgit
   projections are pinned to a single commit OID at construction;
   graph walks are out of scope until we add features that need them.

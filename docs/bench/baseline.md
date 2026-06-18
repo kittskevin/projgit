@@ -1057,6 +1057,62 @@ CHANGELOG.md,CONTRIBUTING.md,src/cargo/lib.rs,src/cargo/macros.rs,\
 Cargo.lock,build.rs"
 ```
 
+### Prefetch coalescing (2026-06-18)
+
+Follow-up to the cat-file pool: the post-pool trace above still
+showed **two** sidecars each driving a full 31-OID
+`PrefetchHeaders` batch for the same root tree — 62 upstream
+promisor fetches where 31 would do. The pool removed the
+head-of-line block but not the duplicate work. `GitCliFetcher`
+now coalesces overlapping prefetch batches via a non-blocking
+per-OID claim set (design:
+[`../design/prefetch-coalescing.md`](../design/prefetch-coalescing.md)).
+
+Re-running the same N=2 `--depth 1` diagnostic with
+`PROJGIT_CATFILE_TRACE=1`, the new accounting line shows one
+sidecar leading the batch and the other skipping it entirely:
+
+```
+cattrace: op=prefetch_coalesce total=31 lead=31 skipped=0
+cattrace: op=prefetch_coalesce total=31 lead=0  skipped=31
+trace:    rpc=PrefetchHeaders served_us=4180 inflight_at_recv=4 n_oids=31
+```
+
+The `lead=0 skipped=31` sidecar issues **zero** upstream
+fetches and its `PrefetchHeaders` RPC returns in ~4 ms (vs the
+multi-second batch it used to run). Only the `lead=31` sidecar
+talks to git. The `lead=31 / skipped=31` split is deterministic
+across runs (the wall numbers below are not — single iteration,
+network variance).
+
+| Config | wall | vs pre-pool | vs pool-only |
+| --- | ---: | ---: | ---: |
+| pre-pool baseline (K=1, mutex-blocked) | 15,298 ms | 1.00× | — |
+| pool + lock-release (2026-06-18) | 1,746 ms | 8.77× | 1.00× |
+| **+ prefetch coalescing (2 runs)** | **882 / 1,192 ms** | **~13–17×** | **~1.5–2×** |
+
+The wall improvement is a secondary benefit (only one prefetch
+batch now contends for pool slots + bandwidth, so on-demand
+`Fetch` RPCs finish faster). The **primary** win is structural:
+N sidecars prefetching the same commit now generate **one**
+batch's worth of upstream work instead of N, which is what makes
+the multi-agent shared-CAS pitch scale to high N and big repos.
+At N=2 the duplicate mostly dedupes at the pack layer so disk is
+flat (~2.2 MB); the win grows with N.
+
+### Reproduce (prefetch coalescing)
+
+```sh
+PROJGIT_NETWORK_TESTS=1 PROJGIT_CATFILE_TRACE=1 \
+  cargo run -p projgit-cli --example bench_mount --release -- \
+  --scenario sparse-shared --concurrency 2 --iterations 1 \
+  --daemon-depth 1 --daemon-trace --daemon-pool-size 4 \
+  --url https://github.com/rust-lang/rust --ref main \
+  --files README.md,Cargo.toml,LICENSE-APACHE
+# stderr `cattrace: op=prefetch_coalesce total=N lead=L skipped=S`:
+# one sidecar leads (L=N, S=0), the rest skip (L=0, S=N).
+```
+
 ## What this shows
 
 - **§1.6 amortisation is real.** Across both targets, the second
