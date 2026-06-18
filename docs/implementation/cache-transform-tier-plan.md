@@ -5,7 +5,9 @@
 > actually gets built. Updated as each stage lands or surfaces
 > something that changes downstream stages.
 >
-> Last updated: 2026-06-18 (created; no stages started).
+> Last updated: 2026-06-18 (Stage 0 decided + Stage 1 implemented:
+> FetchMany wire, fetch_objects primitive, warm_tree_closure eager-tree
+> warm across daemon + standalone + sidecar mount paths).
 >
 > Design in [`../design/cache-transform-tier.md`](../design/cache-transform-tier.md);
 > this is one level down — concrete steps, file changes, commit
@@ -356,10 +358,23 @@ writable-worktrees §10 before proceeding.
 
 ## 10. Status & next steps
 
-Phase 1 proposed, not started. **Start at Stage 0** — pin the
-miss-trigger wire + derived-index format into design §14, because every
-downstream interface depends on them. Do not write `cached` serving
-code until Stage 0 lands.
+**Stage 0 decided + Stage 1 implemented (2026-06-18).** The miss-trigger
+wire and derived-format decisions are recorded in design §15 (wire =
+reuse the `Fetcher`-shaped projgitd RPC + a batched-blob `FetchMany`,
+reply via probes / bytes-in-CAS; format = git-shaped, persistence
+deferred). Stage 1 shipped: `Fetcher::fetch_objects` + `FetchMany`,
+`HydratingObjectStore::warm_tree_closure`, and a background eager-tree
+warm on the daemon (`handle_mount`), standalone, and sidecar
+(`DaemonFetcher`->`FetchMany`) mount paths. Workspace clippy + tests
+green.
+
+**Next: Stage 3 (prefetch-warm blobs, Architecture B)** — drive
+`fetch_objects` from the readdir-time prefetch worker so blob *bytes*
+warm ahead of demand (currently `fetch_objects`/`FetchMany` exist
+end-to-end but only `warm_tree_closure` drives them, for trees). Apply
+tiered eagerness (§6.1): policy-gated, not blanket. Stage 2 (the derived
+metadata memo) is, per design §9, adequately covered for MVP by the
+shared odb + in-process header cache; persist only when profiled.
 
 Phase 2 (writable) is intentionally undecided and gated on the
 [`../design/writable-worktrees.md`](../design/writable-worktrees.md)
