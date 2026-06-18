@@ -352,6 +352,68 @@ impl<F: Fetcher> HydratingObjectStore<F> {
         }
         probes
     }
+
+    /// Eagerly warm the full *tree* closure reachable from
+    /// `root_tree` into the local store, batch-fetching each BFS
+    /// level via [`Self::fetch_objects`]. Blobs are **not** fetched.
+    ///
+    /// After this returns, `readdir` / `stat` over the projection are
+    /// served locally without an upstream round trip (Architecture
+    /// A's structural softener; see
+    /// `docs/design/cache-transform-tier.md` §4-§5). On a stock-git
+    /// remote this is the level-by-level walk that a GVFS
+    /// commit->tree expansion would do in one RPC (design §14
+    /// capability asymmetry).
+    ///
+    /// Best-effort: a tree that fails to hydrate is counted in
+    /// `errors` and skipped; the on-demand `read_tree` path
+    /// self-heals it on a later access. Identical subtrees (shared
+    /// OIDs) are visited once.
+    pub fn warm_tree_closure(&self, root_tree: ObjectId) -> WarmTreeStats {
+        let mut stats = WarmTreeStats::default();
+        let mut visited: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        // Make the root resident first so its read is local.
+        let _ = self.fetch_objects(std::slice::from_ref(&root_tree));
+        let mut frontier = vec![root_tree];
+        visited.insert(root_tree);
+        while !frontier.is_empty() {
+            stats.levels += 1;
+            let mut next: Vec<ObjectId> = Vec::new();
+            for &tree in &frontier {
+                match self.read_tree(tree) {
+                    Ok(entries) => {
+                        stats.trees_warmed += 1;
+                        for e in entries {
+                            if crate::tree::EntryMode::from_raw(e.mode_raw).is_dir()
+                                && visited.insert(e.oid)
+                            {
+                                next.push(e.oid);
+                            }
+                        }
+                    }
+                    Err(_) => stats.errors += 1,
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            // Batch the next level so each subsequent read is local.
+            let _ = self.fetch_objects(&next);
+            frontier = next;
+        }
+        stats
+    }
+}
+
+/// Stats returned by [`HydratingObjectStore::warm_tree_closure`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WarmTreeStats {
+    /// Tree objects made resident and read (including the root).
+    pub trees_warmed: u64,
+    /// BFS levels walked (the root tree is level 1).
+    pub levels: u64,
+    /// Trees that could not be read / hydrated and were skipped.
+    pub errors: u64,
 }
 
 /// Errors that can arise when reading through a [`HydratingObjectStore`].

@@ -53,7 +53,7 @@ pub use blob_cache::BlobCacheStats;
 pub use error::{ObjectStoreError, ProjectionError};
 pub use fetcher::{
     Fetcher, FetcherError, GitCliFetcher, GitCliFetcherError, HeaderProbe, HydrateError,
-    HydratingObjectStore, NoopFetcher,
+    HydratingObjectStore, NoopFetcher, WarmTreeStats,
 };
 #[cfg(feature = "gix-fetcher")]
 pub use fetcher::{GixFetcher, GixFetcherError};
