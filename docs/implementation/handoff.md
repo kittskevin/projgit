@@ -8,20 +8,18 @@
 > code.
 >
 > Living document. Updated whenever we land a phase or change direction.
-> Last updated: 2026-06-04, after the data-plane investigation
-> shipped (Stages 0–4). The rust-lang/rust hang is now
-> **diagnosed**: per-mount prefetch worker × N sidecars ×
-> batched cat-file calls all serialise through one
-> `Mutex<BatchChild>` in the daemon, head-of-line blocking
-> on-demand `Fetch` RPCs (commit `ed7ad90`'s trace output is
-> recorded in [`../bench/baseline.md`](../bench/baseline.md)
-> §Diagnostic). The cat-file pool (deferred from Phase C as
-> speculation) is now the load-bearing fix. Also landed:
-> shallow partial-clone support (`--depth=N`) at every layer
-> (commit `4869594`), which independently moved the rust
-> bench from ">36 minutes, didn't complete" to "~16 s,
-> completes, projgit wins 3.65× wall and 335× disk vs the
-> partial-cat-independent comparator".
+> Last updated: 2026-06-18, after cat-file-pool Stage 1-3 landed.
+> Rust-scale data-plane bottleneck is now fixed in two parts:
+> (1) `GitCliFetcher` moved from single-child cat-file to a
+> K-slot `BatchChildPool`; (2) daemon RPC handlers release
+> `state.active` before slow backend calls, so concurrent
+> Fetch/PrefetchHeaders RPCs can actually reach the pool.
+> On the rust diagnostic repro (`sparse-shared`, N=2,
+> `--daemon-depth 1 --daemon-trace`): wall moved from ~15.3 s
+> pre-pool to ~1.75 s post-fix (~8.8x). Cargo N=10 improved
+> modestly (8.58 s -> 7.39 s wall). Full traces and tables are
+> in [`../bench/baseline.md`](../bench/baseline.md) §Diagnostic
+> "Post-pool measurements".
 >
 > Prior in the multi-day session: worktree-comparator bench
 > (2026-06-04), sparse-access bench (2026-06-02), Phase C
@@ -624,6 +622,26 @@ ffd6ff6  feat(fuse): Phase 3b -- fuser backend, gated on Linux/macOS
   trace, Stage 3 bench `--daemon-depth`+`--daemon-trace` flags,
   this Stage 4 capture+handoff). 4 new clone unit tests; full
   workspace `cargo test --all-targets` + clippy green.
+- **Cat-file pool + handler lock-release (2026-06-18).**
+  Completed Stage 1-3 of
+  [`cat-file-pool-plan.md`](cat-file-pool-plan.md):
+  - `GitCliFetcher` now uses `BatchChildPool` (K slots,
+    round-robin acquire, lazy spawn, per-slot respawn on I/O
+    failure); regression tests cover K=1 and K=4.
+  - daemon/CLI/bench wiring: `pool_size` in `DaemonConfig`,
+    `projgitd --pool-size N`, and bench `--daemon-pool-size N`
+    (rejects N=0).
+  - Stage 3 initially hit stop condition (<2x wall gain).
+    Root cause was a second serialization point:
+    `state.active` mutex held across backend calls in
+    `handle_fetch` / `handle_prefetch_headers`.
+    Fix clones `ActiveBackend` out of lock and releases the
+    mutex before executing backend work.
+  - Final rust diagnostic shape: ~15.3 s -> ~1.75 s wall;
+    on-demand Fetch RPCs return in ~0.4-0.9 s while prefetch
+    continues in background.
+  - Cargo sparse-shared N=10 refresh: projgit-shared 7.39 s
+    wall vs 8.50 s comparator (1.15x wall, 9.98x disk).
 - **Windows / WinFsp backend.** Deferred. The tracked WinFsp spike
   crates were removed from the public repo surface; the useful findings
   are preserved in
@@ -896,96 +914,28 @@ two design docs.)
 
 ## What I'd do next
 
-Reprioritized 2026-06-02 after `projgitd` Stage 3 and dotgit A2
-landed. The audit lives in repo-scoped session memory at
-`/memories/repo/audit.md` (persists across conversations); the
-actionable items below are its top open findings plus the staged
-plan from [`docs/design/projgitd.md`](../design/projgitd.md).
-Stage-by-stage implementation steps, commit boundaries, and
-decision points live in
-[`docs/implementation/projgitd-plan.md`](projgitd-plan.md) — that's
-the working doc that gets updated as each stage lands.
+Reprioritized 2026-06-18 after cat-file-pool Stage 1-3 shipped.
+The prior top item (cat-file pool) is done. Remaining queue:
 
-1. **Cat-file pool in the daemon's `GitCliFetcher`** (was
-   speculative; now the diagnosed fix from the 2026-06-04
-   data-plane investigation). Replace the single shared
-   `Mutex<Option<BatchChild>>` with a pool of K children;
-   `raw_fetch` and `prefetch_headers` acquire any free child
-   instead of serializing through one. Sizing: K probably wants
-   to be at least `N_sidecars + 1` so prefetch fan-out doesn't
-   starve on-demand fetches. Should drop the rust-lang/rust
-   `sparse-shared` wall from ~15 s to ~1–2 s (per-blob cost
-   would dominate instead of mutex wait). The diagnostic trace
-   is in [`../bench/baseline.md`](../bench/baseline.md)
-   §Diagnostic. **This is the highest-leverage perf change on
-   the queue.**
-2. **Per-batch Coalescer for `PrefetchHeaders`** (smaller
-   follow-up to #1). The trace showed two sidecars'
-   `PrefetchHeaders(31 OIDs)` calls each got a full mutex turn
-   even though their OID sets fully overlapped. Either route
-   `prefetch_headers` through the existing per-OID
-   `Coalescer.do_or_join`, or add a per-batch coalescer keyed
-   on a hash of the OID set. Independent of #1; would help even
-   without the pool.
-3. **`projgitd` Stage 5 — production polish.** systemd unit,
-   PID file / restart policy, persistent daemon state for fast
-   recovery (so daemon-restart doesn't re-resolve refs), health
-   checks, `tracing-subscriber` wiring for the existing `-v` flag,
-   structured logging. Wait until #1 + #2 land so persistent
-   state covers a daemon that actually scales.
-4. **Pitch language updates downstream of the worktree-comparator
-   and data-plane findings.** README + top-level project
-   description still imply a wall-clock pitch. Update once #1
-   lands and the rust-scale numbers are re-measured — if the
-   pool brings projgit to wall-clock parity with `worktree-depth1
-   on-demand`, the pitch can be "matches worktree on speed plus
-   wins ~10× on disk plus containerization-clean". If it doesn't,
-   the pitch stays "disk + containerization, wall clock
-   workload-dependent". Gated on #1.
-5. **B3: CI bench job.** README + bench doc claim the bench
-   protects against regression; CI runs only fmt/clippy/test.
-   Add a perf job to `.github/workflows/ci.yml` that runs the
-   bench and compares to the checked-in baseline. The bench
-   suite is now complete (single + sequential + Phase C +
-   sparse-access + worktree-comparator + the diagnostic
-   recipe). Worth doing alongside #1 to lock in the perf gain
-   when it lands.
-6. **Phase 3d. Production `projgit-winfsp`** on top of the
-   `FspService*` lifecycle. Consume `ProjectionFsProvider`
-   directly, exactly like Phase 4's CLI does on Linux. The
-   riskiest remaining piece. Best done in a fresh focused session
-   on the Windows host; first decide whether the Linux-focused
-   workload makes this worth the cost (C1 leans "no").
-7. **Container deployment recipe doc.** User-facing `docs/` page
-   covering `/etc/fuse.conf`, `bind-propagation`, a sample
-   systemd unit, an example Docker invocation, **and the new
-   sidecar deployment shape** (`projgitd` on the host or in a
-   sidecar pod, agent containers run `projgit mount
-   --daemon-socket /run/projgitd.sock`). Architectural framing
-   in [`docs/design/container-deployment.md`](../design/container-deployment.md)
-   and [`docs/design/projgitd.md`](../design/projgitd.md); this is
-   the cookbook side. The [scripts/docker-smoke/](../../scripts/docker-smoke/)
-   recipe shipped with Stage 3d is the runnable seed.
-8. **Bench follow-ups** (optional, conditional on #1 completing):
-   - **Re-bench rust-lang/rust at N=4 and N=10** with the
-     cat-file pool. Validates the predicted ~10× wall-clock
-     improvement.
-   - **Higher-N worktree-comparator** (N=100, README's headline).
-     `worktree-depth1 on-demand` at N=10 scales flat (~20 s on
-     rust); at N=100 it might hit FS / FD limits and
-     projgit (post-#1) could regain wall-clock parity.
-   - **Full-clone worktree on `rust-lang/rust`.** Predicted
-     5–10 minutes setup; would set the upper-bound "operator
-     was lazy" baseline at big-repo scale.
-   - **140 GB target workload.** Currently a synthetic-bench
-     idea (user-context-shared scale). Real or synthetic, the
-     bench should validate projgit at the actual deployment
-     size. Gated on #1 because below the bottleneck-fix
-     threshold there's no chance of completion in reasonable
-     time.
-   None of these are load-bearing for shipping projgit; do them
-   only if pitch claims need stronger backing in their specific
-   regime.
+1. **Per-batch Coalescer for `PrefetchHeaders`** (new #1).
+  Pool + handler lock release removed on-demand Fetch head-of-line
+  blocking, but concurrent sidecars can still duplicate prefetch
+  work on overlapping OID batches. Route prefetch through the
+  existing per-OID coalescer or add a set-keyed batch coalescer.
+2. **`projgitd` Stage 5 — production polish.**
+  systemd unit, restart policy, health checks, persistent daemon
+  state, and structured logging (`tracing-subscriber`).
+3. **CI bench job (B3).**
+  Add a perf job to `.github/workflows/ci.yml` to guard baseline
+  regressions now that the key bottleneck fix is landed.
+4. **Container deployment recipe doc.**
+  Operator cookbook for host/sidecar deployment, mount propagation,
+  and daemon socket wiring.
+5. **Phase 3d production WinFsp backend.**
+  Resume only if Windows target deployment is still in scope.
+6. **Optional bench follow-ups.**
+  rust N=4/N=10 post-pool matrix, higher-N worktree comparator,
+  and target-scale workload validation.
 
 **Items folded into the projgitd plan and removed from the
 standalone list:**

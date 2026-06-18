@@ -96,6 +96,15 @@ in [docs/bench/baseline.md](docs/bench/baseline.md).
   structural per the fetch-coalescing retraction
   ([docs/design/fetch-coalescing.md §9.5](docs/design/fetch-coalescing.md));
   the bench exists to catch if it changes.
+- Post-pool (2026-06) rust diagnostic (`rust-lang/rust`, `sparse-shared`,
+  N=2, `--depth 1`) moved from ~15.3 s wall to ~1.75 s after two fixes:
+  cat-file pool + daemon handler lock release. This closes the prior
+  rust-scale head-of-line block that dominated wall time.
+- Against the worktree steelman on small-history repos, wall parity is
+  still workload-dependent: on cargo N=10, post-pool projgit-shared
+  remains slower than `worktree-depth1 on-demand` on wall clock, while
+  retaining the structural disk + containerization advantages. See
+  [docs/bench/baseline.md](docs/bench/baseline.md) for the exact tables.
 
 Reproduce on Linux/macOS:
 

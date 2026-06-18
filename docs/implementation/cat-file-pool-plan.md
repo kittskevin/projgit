@@ -4,7 +4,8 @@
 > built. Updated as each stage lands or surfaces something that
 > changes downstream stages.
 >
-> Last updated: 2026-06-04 (created; no stages started).
+> Last updated: 2026-06-18 (Stages 1-3 implemented; Stage 4 docs
+> wrap-up in progress).
 >
 > Motivated by the 2026-06-04 data-plane diagnostic: the
 > `rust-lang/rust` `sparse-shared` N=2 cell takes ~16 s, of
@@ -283,6 +284,45 @@ the head-of-line block is gone.
 bench: re-capture rust-lang/rust + cargo with cat-file pool
 ```
 
+### 4.6 Actual outcome (2026-06-18)
+
+Stage 3 did not pass on the first post-pool run: the initial
+K=4 diagnostic improved wall only ~1.65x (15.3 s -> 9.24 s),
+which fired stop-condition #2 (<2x). Investigation added
+`PROJGIT_CATFILE_TRACE=1` instrumentation in
+`GitCliFetcher` (per-call `wait_us` + `work_us`) and revealed
+that pool wait time was ~0 while work time remained long.
+
+Root cause: a second, independent serialization point in
+`projgit-daemon` -- `handle_fetch` and
+`handle_prefetch_headers` held `state.active`'s mutex across
+the full backend call, so only one RPC could enter
+`repo.backend.*` at a time. This masked the cat-file pool.
+
+Fix: clone `ActiveBackend` (cheap Arc clone) out of the mutex
+critical section in both handlers, drop the lock, then call
+`fetch_one` / `prefetch_headers`.
+
+Post-fix measurements on rust diagnostic cell:
+
+- K=1 pre-pool baseline: 15.3 s wall
+- K=4 pool-only (mutex still held in handlers): 9.24 s wall
+- K=1 with lock release: 9.71 s wall
+- K=4 + lock release: 1.75 s wall (~8.8x vs baseline)
+
+Interpretation: both fixes are required for the predicted
+shape. The pool removes cat-file HoL blocking; the handler
+lock-release lets concurrent RPCs actually reach the pool.
+
+Cargo sparse-shared N=10 refresh with K=4:
+
+- projgit-shared wall: 7.39 s (from 8.58 s pre-pool)
+- partial-cat-independent wall: 8.50 s
+- wall ratio: 1.15x, disk ratio: 9.98x
+
+So rust-scale bottleneck is closed; cargo's wall win remains
+modest and still behind worktree-depth1 on-demand total wall.
+
 Updates the Diagnostic section in baseline.md with new trace
 + a "Post-pool measurements" table; refreshes the sparse-shared
 + worktree-comparator cargo numbers for projgit-shared.
@@ -316,6 +356,18 @@ pitch.
    - If pool fell short of prediction: document honestly and
      leave the pitch as-is from 2026-06-04.
 
+### 5.4 Outcome guardrail update
+
+Measured outcome after Stage 3: rust diagnostic meets the
+prediction band (~1-2 s per-thread) only with the combined
+pool + handler lock-release fix. Cargo wall improves but does
+not reach worktree parity. Therefore Stage 4 pitch language
+must stay workload-qualified:
+
+- big-history multi-agent repos: strong wall + disk wins
+- small-history repos like cargo: disk/containerization wins,
+  wall still behind worktree-depth1 on-demand
+
 ### 5.3 Commit boundary
 
 ```
@@ -337,6 +389,13 @@ pressing on:**
 - **Stage 3 — fetch failures appear at K>=4.** GitHub
   rate-limiting or local file-descriptor limits. Either
   reduce K or document the operational ceiling.
+
+Status on 2026-06-18:
+
+- Triggered once (pool-only run ~1.65x), diagnosed and fixed.
+- Final post-fix run: stop condition cleared (~8.8x).
+- No fetch failures observed at K=4 or K=10 in the diagnostic
+  repro runs.
 
 ## 7. What this doc is not
 
