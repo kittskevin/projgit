@@ -41,6 +41,7 @@ pub mod error;
 pub mod fetcher;
 pub mod fs_provider;
 mod header_cache;
+pub mod maintenance;
 pub mod object_store;
 pub mod overlay;
 pub mod prefetch;
@@ -51,6 +52,7 @@ mod tree_cache;
 
 pub use blob_cache::BlobCacheStats;
 pub use error::{ObjectStoreError, ProjectionError};
+pub use maintenance::{run_maintenance, MaintenanceError};
 pub use fetcher::{
     Fetcher, FetcherError, GitCliFetcher, GitCliFetcherError, HeaderProbe, HydrateError,
     HydratingObjectStore, NoopFetcher, WarmTreeStats,
