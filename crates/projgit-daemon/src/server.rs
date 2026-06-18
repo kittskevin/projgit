@@ -219,6 +219,17 @@ impl ActiveBackend {
             ActiveBackend::GitCli(h) => h.fetch_objects(oids),
         }
     }
+
+    /// Eagerly warm the projection's full tree closure into the
+    /// shared CAS so `readdir` / `stat` are network-free. Runs the
+    /// level-by-level batched walk; intended to be called off the
+    /// mount-response path (see `handle_mount`).
+    fn warm_tree_closure(&self, root_tree: ObjectId) -> projgit_core::WarmTreeStats {
+        match self {
+            ActiveBackend::Noop(h) => h.warm_tree_closure(root_tree),
+            ActiveBackend::GitCli(h) => h.warm_tree_closure(root_tree),
+        }
+    }
 }
 
 struct MountEntry {
@@ -605,6 +616,10 @@ fn handle_mount(
         Err(e) => return err(codes::REF_RESOLVE_FAILED, format!("{e:#}")),
     };
 
+    // Resolve the projection's root tree now (best-effort) so we can
+    // eagerly warm the tree closure once the mount succeeds.
+    let root_tree = projection.root_tree(&repo.store).ok();
+
     let projection_id = state.next_projection_id();
     let mut cfg = MountConfig::default();
     if allow_other {
@@ -638,6 +653,17 @@ fn handle_mount(
                     session,
                 },
             );
+            // Eager-tree warm in the background so the first os.walk is
+            // network-free without blocking the mount response
+            // (cache-transform-tier §4 softener; the closure streams in
+            // behind the mount per §6.1). Best-effort: anything not
+            // warmed self-heals via the on-demand path.
+            if let Some(rt) = root_tree {
+                let backend = repo.backend.clone();
+                std::thread::spawn(move || {
+                    let _ = backend.warm_tree_closure(rt);
+                });
+            }
             Response::Ok
         }
         Err(e) => err(codes::MOUNT_FAILED, format!("{e:#}")),
