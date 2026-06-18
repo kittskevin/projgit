@@ -212,6 +212,13 @@ impl ActiveBackend {
             ActiveBackend::GitCli(h) => h.prefetch_headers(oids),
         }
     }
+
+    fn fetch_objects(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
+        match self {
+            ActiveBackend::Noop(h) => h.fetch_objects(oids),
+            ActiveBackend::GitCli(h) => h.fetch_objects(oids),
+        }
+    }
 }
 
 struct MountEntry {
@@ -483,6 +490,7 @@ fn request_label(req: &Request) -> &'static str {
         Request::Attach { .. } => "Attach",
         Request::Fetch { .. } => "Fetch",
         Request::PrefetchHeaders { .. } => "PrefetchHeaders",
+        Request::FetchMany { .. } => "FetchMany",
     }
 }
 
@@ -495,6 +503,7 @@ fn request_extra(req: &Request) -> String {
             format!("oid={short}")
         }
         Request::PrefetchHeaders { oids } => format!("n_oids={}", oids.len()),
+        Request::FetchMany { oids } => format!("n_oids={}", oids.len()),
         Request::Mount { mountpoint, .. } => format!("mp={}", mountpoint.display()),
         _ => String::new(),
     }
@@ -531,6 +540,7 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
         Request::Attach { source } => handle_attach(state, source),
         Request::Fetch { oid } => handle_fetch(state, oid),
         Request::PrefetchHeaders { oids } => handle_prefetch_headers(state, oids),
+        Request::FetchMany { oids } => handle_fetch_many(state, oids),
     }
 }
 
@@ -763,6 +773,41 @@ fn handle_prefetch_headers(state: &Arc<DaemonState>, oid_hexes: Vec<String>) -> 
         repo.backend.clone()
     };
     let probes = backend.prefetch_headers(&oids);
+    Response::HeaderProbes {
+        probes: probes.into_iter().map(probe_to_wire).collect(),
+    }
+}
+
+/// Bulk-resident variant of [`handle_fetch`]: make many objects'
+/// *bytes* resident in as few batched upstream round trips as the
+/// fetcher can manage (via `fetch_objects`). Bytes land in the shared
+/// CAS; the reply is one probe per OID so the sidecar knows which to
+/// re-read directly and which to fall back to on-demand for.
+fn handle_fetch_many(state: &Arc<DaemonState>, oid_hexes: Vec<String>) -> Response {
+    let mut oids: Vec<ObjectId> = Vec::with_capacity(oid_hexes.len());
+    for hex in &oid_hexes {
+        match parse_oid(hex) {
+            Ok(o) => oids.push(o),
+            Err(e) => return err(codes::BAD_OID, e),
+        }
+    }
+    // Clone the backend out of the critical section, same rationale as
+    // handle_fetch / handle_prefetch_headers: keep N concurrent
+    // data-plane RPCs from serialising on state.active.
+    let backend = {
+        let active = match state.active.lock() {
+            Ok(g) => g,
+            Err(_) => return err(codes::INTERNAL, "daemon state mutex poisoned"),
+        };
+        let Some(repo) = active.as_ref() else {
+            return err(
+                codes::NOT_ATTACHED,
+                "daemon has no active source yet; send Attach first",
+            );
+        };
+        repo.backend.clone()
+    };
+    let probes = backend.fetch_objects(&oids);
     Response::HeaderProbes {
         probes: probes.into_iter().map(probe_to_wire).collect(),
     }

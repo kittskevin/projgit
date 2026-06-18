@@ -91,6 +91,20 @@ pub enum Request {
         /// Hex-encoded object ids.
         oids: Vec<String>,
     },
+    /// Bulk-resident variant of [`Request::Fetch`]: ask the daemon to
+    /// make many objects' *bytes* resident in the shared CAS in as few
+    /// upstream round trips as possible. Backs the cache tier's
+    /// Architecture-B bulk blob-byte prefetch
+    /// (`docs/design/cache-transform-tier.md` §6, §15).
+    ///
+    /// Bytes are written to the shared CAS, **not** returned over the
+    /// wire ("notifications, not payloads"); the reply is one
+    /// [`HeaderProbeWire`] per OID, in order, so the caller knows
+    /// which landed and which to fall back to on-demand for.
+    FetchMany {
+        /// Hex-encoded object ids.
+        oids: Vec<String>,
+    },
 }
 
 /// Control-plane response from daemon to client.
@@ -390,6 +404,17 @@ mod tests {
                 assert_eq!(c.tree_hits, 10);
                 assert_eq!(c.blob_misses, 3);
             }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_many_roundtrip() {
+        let original = Request::FetchMany {
+            oids: vec!["aaaa".into(), "bbbb".into()],
+        };
+        match roundtrip::<Request>(&original) {
+            Request::FetchMany { oids } => assert_eq!(oids, vec!["aaaa", "bbbb"]),
             other => panic!("got {other:?}"),
         }
     }

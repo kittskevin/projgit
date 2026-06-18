@@ -82,6 +82,40 @@ impl Fetcher for DaemonFetcher {
         }
     }
 
+    fn fetch_objects(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
+        if oids.is_empty() {
+            return Vec::new();
+        }
+        let req = Request::FetchMany {
+            oids: oids.iter().map(ObjectId::to_string).collect(),
+        };
+        match self.rpc(&req) {
+            Ok(Response::HeaderProbes { probes }) => merge_probes(oids, probes),
+            Ok(Response::Err { code, message }) => oids
+                .iter()
+                .map(|oid| {
+                    HeaderProbe::Error(*oid, daemon_err_to_fetcher(*oid, &code, message.clone()))
+                })
+                .collect(),
+            Ok(other) => oids
+                .iter()
+                .map(|oid| {
+                    HeaderProbe::Error(
+                        *oid,
+                        FetcherError::Backend(
+                            *oid,
+                            format!("unexpected response to FetchMany: {other:?}"),
+                        ),
+                    )
+                })
+                .collect(),
+            Err(transport) => oids
+                .iter()
+                .map(|oid| HeaderProbe::Error(*oid, FetcherError::Transport(*oid, transport.clone())))
+                .collect(),
+        }
+    }
+
     fn prefetch_headers(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {
         if oids.is_empty() {
             return Vec::new();
