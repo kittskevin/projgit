@@ -960,6 +960,7 @@ fn bench_projgit_daemon_concurrent(args: &Args) -> anyhow::Result<ConcurrentSamp
         pool_size: args
             .daemon_pool_size
             .unwrap_or_else(|| DaemonConfig::default().pool_size),
+        pid_file: None,
     };
     let daemon_handle = thread::spawn(move || daemon_run(config));
 
@@ -1638,6 +1639,7 @@ fn sparse_shared_projgit(args: &Args) -> anyhow::Result<SparseSharedConfig> {
         pool_size: args
             .daemon_pool_size
             .unwrap_or_else(|| DaemonConfig::default().pool_size),
+        pid_file: None,
     };
     let daemon_handle = thread::spawn(move || daemon_run(config));
 

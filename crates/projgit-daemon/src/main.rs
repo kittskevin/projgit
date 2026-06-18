@@ -77,6 +77,23 @@ fn main() -> anyhow::Result<()> {
         /// `PROJGIT_LOG=projgit_daemon=debug`.
         #[arg(short, long, action = clap::ArgAction::Count)]
         verbose: u8,
+
+        /// Write the daemon's PID to <PATH> once the control socket
+        /// is bound (the file's presence doubles as a readiness
+        /// marker), and remove it on graceful shutdown. A SIGKILL
+        /// leaves it stale. Optional — socket-bind already guards
+        /// against a second instance; use this when a supervisor
+        /// wants a PID handle.
+        #[arg(long, value_name = "PATH")]
+        pid_file: Option<PathBuf>,
+
+        /// Directory for the partial clones of URL sources. Required
+        /// for a system service whose user has no `$HOME`; without it
+        /// the daemon falls back to `$XDG_CACHE_HOME` then
+        /// `$HOME/.cache/projgit`, and errors at first URL Attach if
+        /// neither is set.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
     }
 
     let cli = Cli::parse();
@@ -103,6 +120,10 @@ fn main() -> anyhow::Result<()> {
     config.trace = cli.trace;
     if let Some(n) = cli.pool_size {
         config.pool_size = n;
+    }
+    config.pid_file = cli.pid_file;
+    if let Some(dir) = cli.cache_dir {
+        config.cache_dir = Some(dir);
     }
 
     // Signal handling lives in the binary, not the library, because

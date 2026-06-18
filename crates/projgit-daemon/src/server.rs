@@ -93,6 +93,14 @@ pub struct DaemonConfig {
     /// first Attach binds for the daemon's lifetime; changing
     /// `--pool-size` requires a daemon restart.
     pub pool_size: usize,
+    /// If `Some(path)`, write the daemon's PID to `path` once the
+    /// control socket is bound (so the file's presence also serves
+    /// as a readiness marker) and remove it on graceful shutdown.
+    /// A `SIGKILL` leaves it stale (the usual PID-file caveat).
+    /// `None` (default) writes no PID file; socket-bind already
+    /// guards against a second instance, so this is opt-in for
+    /// supervisors that want a PID handle.
+    pub pid_file: Option<PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -104,6 +112,7 @@ impl Default for DaemonConfig {
             cache_depth: None,
             trace: false,
             pool_size: GitCliFetcher::default_pool_size(),
+            pid_file: None,
         }
     }
 }
@@ -338,6 +347,19 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         config.socket_mode
     );
 
+    // Write the PID file once bound + listening, so its presence is
+    // also a readiness marker. A write failure is a startup config
+    // error: surface it loudly and don't leave a half-initialised
+    // daemon (socket bound, no pid file) behind.
+    if let Some(pid_path) = &config.pid_file {
+        if let Err(e) = std::fs::write(pid_path, format!("{}\n", std::process::id())) {
+            let _ = std::fs::remove_file(&config.socket_path);
+            return Err(e)
+                .with_context(|| format!("writing pid file {}", pid_path.display()));
+        }
+        tracing::info!("wrote pid file {}", pid_path.display());
+    }
+
     let state = Arc::new(DaemonState::with_full_config(
         config.socket_path.clone(),
         config.cache_dir.clone(),
@@ -375,6 +397,11 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     drop(listener);
     // Remove the socket file so a restart doesn't see a stale path.
     let _ = std::fs::remove_file(&config.socket_path);
+    // Remove the PID file (if any) so its presence stays a truthful
+    // liveness marker. A SIGKILL skips this and leaves it stale.
+    if let Some(pid_path) = &config.pid_file {
+        let _ = std::fs::remove_file(pid_path);
+    }
     // State drops here. Stage 2b's mount sessions will unmount on this.
     drop(state);
     tracing::info!("shutdown complete");

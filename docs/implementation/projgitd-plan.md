@@ -658,24 +658,34 @@ Production polish, split into independently-shippable sub-stages:
   subscriber init lives in the binary alongside the signal handler.
   Verified: default boot logs `INFO listening on …`; `PROJGIT_LOG=warn`
   suppresses it.
-- **5b — PID file + readiness (not started).** Optional
-  `--pid-file <PATH>` written on bind, removed on shutdown, for
-  `Type=forking`/PIDFile supervision. (Socket-bind already guards
-  against a double-start, so this is mostly a systemd ergonomics
-  nicety.)
-- **5c — systemd unit + deployment recipe (not started).** Ship a
-  sample `projgitd.service` (Type=simple, SIGTERM→clean shutdown
-  already works) plus the operator recipe. Overlaps the
-  "container deployment recipe doc" item; do them together.
-- **5d — Health check (not started).** `projgit attach ping`
-  already gives a liveness probe; a thin `projgitd`-side
-  health subcommand or documented `ExecHealthcheck` may be all
-  that's needed.
-- **5e — Persistent daemon state (deferred, likely skip).** In the
-  Stage 3 sidecar model the daemon doesn't own mounts (sidecars
-  do) and the partial clone is already on disk, so a restart
-  re-`Attach`es cheaply. Persistent state buys little; revisit
-  only if profiling shows re-attach cost matters.
+- **5b — PID file — DONE 2026-06-18.** `projgitd --pid-file <PATH>`
+  writes the PID once the socket is bound (presence = readiness
+  marker) and removes it on graceful shutdown; a `SIGKILL` leaves
+  it stale (documented). `DaemonConfig.pid_file`; write/remove in
+  `run()`. Opt-in — socket-bind already guards double-start.
+- **5c — systemd unit + deployment recipe — DONE 2026-06-18.**
+  [`../../deploy/projgitd.service`](../../deploy/projgitd.service)
+  (Type=simple system unit: dedicated user, `RuntimeDirectory` +
+  `CacheDirectory`, SIGTERM clean shutdown, conservative hardening)
+  and [`../../deploy/README.md`](../../deploy/README.md) (build,
+  system + rootless install, multi-consumer socket access, health,
+  logs, PID file, restart/state). Required adding
+  `projgitd --cache-dir <PATH>` — a system-service user has no
+  `$HOME`, so the daemon couldn't otherwise resolve a cache dir
+  (the `DaemonConfig.cache_dir` field already existed; the CLI just
+  hadn't exposed it).
+- **5d — Health check — DONE 2026-06-18 (no new code).**
+  `projgit attach … ping` already connects, sends `Ping`, and exits
+  `0` on `Pong` / non-zero (with a clear "is the daemon running?"
+  message) otherwise — a ready-made liveness probe for systemd
+  `ExecStartPost`, k8s `exec`, or Docker `HEALTHCHECK`. Documented
+  in the deploy recipe.
+- **5e — Persistent daemon state — SETTLED: not built.** In the
+  Stage 3 sidecar model the daemon owns no mounts (sidecars do) and
+  the partial clone is already on disk, so a restart re-`Attach`es
+  cheaply and sidecars' warm reads survive the gap. There is no
+  durable state worth persisting; revisit only if profiling ever
+  shows re-attach cost matters.
 
 
 ## Cross-cutting notes

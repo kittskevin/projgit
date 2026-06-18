@@ -1,0 +1,87 @@
+# projgitd — systemd service unit (Stage 5c).
+#
+# A long-lived projgit daemon: a pure data plane that owns the
+# upstream connection, the shared content-addressable store, and the
+# in-flight fetch coalescer. Agent containers / sidecars mount
+# projections themselves and talk to this daemon over the unix socket
+# (`projgit mount --daemon-socket <PATH>`). See
+# docs/design/projgitd.md and deploy/README.md.
+#
+# This is a SYSTEM service template (runs as a dedicated user). For a
+# rootless / per-operator deployment, copy to
+# ~/.config/systemd/user/projgitd.service, drop the User=/Group= and
+# the /run + /var/cache lines, and rely on the %t (XDG_RUNTIME_DIR)
+# and %C (cache) specifiers — see deploy/README.md.
+#
+# Install:
+#   sudo cp target/release/projgitd /usr/local/bin/
+#   sudo cp deploy/projgitd.service /etc/systemd/system/
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin projgit
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now projgitd
+#
+# Health check:  projgit attach --socket /run/projgitd/projgitd.sock ping
+# Logs:          journalctl -u projgitd -f
+
+[Unit]
+Description=projgit daemon (shared CAS + fetch coalescer for FUSE projections)
+Documentation=https://github.com/kittskevin/projgit
+# git fetches reach the network; order after it is online.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=projgit
+Group=projgit
+
+# RuntimeDirectory creates /run/projgitd (0750, owned by User/Group)
+# and removes it on stop. The control socket lives inside it.
+RuntimeDirectory=projgitd
+RuntimeDirectoryMode=0750
+# CacheDirectory creates /var/cache/projgit for the partial clones.
+CacheDirectory=projgit
+CacheDirectoryMode=0700
+
+# Default socket mode is 0600 (owner-only). For multi-consumer hosts
+# where agent processes run as a different user, widen to 0660 with
+# `--socket-mode 0660` and add those users to the `projgit` group
+# (the socket inherits Group= via RuntimeDirectory). See
+# deploy/README.md "Letting other users connect".
+ExecStart=/usr/local/bin/projgitd \
+    --socket /run/projgitd/projgitd.sock \
+    --cache-dir /var/cache/projgit
+
+# SIGTERM is the daemon's clean-shutdown path (the binary forwards it
+# to the in-library accept loop, which unmounts nothing in Stage 3 —
+# sidecars own their mounts — removes the socket, and exits).
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=2
+
+# --- Hardening -----------------------------------------------------
+# The daemon binds a unix socket, shells out to `git` for
+# partial-clone + cat-file promisor fetches, and writes packs into the
+# cache dir. It does NOT mount FUSE (sidecars do that in their own
+# namespaces), so it needs no mount privileges. The settings below are
+# a tested-conservative baseline; tighten further per your threat
+# model after confirming `git fetch` still works in your environment.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# git needs AF_UNIX (control socket) + AF_INET/AF_INET6 (https fetch).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Everything except the runtime + cache dirs is read-only via
+# ProtectSystem=strict; those two are made writable by
+# RuntimeDirectory= / CacheDirectory= above.
+
+[Install]
+WantedBy=multi-user.target

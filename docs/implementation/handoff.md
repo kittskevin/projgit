@@ -9,8 +9,8 @@
 >
 > Living document. Updated whenever we land a phase or change direction.
 > Last updated: 2026-06-18, after cat-file-pool Stage 1-3 landed,
-> prefetch coalescing shipped, and projgitd Stage 5a (structured
-> logging) landed.
+> prefetch coalescing shipped, and projgitd Stage 5 (production
+> polish) completed.
 > Rust-scale data-plane bottleneck is now fixed in two parts:
 > (1) `GitCliFetcher` moved from single-child cat-file to a
 > K-slot `BatchChildPool`; (2) daemon RPC handlers release
@@ -930,25 +930,21 @@ two design docs.)
 
 ## What I'd do next
 
-Reprioritized 2026-06-18 after cat-file-pool Stage 1-3 and
-prefetch coalescing shipped. The prior top two items (cat-file
-pool, prefetch coalescing) are done. Remaining queue:
+Reprioritized 2026-06-18 after cat-file-pool Stage 1-3,
+prefetch coalescing, and projgitd Stage 5 (production polish)
+shipped. Remaining queue:
 
-1. **`projgitd` Stage 5 — production polish.** 5a (structured
-  logging) done. Remaining: 5b PID file / readiness, 5c systemd
-  unit + deployment recipe (pairs with #3), 5d health check
-  (`projgit attach ping` may suffice), 5e persistent state
-  (likely skip — sidecars own mounts, clone is on disk).
-  Detail in [`projgitd-plan.md`](projgitd-plan.md) §Stage 5.
-2. **CI bench job (B3).**
+1. **CI bench job (B3).**
   Add a perf job to `.github/workflows/ci.yml` to guard baseline
   regressions now that the key bottleneck fixes are landed.
-3. **Container deployment recipe doc.**
-  Operator cookbook for host/sidecar deployment, mount propagation,
-  and daemon socket wiring.
-4. **Phase 3d production WinFsp backend.**
+2. **Container deployment recipe doc.** Largely covered by
+  [`../../deploy/README.md`](../../deploy/README.md) (Stage 5c);
+  remaining gap is a container-specific walk-through tying together
+  the daemon-on-host / sidecar-in-container topology and the
+  [`../../scripts/docker-smoke/`](../../scripts/docker-smoke/) seed.
+3. **Phase 3d production WinFsp backend.**
   Resume only if Windows target deployment is still in scope.
-5. **Optional bench follow-ups.**
+4. **Optional bench follow-ups.**
   rust N=4/N=10 post-pool matrix (only N=2 measured so far),
   higher-N worktree comparator, and target-scale workload
   validation. The prefetch-coalescing disk/upstream win in
