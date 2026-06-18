@@ -867,9 +867,10 @@ where
         for (provider, spec) in providers.iter().zip(args.mounts.iter()) {
             let p = provider.prefetch_stats();
             eprintln!(
-                "projgit: prefetch ({:<20}) posted={} dropped={} batches={} resolved={} headers={} failed={}",
+                "projgit: prefetch ({:<20}) posted={} dropped={} batches={} resolved={} headers={} failed={} blobs_warmed={} blobs_skipped={}",
                 spec.ref_name,
                 p.posted, p.dropped, p.batches_sent, p.oids_resolved, p.headers_published, p.oids_failed,
+                p.blobs_warmed, p.blobs_skipped,
             );
         }
     }
@@ -966,13 +967,15 @@ where
             b.capacity_bytes,
         );
         eprintln!(
-            "projgit: prefetch (T1) posted={} dropped={} batches={} resolved={} headers={} failed={}",
+            "projgit: prefetch (T1) posted={} dropped={} batches={} resolved={} headers={} failed={} blobs_warmed={} blobs_skipped={}",
             p.posted,
             p.dropped,
             p.batches_sent,
             p.oids_resolved,
             p.headers_published,
             p.oids_failed,
+            p.blobs_warmed,
+            p.blobs_skipped,
         );
     }
 
