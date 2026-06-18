@@ -642,9 +642,41 @@ if/when that day comes.
 
 ### Stage 5 — Lifecycle / supervision
 
-systemd unit (or kubelet recipe), restart policy, persistent
-daemon state for fast recovery, health checks, `tracing-subscriber`
-wiring. Production polish.
+Production polish, split into independently-shippable sub-stages:
+
+- **5a — Structured logging — DONE 2026-06-18.** Replaced the
+  daemon's lifecycle `eprintln!` calls with `tracing` macros and
+  initialise a `tracing_subscriber` fmt layer (stderr, timestamped,
+  level-prefixed) once in the binary's `main`. New
+  `projgitd -v/--verbose` flag (count): default `info`, `-v`
+  `debug`, `-vv` `trace`; an explicit `PROJGIT_LOG` / `RUST_LOG`
+  directive overrides. The `--trace` per-RPC `trace: rpc=…` line
+  stays a raw `eprintln!` on purpose — it's a grep-stable
+  diagnostic channel the bench harness + `baseline.md` rely on, so
+  it must not gain a level/timestamp prefix. The library `run()`
+  never installs a subscriber (in-process tests stay quiet);
+  subscriber init lives in the binary alongside the signal handler.
+  Verified: default boot logs `INFO listening on …`; `PROJGIT_LOG=warn`
+  suppresses it.
+- **5b — PID file + readiness (not started).** Optional
+  `--pid-file <PATH>` written on bind, removed on shutdown, for
+  `Type=forking`/PIDFile supervision. (Socket-bind already guards
+  against a double-start, so this is mostly a systemd ergonomics
+  nicety.)
+- **5c — systemd unit + deployment recipe (not started).** Ship a
+  sample `projgitd.service` (Type=simple, SIGTERM→clean shutdown
+  already works) plus the operator recipe. Overlaps the
+  "container deployment recipe doc" item; do them together.
+- **5d — Health check (not started).** `projgit attach ping`
+  already gives a liveness probe; a thin `projgitd`-side
+  health subcommand or documented `ExecHealthcheck` may be all
+  that's needed.
+- **5e — Persistent daemon state (deferred, likely skip).** In the
+  Stage 3 sidecar model the daemon doesn't own mounts (sidecars
+  do) and the partial clone is already on disk, so a restart
+  re-`Attach`es cheaply. Persistent state buys little; revisit
+  only if profiling shows re-attach cost matters.
+
 
 ## Cross-cutting notes
 

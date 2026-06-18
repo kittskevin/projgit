@@ -40,6 +40,13 @@ nix = { version = "0.29", features = ["fs", "user"] }
 # handlers. Workspace pin so we never drift onto a different gix
 # major than projgit-core.
 gix = { workspace = true }
+# Structured logging for the long-lived daemon (Stage 5 production
+# polish). `tracing` macros in the server; `tracing-subscriber` is
+# initialised once in the binary's `main` (cfg-gated, like the rest
+# of the server). The `env-filter` feature lets operators override
+# the `-v`-derived level via `PROJGIT_LOG` / `RUST_LOG`.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = []

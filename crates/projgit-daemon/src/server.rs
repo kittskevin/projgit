@@ -332,8 +332,8 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     )
     .with_context(|| format!("fchmod {:o} on socket", config.socket_mode))?;
 
-    eprintln!(
-        "projgitd: listening on {} (socket mode {:o})",
+    tracing::info!(
+        "listening on {} (socket mode {:o})",
         config.socket_path.display(),
         config.socket_mode
     );
@@ -358,26 +358,26 @@ pub fn run(config: DaemonConfig) -> Result<()> {
                 let state = state.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = handle_connection(stream, state) {
-                        eprintln!("projgitd: connection error: {e:#}");
+                        tracing::warn!("connection error: {e:#}");
                     }
                 });
             }
             Err(e) => {
-                eprintln!("projgitd: accept error: {e}");
+                tracing::warn!("accept error: {e}");
                 // Don't kill the daemon on a transient accept error.
                 continue;
             }
         }
     }
 
-    eprintln!("projgitd: shutting down");
+    tracing::info!("shutting down");
     // Drop the listener first so no new connections succeed.
     drop(listener);
     // Remove the socket file so a restart doesn't see a stale path.
     let _ = std::fs::remove_file(&config.socket_path);
     // State drops here. Stage 2b's mount sessions will unmount on this.
     drop(state);
-    eprintln!("projgitd: shutdown complete");
+    tracing::info!("shutdown complete");
     Ok(())
 }
 
@@ -439,7 +439,7 @@ fn handle_connection(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<
     if let Err(e) = write_message(&mut stream, &response) {
         // We've already computed the response; if the wire write
         // fails (peer hung up, etc.), there's nothing useful to send.
-        eprintln!("projgitd: response write failed: {e}");
+        tracing::warn!("response write failed: {e}");
     }
     Ok(())
 }
@@ -809,8 +809,8 @@ fn attach_source(
                 Some(n) => format!(" (--depth={n})"),
                 None => String::new(),
             };
-            eprintln!(
-                "projgitd: partial-cloning {} into {}{}",
+            tracing::info!(
+                "partial-cloning {} into {}{}",
                 source,
                 dest.display(),
                 depth_note,
@@ -823,7 +823,7 @@ fn attach_source(
             }
             partial_clone(&opts).with_context(|| format!("cloning {source}"))?;
         } else {
-            eprintln!("projgitd: reusing cached clone at {}", dest.display());
+            tracing::info!("reusing cached clone at {}", dest.display());
         }
         let git_dir = git_dir_for(&dest);
         let store = Arc::new(

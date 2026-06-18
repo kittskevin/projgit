@@ -70,9 +70,18 @@ fn main() -> anyhow::Result<()> {
         /// not a useful configuration.
         #[arg(long, value_name = "N")]
         pool_size: Option<usize>,
+
+        /// Increase log verbosity. Repeat for more: default `info`,
+        /// `-v` `debug`, `-vv` `trace`. Overridable per-target via
+        /// the `PROJGIT_LOG` (preferred) or `RUST_LOG` env var, e.g.
+        /// `PROJGIT_LOG=projgit_daemon=debug`.
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
     }
 
     let cli = Cli::parse();
+
+    init_tracing(cli.verbose);
 
     let socket_mode = u32::from_str_radix(cli.socket_mode.trim_start_matches('0'), 8)
         .map_err(|e| anyhow::anyhow!("--socket-mode must be octal, got `{}`: {e}", cli.socket_mode))?;
@@ -105,13 +114,43 @@ fn main() -> anyhow::Result<()> {
     run(config)
 }
 
+/// Initialise the global `tracing` subscriber for the daemon.
+///
+/// Level precedence: an explicit `PROJGIT_LOG` (or `RUST_LOG`) env
+/// directive wins; otherwise the `-v` count picks the default
+/// (`info` / `debug` / `trace`). Logs go to stderr so they land in
+/// the journal under a systemd unit. Called once from `main`; the
+/// library `run()` never installs a subscriber, so in-process tests
+/// that drive the daemon stay quiet.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn init_tracing(verbose: u8) {
+    use tracing_subscriber::EnvFilter;
+
+    let default_level = match verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    let filter = std::env::var("PROJGIT_LOG")
+        .ok()
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .map(EnvFilter::new)
+        .unwrap_or_else(|| EnvFilter::new(default_level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn install_signal_handler(socket_path: std::path::PathBuf) -> anyhow::Result<()> {
     use projgit_daemon::protocol::{write_message, Request};
     use std::os::unix::net::UnixStream;
 
     ctrlc::set_handler(move || {
-        eprintln!("projgitd: shutdown signal received; forwarding via socket");
+        tracing::info!("shutdown signal received; forwarding via socket");
         // Self-connect and send Shutdown — the running accept loop
         // picks it up like any other client. Keeps the in-library
         // shutdown path unique.
@@ -120,7 +159,7 @@ fn install_signal_handler(socket_path: std::path::PathBuf) -> anyhow::Result<()>
                 let _ = write_message(&mut s, &Request::Shutdown);
             }
             Err(e) => {
-                eprintln!("projgitd: signal-handler self-connect failed: {e}");
+                tracing::warn!("signal-handler self-connect failed: {e}");
             }
         }
     })
