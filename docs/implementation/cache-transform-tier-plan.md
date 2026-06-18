@@ -5,9 +5,9 @@
 > actually gets built. Updated as each stage lands or surfaces
 > something that changes downstream stages.
 >
-> Last updated: 2026-06-18 (Stage 0 decided + Stage 1 implemented:
-> FetchMany wire, fetch_objects primitive, warm_tree_closure eager-tree
-> warm across daemon + standalone + sidecar mount paths).
+> Last updated: 2026-06-18 (Stage 0 decided; Stage 1 + Stage 3
+> mechanism implemented: FetchMany wire, fetch_objects, warm_tree_closure
+> eager-tree warm, and PROJGIT_PREFETCH_BLOBS size-capped blob prefetch).
 >
 > Design in [`../design/cache-transform-tier.md`](../design/cache-transform-tier.md);
 > this is one level down — concrete steps, file changes, commit
@@ -368,13 +368,23 @@ warm on the daemon (`handle_mount`), standalone, and sidecar
 (`DaemonFetcher`->`FetchMany`) mount paths. Workspace clippy + tests
 green.
 
-**Next: Stage 3 (prefetch-warm blobs, Architecture B)** — drive
-`fetch_objects` from the readdir-time prefetch worker so blob *bytes*
-warm ahead of demand (currently `fetch_objects`/`FetchMany` exist
-end-to-end but only `warm_tree_closure` drives them, for trees). Apply
-tiered eagerness (§6.1): policy-gated, not blanket. Stage 2 (the derived
-metadata memo) is, per design §9, adequately covered for MVP by the
-shared odb + in-process header cache; persist only when profiled.
+**Stage 3 (prefetch-warm blobs, Architecture B) mechanism shipped.**
+The readdir-time prefetch worker now drives `fetch_objects` to warm a
+directory's blob *bytes* ahead of demand, gated by
+`PROJGIT_PREFETCH_BLOBS` with a size cap (tiered eagerness, §6.1).
+**Still open for Stage 3:** the §6.3 bench validation (confirm the
+cold-read tail shrinks without blowing past `∝ touched + bounded
+prefetch slack`) needs a network-backed run; and promoting the env gate
+to a CLI flag once the policy is bench-tuned.
+
+Stage 2 (the derived metadata memo) is, per design §9, adequately
+covered for MVP by the shared odb + in-process header cache; persist
+only when profiled.
+
+**Next: Stage 5 (maintenance loop)** — MIDX + incremental repack +
+commit-graph on the shared CAS, the piece that makes cross-commit reuse
+physical (§14). This is the largest remaining Phase 1 gap for the §1
+"different commits" workload.
 
 Phase 2 (writable) is intentionally undecided and gated on the
 [`../design/writable-worktrees.md`](../design/writable-worktrees.md)
