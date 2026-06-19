@@ -142,6 +142,11 @@ struct Upper {
     /// reconstructed from `lookup` calls (parent path + name). Lets the
     /// inode-keyed write path name the FSMonitor changed-paths set.
     inode_paths: HashMap<u64, String>,
+    /// `(parent_inode, name)` of each looked-up inode, so a baseline swap
+    /// can enqueue precise `inval_entry` calls (the kernel must re-lookup
+    /// changed paths by name, since a changed file's inode differs in the
+    /// new baseline).
+    inode_parent_name: HashMap<u64, (u64, Vec<u8>)>,
     /// FSMonitor write-log: worktree-relative paths changed since mount.
     modified_paths: std::collections::BTreeSet<String>,
     /// Monotonic, timestamp-shaped FSMonitor token (git rejects small
@@ -164,10 +169,11 @@ impl Upper {
 }
 
 /// Writable overlay filesystem: read-only `lower` projection + in-memory
-/// upper materialization store.
+/// upper materialization store. `lower` and `up` are shared (Arc) so a
+/// [`WritableHandle`] can swap the baseline under a live mount.
 pub struct WritableFs<F: FsProvider> {
-    lower: Arc<F>,
-    up: Mutex<Upper>,
+    lower: Arc<Mutex<Arc<F>>>,
+    up: Arc<Mutex<Upper>>,
     /// Off-thread kernel-cache invalidator. `None` => no invalidation
     /// and `ttl == 0` (every getattr re-asks us; always correct).
     inval: Option<Sender<Inval>>,
@@ -185,8 +191,8 @@ impl<F: FsProvider> WritableFs<F> {
     /// no kernel-cache invalidation (TTL=0), no FSMonitor log, no cone.
     pub fn new(lower: Arc<F>) -> Self {
         Self {
-            lower,
-            up: Mutex::new(Upper::default()),
+            lower: Arc::new(Mutex::new(lower)),
+            up: Arc::new(Mutex::new(Upper::default())),
             inval: None,
             ttl: Duration::ZERO,
             fsmonitor_file: None,
@@ -208,12 +214,28 @@ impl<F: FsProvider> WritableFs<F> {
             write_fsm(p, now_nanos(), &std::collections::BTreeSet::new());
         }
         Self {
-            lower,
-            up: Mutex::new(Upper::default()),
+            lower: Arc::new(Mutex::new(lower)),
+            up: Arc::new(Mutex::new(Upper::default())),
             inval: Some(inval),
             ttl: WRITABLE_TTL,
             fsmonitor_file,
             cone,
+        }
+    }
+
+    /// Current lower baseline (cheap Arc clone).
+    fn lower(&self) -> Arc<F> {
+        self.lower.lock().unwrap().clone()
+    }
+
+    /// A handle that shares this overlay's swappable state, so a caller
+    /// can [`WritableHandle::swap_baseline`] under the live mount.
+    fn handle(&self) -> WritableHandle<F> {
+        WritableHandle {
+            lower: self.lower.clone(),
+            up: self.up.clone(),
+            inval: self.inval.clone(),
+            fsmonitor_file: self.fsmonitor_file.clone(),
         }
     }
 
@@ -283,7 +305,7 @@ impl<F: FsProvider> WritableFs<F> {
             a.mtime = SystemTime::now();
             return Ok(a);
         }
-        let mut a = self.lower.getattr(ino)?;
+        let mut a = self.lower().getattr(ino)?;
         if let Some(buf) = up.content.get(&ino) {
             a.size = buf.len() as u64;
         }
@@ -300,11 +322,12 @@ impl<F: FsProvider> WritableFs<F> {
             return Ok(());
         }
         // Lower file: read its full content through the projection.
-        let size = self.lower.getattr(ino)?.size;
+        let lower = self.lower();
+        let size = lower.getattr(ino)?.size;
         let mut buf = Vec::with_capacity(size as usize);
         let mut off = 0u64;
         while off < size {
-            let chunk = self.lower.read(ino, off, 64 * 1024)?;
+            let chunk = lower.read(ino, off, 64 * 1024)?;
             if chunk.is_empty() {
                 break;
             }
@@ -325,7 +348,7 @@ impl<F: FsProvider> WritableFs<F> {
         if let Some(&ino) = up.additions.get(&parent).and_then(|m| m.get(name)) {
             return Ok(ino);
         }
-        Ok(self.lower.lookup(parent, name)?.inode)
+        Ok(self.lower().lookup(parent, name)?.inode)
     }
 }
 
@@ -347,6 +370,9 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
                             return;
                         }
                         up.inode_paths.entry(ino).or_insert(child_path);
+                        up.inode_parent_name
+                            .entry(ino)
+                            .or_insert_with(|| (parent.0, name.to_vec()));
                         reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN);
                     }
                     Err(e) => reply.error(errno_for(&e)),
@@ -373,7 +399,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             return;
         }
         drop(up);
-        match self.lower.readlink(ino.0) {
+        match self.lower().readlink(ino.0) {
             Ok(t) => reply.data(t.as_slice()),
             Err(e) => reply.error(errno_for(&e)),
         }
@@ -404,7 +430,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             return;
         }
         drop(up);
-        match self.lower.read(ino.0, offset, size) {
+        match self.lower().read(ino.0, offset, size) {
             Ok(bytes) => reply.data(&bytes),
             Err(e) => reply.error(errno_for(&e)),
         }
@@ -431,7 +457,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         let additions = up.additions.get(&parent);
 
         if !is_created_dir {
-            match self.lower.readdir(parent, 0) {
+            match self.lower().readdir(parent, 0) {
                 Ok(lower) => {
                     for e in lower {
                         let name = e.name.to_vec();
@@ -710,7 +736,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         // even though its name (and thus lower path) changes.
         let is_lower_file = !up.created.contains_key(&src)
             && self
-                .lower
+                .lower()
                 .getattr(src)
                 .map(|a| matches!(a.kind, FileType::RegularFile))
                 .unwrap_or(false);
@@ -780,6 +806,76 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
     }
 }
 
+/// A handle to a live writable mount that shares the overlay's swappable
+/// state, so a caller can swap the LOWER baseline (a `checkout` of a
+/// different commit) under the mount. Obtain it from
+/// [`mount_writable_background_with_handle`].
+pub struct WritableHandle<F: FsProvider> {
+    lower: Arc<Mutex<Arc<F>>>,
+    up: Arc<Mutex<Upper>>,
+    inval: Option<Sender<Inval>>,
+    fsmonitor_file: Option<std::path::PathBuf>,
+}
+
+/// Errors from [`WritableHandle::swap_baseline`].
+#[derive(Debug)]
+pub enum SwapError {
+    /// The overlay has outstanding materialized edits / created entries /
+    /// whiteouts; swapping the baseline would lose them. Commit or
+    /// discard first. (EdenFS-style edit-survival across a swap is a
+    /// documented Stage 7 follow-up — see
+    /// `docs/implementation/writable-worktrees-plan.md`.)
+    NotClean,
+}
+
+impl std::fmt::Display for SwapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SwapError::NotClean => {
+                write!(f, "cannot swap baseline: overlay has outstanding changes")
+            }
+        }
+    }
+}
+impl std::error::Error for SwapError {}
+
+impl<F: FsProvider> WritableHandle<F> {
+    /// Swap the LOWER baseline under the live mount (a `checkout` of a
+    /// different commit). Requires a **clean** overlay (no materialized
+    /// edits, created entries, or whiteouts). On success, the kernel's
+    /// attr + entry caches for every previously looked-up inode are
+    /// invalidated (off-thread) so subsequent accesses re-resolve against
+    /// `new_lower` — unmodified files re-virtualize to the new baseline.
+    pub fn swap_baseline(&self, new_lower: Arc<F>) -> Result<(), SwapError> {
+        let mut up = self.up.lock().unwrap();
+        let dirty = !up.content.is_empty()
+            || !up.created.is_empty()
+            || !up.modified_paths.is_empty()
+            || up.whiteouts.values().any(|s| !s.is_empty());
+        if dirty {
+            return Err(SwapError::NotClean);
+        }
+        // Point the overlay at the new baseline.
+        *self.lower.lock().unwrap() = new_lower;
+        // Re-lookup everything: the kernel must drop dentries (a changed
+        // file's inode differs in the new baseline) and re-read data.
+        if let Some(tx) = &self.inval {
+            for (ino, (parent, name)) in up.inode_parent_name.iter() {
+                let _ = tx.send(Inval::Entry(*parent, name.clone()));
+                let _ = tx.send(Inval::Inode(*ino));
+            }
+        }
+        up.inode_paths.clear();
+        up.inode_parent_name.clear();
+        // Advance the FSMonitor token so a watcher sees state changed.
+        up.fsm_token = now_nanos().max(up.fsm_token + 1);
+        if let Some(p) = &self.fsmonitor_file {
+            write_fsm(p, up.fsm_token, &up.modified_paths);
+        }
+        Ok(())
+    }
+}
+
 /// Mount a [`WritableFs`] over `lower` at `mountpoint`, returning a
 /// background session. Unlike [`crate::mount_background`], the mount is
 /// **read-write** (no `MountOption::RO`). The default read-only mount
@@ -789,6 +885,17 @@ pub fn mount_writable_background<F: FsProvider + 'static>(
     mountpoint: impl AsRef<Path>,
     config: &crate::MountConfig,
 ) -> std::io::Result<fuser::BackgroundSession> {
+    Ok(mount_writable_background_with_handle(lower, mountpoint, config)?.0)
+}
+
+/// Like [`mount_writable_background`] but also returns a
+/// [`WritableHandle`] for swapping the LOWER baseline under the live
+/// mount (Stage 7 / checkout-under-live-mount).
+pub fn mount_writable_background_with_handle<F: FsProvider + 'static>(
+    lower: Arc<F>,
+    mountpoint: impl AsRef<Path>,
+    config: &crate::MountConfig,
+) -> std::io::Result<(fuser::BackgroundSession, WritableHandle<F>)> {
     let (tx, rx) = std::sync::mpsc::channel::<Inval>();
     let fs = WritableFs::with_invalidator(
         lower,
@@ -796,6 +903,7 @@ pub fn mount_writable_background<F: FsProvider + 'static>(
         config.fsmonitor_file.clone(),
         config.sparse_cone.clone(),
     );
+    let handle = fs.handle();
     let mut fc = Config::default();
     fc.mount_options = vec![
         MountOption::FSName(config.name.clone()),
@@ -819,5 +927,5 @@ pub fn mount_writable_background<F: FsProvider + 'static>(
             }
         })
         .ok();
-    Ok(session)
+    Ok((session, handle))
 }

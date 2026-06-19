@@ -6,11 +6,10 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (**Stages 1–6 shipped** — the read-only→writable
-> seam through commit: R1 index, overlay, R4 invalidation, R3 FSMonitor,
-> R2 sparse cone, verified edit→add→commit. **Stage 7 designed** — the
-> hard problems (path-keyed upper, entry-cache invalidation, git-checkout
-> integration, crash journal) captured for a dedicated effort.).
+> Last updated: 2026-06-19 (**Stages 1–6 shipped**; **Stage 7 core
+> shipped** — `swap_baseline` under a live mount for the clean-worktree
+> checkout, with entry-cache invalidation; edit-survival, git-checkout
+> integration, and the crash journal remain).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -201,56 +200,40 @@ materialized set via `gix` (with the cache-tree extension) so commit
 cost is proportional to the change rather than git re-reading the
 worktree. Correctness is in hand; this is a perf follow-up.
 
-### Stage 7 — checkout-under-live-mount + crash consistency  *(DESIGNED; remaining work)*
+### Stage 7 — checkout-under-live-mount + crash consistency  *(core SHIPPED 2026-06-19; follow-ups remain)*
 
-The design (§10.7, §11) flags this as the subtlest part, and starting it
-surfaced concrete decisions that warrant a dedicated effort rather than a
-rushed final pass. Captured here so the next session starts from the
-findings, not a blank page.
+**Shipped.** `WritableFs` now shares its `lower` baseline + `up` state
+(both `Arc<Mutex<…>>`), and `mount_writable_background_with_handle`
+returns a `WritableHandle` whose `swap_baseline(new_lower)` swaps the
+LOWER projection under the live mount — a `checkout` of a different
+commit. On swap it enqueues precise `inval_entry(parent, name)` +
+`inval_inode` for every previously looked-up inode (tracked via
+`inode_parent_name`) through the Stage 3 off-thread invalidator, so the
+kernel re-resolves changed paths by name against the new baseline, and
+advances the FSMonitor token. Swapping is refused (`SwapError::NotClean`)
+while the overlay holds outstanding edits.
 
-**Hard problem 1 — the upper layer is inode-keyed.** Stages 2–6 key
-materialized content by inode (`content: HashMap<u64, _>`). A baseline
-swap (`checkout` of a different commit) changes the inodes for any path
-whose blob OID differs, so inode-keyed upper state is orphaned by a swap.
-EdenFS keys materialization by **path / tree position** for exactly this
-reason. *Decision:* before checkout support, add a path-keyed
-materialization index (e.g. `materialized_by_path: HashMap<String,
-Vec<u8>>` mirroring `content`, re-associated to the new inode on the
-first post-swap `lookup`) so edits survive a checkout (EdenFS semantics).
+**Proved** (`tests/writable_mount.rs::writable_mount_swap_baseline_serves_new_commit`,
+real mount): mount commit A (`README=A`, `dir/x.txt=one`), then
+`swap_baseline` to commit B — the mount re-virtualizes to B
+(`README=B`, `dir/x.txt=two`, the B-only `dir/y.txt` appears); a swap
+while a local edit is outstanding is refused.
 
-**Hard problem 2 — invalidation must be entry-cache, not just inode.**
-`inval_inode(old_ino)` is insufficient: a changed file's old inode does
-not exist in the new baseline, so the kernel must re-`lookup` by name —
-which needs `inval_entry(parent_ino, name)` for every changed path. The
-overlay tracks `inode -> path` (Stage 4) but not `path -> parent_ino`;
-*decision:* maintain the reverse mapping (or store `(parent_ino, name)`
-alongside each looked-up inode) so a swap can enqueue precise
-`inval_entry` calls. The Stage 3 off-thread invalidator is the delivery
-mechanism (reuse it).
+**Remaining follow-ups (the harder half).**
+1. **Edit-survival across checkout** (EdenFS semantics): the upper is
+   inode-keyed, so a swap currently requires a clean overlay. Re-key
+   materialization by path so edits carry across a swap, then drop the
+   `NotClean` restriction.
+2. **git-checkout integration**: have git's `checkout` *drive* the swap
+   (update HEAD/index + `swap_baseline`) instead of materializing the
+   whole diff into the worktree — the daemon observing the HEAD change
+   + sparse/skip-worktree is the likely seam.
+3. **Crash consistency**: move the upper to an on-disk overlay, then add
+   a minimal journal (§10.3). Small blast radius (immutable LOWER), but
+   nonzero.
 
-**Hard problem 3 — git must not materialize on checkout.** A plain `git
-checkout <other>` over the mount would write every changed file into the
-worktree (materializing the whole diff — the opposite of virtual). The
-VFS must drive the swap: `checkout` updates HEAD + index, and projgit
-swaps the LOWER baseline so unmodified files re-virtualize. This needs
-the swap entry point (`WritableFs::swap_baseline(new_lower)` —
-straightforward to add: make `lower` a `Mutex<Arc<F>>`, clone-out per
-call) plus integration so git's checkout path triggers it rather than
-writing files (sparse/skip-worktree + the daemon observing the HEAD
-change is the likely seam).
-
-**Hard problem 4 — crash consistency of the upper.** The upper is
-in-memory (Stage 2 decision). Surviving a daemon/host crash needs the
-on-disk overlay + a minimal journal (design §10.3). Blast radius is
-small (immutable content-addressed LOWER can't corrupt; only the bounded
-UPPER needs recovery), but it is nonzero. *Decision:* move the upper to
-an on-disk overlay dir first (also helps memory pressure for large
-edits), then add the journal.
-
-**Recommended order:** (1) on-disk upper; (2) path-keyed materialization;
-(3) `swap_baseline` + entry-cache invalidation, tested with a direct
-swap (clean worktree first, then with surviving edits); (4) git-checkout
-integration; (5) upper journal for crash consistency.
+**Recommended order for the follow-ups:** on-disk upper → path-keyed
+materialization → git-checkout integration → journal.
 
 ## 3. Out of scope (this plan)
 

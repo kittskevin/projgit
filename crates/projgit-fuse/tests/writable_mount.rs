@@ -24,7 +24,7 @@ use projgit_core::{
     dotgit, HydratingObjectStore, NoopFetcher, ObjectStore, Projection, ProjectionFsProvider,
     RootOverlay,
 };
-use projgit_fuse::{mount_writable_background, MountConfig};
+use projgit_fuse::{mount_writable_background, mount_writable_background_with_handle, MountConfig};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -457,5 +457,118 @@ fn writable_mount_sparse_cone_hides_out_of_cone() {
     assert!(
         std::fs::read_dir(mnt.join("dirB")).is_err(),
         "out-of-cone dir must not be listable"
+    );
+}
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn writable_mount_swap_baseline_serves_new_commit() {
+    // Stage 7: swap the LOWER baseline under a live mount (a checkout of a
+    // different commit) and prove unmodified files re-virtualize to the
+    // new baseline, with the kernel caches invalidated.
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+
+    let base = std::env::temp_dir().join(format!("projgit-wr-swap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let served = base.join("served");
+    std::fs::create_dir_all(&src).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    // commit A
+    std::fs::write(src.join("README.md"), b"A\n").unwrap();
+    std::fs::write(src.join("dir/x.txt"), b"one\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "A"]);
+    // commit B: change both files + add a new one
+    std::fs::write(src.join("README.md"), b"B\n").unwrap();
+    std::fs::write(src.join("dir/x.txt"), b"two\n").unwrap();
+    std::fs::write(src.join("dir/y.txt"), b"new\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "B"]);
+
+    let url = format!("file://{}", src.display());
+    git_ok(
+        &base,
+        &["clone", "-q", "--no-checkout", &url, served.to_str().unwrap()],
+    );
+    let head_b = gix::ObjectId::from_hex(git_ok(&served, &["rev-parse", "HEAD"]).trim().as_bytes())
+        .unwrap();
+    let head_a =
+        gix::ObjectId::from_hex(git_ok(&served, &["rev-parse", "HEAD~1"]).trim().as_bytes())
+            .unwrap();
+
+    let make_provider = |commit: gix::ObjectId, id: u64| {
+        let store = Arc::new(ObjectStore::open(&served).unwrap());
+        let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
+        Arc::new(
+            ProjectionFsProvider::new(Projection::Commit(commit), hydrating, RootOverlay::new(), id)
+                .expect("ProjectionFsProvider::new"),
+        )
+    };
+
+    let mnt = base.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let (_session, handle) =
+        mount_writable_background_with_handle(make_provider(head_a, 1), &mnt, &MountConfig::default())
+            .expect("mount_writable_background_with_handle");
+    assert!(wait_for_mount(&mnt, Duration::from_secs(5)), "never mounted");
+
+    // Baseline A.
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("README.md")).unwrap(),
+        "A\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("dir/x.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(!mnt.join("dir/y.txt").exists(), "y.txt is not in commit A");
+
+    // Swap to commit B under the live mount.
+    handle
+        .swap_baseline(make_provider(head_b, 2))
+        .expect("clean swap should succeed");
+    // Let the off-thread invalidator reach the kernel.
+    std::thread::sleep(Duration::from_millis(250));
+
+    // The mount now re-virtualizes to baseline B.
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("README.md")).unwrap(),
+        "B\n",
+        "swapped baseline must serve commit B's README"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("dir/x.txt")).unwrap(),
+        "two\n",
+        "swapped baseline must serve commit B's dir/x.txt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("dir/y.txt")).unwrap(),
+        "new\n",
+        "file added in commit B must appear after the swap"
+    );
+
+    // A swap with outstanding edits is refused (EdenFS-style edit-survival
+    // across checkout is a documented Stage 7 follow-up).
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mnt.join("README.md"))
+            .unwrap();
+        f.write_all(b"local edit\n").unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        handle.swap_baseline(make_provider(head_a, 3)).is_err(),
+        "swap must be refused while the overlay has outstanding edits"
     );
 }
