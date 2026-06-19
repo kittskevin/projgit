@@ -179,10 +179,11 @@ out-of-cone worktree content.
 with `cone = [dirA]`, the root lists `README.md` + `dirA` but not `dirB`;
 `dirA` contents are visible; `dirB` is neither stat-able nor listable.
 
-**Deferred:** seeding the index with `SKIP_WORKTREE` on out-of-cone
-entries so a *git* sparse-checkout flow over the mount is clean without
-git's own `sparse-checkout set` pass (the R1 index variant for sparse
-mounts).
+**Index pairing (shipped).** `dotgit::build_writable_index_bytes_sparse`
+seeds `SKIP_WORKTREE` (as an extended/V3 index entry) on every out-of-cone
+path, so git knows the hidden files are intentionally absent and `status`
+stays clean (without it, git reports the hidden files as *deleted*).
+Tested in `tests/dotgit_index.rs::sparse_index_sets_skip_worktree_outside_cone`.
 
 ### Stage 6 — commit path  *(SHIPPED 2026-06-19, correctness)*
 

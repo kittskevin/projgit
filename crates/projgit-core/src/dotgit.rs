@@ -322,6 +322,56 @@ pub fn build_writable_index_bytes(
     store: &ObjectStore,
     commit_oid: ObjectId,
 ) -> Result<Vec<u8>, IndexBuildError> {
+    build_writable_index_bytes_inner(store, commit_oid, &[])
+}
+
+/// Like [`build_writable_index_bytes`] but for a **sparse** (cone-mode)
+/// mount: every entry whose path is outside `cone` gets the
+/// `SKIP_WORKTREE` flag set, so git knows those files are intentionally
+/// absent from the worktree. Pair this with the FUSE projection hiding
+/// the same out-of-cone paths (writable-worktrees-plan.md Stage 5 / R2):
+/// without `SKIP_WORKTREE`, git would report the hidden files as
+/// *deleted*; with it, `status` stays clean and the sparse-index stays
+/// collapsed.
+///
+/// `cone` is a list of cone-mode directories (worktree-relative, no
+/// trailing slash). An empty `cone` is equivalent to
+/// [`build_writable_index_bytes`].
+pub fn build_writable_index_bytes_sparse(
+    store: &ObjectStore,
+    commit_oid: ObjectId,
+    cone: &[String],
+) -> Result<Vec<u8>, IndexBuildError> {
+    build_writable_index_bytes_inner(store, commit_oid, cone)
+}
+
+/// Whether an index file `path` is inside the cone (i.e. its parent
+/// directory is shown). Root files are always in; otherwise the parent
+/// dir must be within a cone dir or an ancestor leading to one. Empty
+/// cone => everything in.
+fn index_path_in_cone(path: &str, cone: &[String]) -> bool {
+    if cone.is_empty() {
+        return true;
+    }
+    let parent = match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    };
+    if parent.is_empty() {
+        return true;
+    }
+    cone.iter().any(|c| {
+        parent == c
+            || parent.starts_with(&format!("{c}/"))
+            || c.starts_with(&format!("{parent}/"))
+    })
+}
+
+fn build_writable_index_bytes_inner(
+    store: &ObjectStore,
+    commit_oid: ObjectId,
+    cone: &[String],
+) -> Result<Vec<u8>, IndexBuildError> {
     use std::time::UNIX_EPOCH;
 
     let tree_oid = store
@@ -342,13 +392,28 @@ pub fn build_writable_index_bytes(
         .map_err(|e| IndexBuildError::FromTree(Box::new(e)))?;
     let (mut state, _path) = file.into_parts();
 
-    for entry in state.entries_mut() {
+    // Collect paths first (borrows `state` immutably); then mutate entries
+    // by index (mutable borrow). The two never overlap.
+    let paths: Vec<bstr::BString> = if cone.is_empty() {
+        Vec::new()
+    } else {
+        state.entries().iter().map(|e| e.path(&state).to_owned()).collect()
+    };
+
+    for (i, entry) in state.entries_mut().iter_mut().enumerate() {
         let (_kind, size) = store.header(entry.id).map_err(IndexBuildError::Store)?;
         entry.stat.size = size.min(u32::MAX as u64) as u32;
         entry.stat.mtime = stamp;
         entry.stat.ctime = stamp;
         // NB: deliberately NOT setting ASSUME_VALID — a writable mount
         // needs git to notice edits.
+        if !cone.is_empty() {
+            let path = String::from_utf8_lossy(&paths[i]);
+            if !index_path_in_cone(&path, cone) {
+                entry.flags |= gix::index::entry::Flags::EXTENDED
+                    | gix::index::entry::Flags::SKIP_WORKTREE;
+            }
+        }
     }
 
     let file = gix::index::File::from_state(state, std::path::PathBuf::new());

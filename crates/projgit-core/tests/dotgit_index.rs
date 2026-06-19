@@ -397,3 +397,48 @@ fn writable_index_carries_real_size_and_mtime() {
     }
 }
 
+#[test]
+fn sparse_index_sets_skip_worktree_outside_cone() {
+    // build a repo with two top-level dirs + a root file
+    let base = std::env::temp_dir().join(format!(
+        "projgit-dotgit-sparse-{}-{}",
+        std::process::id(),
+        next_unique_id(),
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let _guard = DirGuard(base.clone());
+    git(&base, &["init", "-q", "-b", "main"]);
+    git(&base, &["config", "user.email", "t@t.invalid"]);
+    git(&base, &["config", "user.name", "t"]);
+    std::fs::write(base.join("README.md"), b"root\n").unwrap();
+    std::fs::create_dir_all(base.join("dirA")).unwrap();
+    std::fs::write(base.join("dirA/a.txt"), b"alpha\n").unwrap();
+    std::fs::create_dir_all(base.join("dirB")).unwrap();
+    std::fs::write(base.join("dirB/b.txt"), b"bravo\n").unwrap();
+    git(&base, &["add", "-A"]);
+    git(&base, &["commit", "-q", "-m", "init"]);
+    let head =
+        gix::ObjectId::from_hex(String::from_utf8(git(&base, &["rev-parse", "HEAD"])).unwrap().trim().as_bytes())
+            .unwrap();
+
+    let store = Arc::new(ObjectStore::open(&base).unwrap());
+    let bytes =
+        dotgit::build_writable_index_bytes_sparse(&store, head, &["dirA".to_string()]).unwrap();
+    let file = parse_index(&bytes);
+
+    let skip = gix::index::entry::Flags::SKIP_WORKTREE;
+    for entry in file.entries() {
+        let path = entry.path(&file).to_string();
+        let has_skip = entry.flags.contains(skip);
+        if path.starts_with("dirB/") {
+            assert!(has_skip, "out-of-cone `{path}` must have SKIP_WORKTREE");
+        } else {
+            assert!(
+                !has_skip,
+                "in-cone `{path}` (root file or cone dir) must NOT have SKIP_WORKTREE",
+            );
+        }
+    }
+}
+
