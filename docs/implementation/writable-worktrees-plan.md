@@ -123,9 +123,21 @@ file stays virtual (served from the lower projection).
 
 **Deferred within Stage 2:** in-memory upper (on-disk overlay + crash
 consistency = Stage 7); attr-cache TTL is 0 (Stage 3 / R4 restores it
-with FUSE invalidation); `.git`-writable-inside-the-mount and the CLI
-`--writable` flag wiring (ergonomics; the mechanism is proven via
-`mount_writable_background` + an external git-dir).
+with FUSE invalidation).
+
+**CLI `--writable` (SHIPPED 2026-06-19).** `projgit mount --writable
+<src> <mnt>` now works end to end: projgit creates a real, writable
+scratch git dir on disk (detached `HEAD` at the projection commit,
+`objects/info/alternates` → the shared store, a writable seeded index,
+`core.worktree` = mountpoint, `core.checkStat = minimal`) and synthesizes
+the mount's `.git` as a `gitdir:` **link file** to it, then mounts via
+`mount_writable_background`. Stock git inside the mount does
+`status`/`add`/`commit` against the on-disk git dir while the worktree is
+the FUSE mount; cold blobs hydrate on read through the projection. Proved
+by `crates/projgit-cli/tests/writable_mount_cli.rs` (real CLI subprocess:
+clean status → edit + new file → `M`/`??` → `add` → `commit` → verified
+content). First-cut limits: in-memory upper (edits lost on unmount unless
+committed); not combinable with `--subtree`/`--no-dotgit`/`--daemon-socket`.
 
 ### Stage 3 — R4: FUSE invalidation on write  *(SHIPPED 2026-06-19)*
 

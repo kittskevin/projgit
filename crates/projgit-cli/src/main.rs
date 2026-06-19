@@ -141,6 +141,20 @@ struct MountArgs {
     #[arg(long)]
     no_dotgit: bool,
 
+    /// **Writable worktree** (Phase 2). Mount the projection read-WRITE:
+    /// unmodified files stay virtual, but you can edit them, create new
+    /// files, `git add`, and `git commit` — only touched files are
+    /// materialized (EdenFS-style). projgit sets up a real, writable
+    /// git dir on disk (alternating to the shared object store) and
+    /// links the mount's `.git` to it, so stock git inside the mount
+    /// works with no fork.
+    ///
+    /// First-cut limitations: in-memory upper (edits are lost on
+    /// unmount unless committed); not combinable with `--subtree`,
+    /// `--no-dotgit`, or `--daemon-socket`.
+    #[arg(long)]
+    writable: bool,
+
     /// Pass the `allow_other` FUSE mount option, so users other than
     /// the one running `projgit mount` can read the mount.
     ///
@@ -408,8 +422,20 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     // hydration. The FUSE protocol loop runs locally so a daemon
     // crash degrades to brief cold-fetch unavailability rather than
     // killing the mount.
+    if args.writable && args.daemon_socket.is_some() {
+        bail!("--writable is not supported with --daemon-socket (sidecar) yet");
+    }
     if let Some(sock) = args.daemon_socket.clone() {
         return cmd_mount_via_daemon(args, sock);
+    }
+
+    if args.writable {
+        if args.no_dotgit {
+            bail!("--writable cannot be combined with --no-dotgit (it needs a synthesized .git link)");
+        }
+        if args.subtree.is_some() {
+            bail!("--writable cannot be combined with --subtree");
+        }
     }
 
     // 1. Resolve `source` to a local git directory.
@@ -477,7 +503,19 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     //    `git`'s promisor mechanism uses whatever remote the partial
     //    clone configured (typically `origin`).
     let _remote_hint = &args.remote;
-    let overlay = build_root_overlay(&args, &projection, &store, &git_dir)?;
+    let (overlay, writable) = if args.writable {
+        let commit_oid = projection
+            .resolve_commit(&store)
+            .context("resolving projection commit for --writable")?;
+        let scratch = setup_writable_gitdir(&git_dir, &store, commit_oid, &args.mountpoint)?;
+        eprintln!(
+            "projgit: writable mount — git dir at {} (edits are in-memory; commit to persist)",
+            scratch.display()
+        );
+        (build_writable_overlay(&scratch)?, true)
+    } else {
+        (build_root_overlay(&args, &projection, &store, &git_dir)?, false)
+    };
     let mut cfg = MountConfig::default();
     if args.allow_other {
         cfg.acl = projgit_fuse::SessionACL::All;
@@ -495,7 +533,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
             ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
                 .context("building ProjectionFsProvider")?,
         );
-        run_mount(provider, &mp, &cfg, print_stats)
+        run_mount(provider, &mp, &cfg, print_stats, writable)
     } else {
         match args.fetcher {
             FetcherChoice::Git => {
@@ -509,7 +547,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
                     )
                     .context("building ProjectionFsProvider")?,
                 );
-                run_mount(provider, &mp, &cfg, print_stats)
+                run_mount(provider, &mp, &cfg, print_stats, writable)
             }
             #[cfg(feature = "gvfs-fetcher")]
             FetcherChoice::Gvfs => {
@@ -532,7 +570,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
                     )
                     .context("building ProjectionFsProvider")?,
                 );
-                run_mount(provider, &mp, &cfg, print_stats)
+                run_mount(provider, &mp, &cfg, print_stats, writable)
             }
         }
     }
@@ -626,7 +664,7 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
         ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
             .context("building ProjectionFsProvider")?,
     );
-    run_mount(provider, &mp, &cfg, print_stats)
+    run_mount(provider, &mp, &cfg, print_stats, /* writable */ false)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -919,16 +957,23 @@ fn run_mount<F>(
     mountpoint: &std::path::Path,
     config: &projgit_fuse::MountConfig,
     print_stats: bool,
+    writable: bool,
 ) -> Result<()>
 where
     F: projgit_core::Fetcher + 'static,
 {
     eprintln!(
-        "projgit: mounting at {} (Ctrl-C to unmount)",
-        mountpoint.display()
+        "projgit: mounting at {} ({}, Ctrl-C to unmount)",
+        mountpoint.display(),
+        if writable { "writable" } else { "read-only" },
     );
-    let session = projgit_fuse::mount_background(provider.clone(), mountpoint, config)
-        .with_context(|| format!("mounting at {}", mountpoint.display()))?;
+    let session = if writable {
+        projgit_fuse::mount_writable_background(provider.clone(), mountpoint, config)
+            .with_context(|| format!("mounting (writable) at {}", mountpoint.display()))?
+    } else {
+        projgit_fuse::mount_background(provider.clone(), mountpoint, config)
+            .with_context(|| format!("mounting at {}", mountpoint.display()))?
+    };
 
     // Park the main thread on a Ctrl-C / SIGTERM. Dropping `session`
     // synchronously unmounts via fuser's drop impl.
@@ -1072,6 +1117,69 @@ fn build_root_overlay(
         .context("building A1+ overlay")?;
     apply_a2_if_branch(&mut overlay, projection, store, commit_oid);
     Ok(overlay)
+}
+
+/// Build the `RootOverlay` for a **writable** mount: a single `.git`
+/// FILE that is a `gitdir:` link to the real, writable scratch git dir
+/// on disk (see [`setup_writable_gitdir`]). Stock git inside the mount
+/// follows the link and uses the on-disk git dir for all metadata
+/// (index, objects, refs), while the worktree is the FUSE mount.
+fn build_writable_overlay(scratch_gitdir: &Path) -> Result<projgit_core::RootOverlay> {
+    use projgit_core::{overlay::SyntheticEntry, RootOverlay};
+    let abs = std::fs::canonicalize(scratch_gitdir)
+        .with_context(|| format!("canonicalizing {}", scratch_gitdir.display()))?;
+    let content = format!("gitdir: {}\n", abs.display()).into_bytes();
+    let mut overlay = RootOverlay::new();
+    overlay.insert(".git", SyntheticEntry::file(content));
+    Ok(overlay)
+}
+
+/// Create a real, writable git dir on disk for a writable worktree
+/// mount. It alternates to the shared clone's object store (so reads
+/// reach the partial-clone packs / on-demand-hydrated objects), carries
+/// a detached `HEAD` at the projection commit, a **writable** index
+/// (real per-entry stat, no `ASSUME_VALID`), and `core.worktree`
+/// pointing at the mountpoint + `core.checkStat = minimal`.
+///
+/// Located under the system temp dir, keyed by the mountpoint, and
+/// recreated fresh each mount (first-cut: in-memory upper, so a fresh
+/// session per mount).
+fn setup_writable_gitdir(
+    clone_git_dir: &Path,
+    store: &projgit_core::ObjectStore,
+    commit_oid: gix::ObjectId,
+    mountpoint: &Path,
+) -> Result<PathBuf> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mp_abs = std::fs::canonicalize(mountpoint)
+        .with_context(|| format!("canonicalizing mountpoint {}", mountpoint.display()))?;
+    let mut hasher = DefaultHasher::new();
+    mp_abs.hash(&mut hasher);
+    let gd = std::env::temp_dir().join(format!("projgit-wt-{:016x}.git", hasher.finish()));
+    let _ = std::fs::remove_dir_all(&gd);
+    std::fs::create_dir_all(gd.join("objects/info"))?;
+    std::fs::create_dir_all(gd.join("refs/heads"))?;
+    std::fs::create_dir_all(gd.join("refs/tags"))?;
+
+    std::fs::write(gd.join("HEAD"), format!("{commit_oid}\n"))?;
+    std::fs::write(gd.join("packed-refs"), b"")?;
+    let clone_objects = std::fs::canonicalize(clone_git_dir.join("objects"))
+        .with_context(|| format!("canonicalizing {}/objects", clone_git_dir.display()))?;
+    std::fs::write(
+        gd.join("objects/info/alternates"),
+        format!("{}\n", clone_objects.display()),
+    )?;
+    let config = format!(
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = false\n\tcheckStat = minimal\n\tworktree = {}\n",
+        mp_abs.display()
+    );
+    std::fs::write(gd.join("config"), config)?;
+    let index = projgit_core::dotgit::build_writable_index_bytes(store, commit_oid)
+        .context("building writable index")?;
+    std::fs::write(gd.join("index"), index)?;
+    Ok(gd)
 }
 
 /// Apply A2 ref visibility to `overlay` when `projection` is a
