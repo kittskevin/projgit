@@ -5,9 +5,10 @@
 > actually gets built. Updated as each stage lands or surfaces
 > something that changes downstream stages.
 >
-> Last updated: 2026-06-18 (Stage 0 decided; Stage 1 + Stage 3
-> mechanism implemented: FetchMany wire, fetch_objects, warm_tree_closure
-> eager-tree warm, and PROJGIT_PREFETCH_BLOBS size-capped blob prefetch).
+> Last updated: 2026-06-18 (Phase 1 mechanisms complete: Stage 0
+> decided; Stage 1 eager trees; Stage 3 blob prefetch; Stage 5
+> maintenance loop. Stage 2 deferred per design §9. Remaining: bench
+> validation + promoting env gates to CLI flags + cadence tuning).
 >
 > Design in [`../design/cache-transform-tier.md`](../design/cache-transform-tier.md);
 > this is one level down — concrete steps, file changes, commit
@@ -385,6 +386,21 @@ only when profiled.
 commit-graph on the shared CAS, the piece that makes cross-commit reuse
 physical (§14). This is the largest remaining Phase 1 gap for the §1
 "different commits" workload.
+
+**Stage 5 (maintenance loop) shipped.** `projgit_core::run_maintenance`
+shells `git maintenance run --task=incremental-repack --task=commit-graph`
+on the shared CAS; the daemon runs it from a background thread gated by
+`PROJGIT_MAINTENANCE_INTERVAL_SECS` (off by default), off the serving
+path and joined on shutdown. Open for Stage 5: the §8.3 multi-commit
+bench (disk ≈ union of objects; lookup flat as pack count grows) and a
+sensible default cadence.
+
+**Phase 1 mechanisms are now complete** (Stages 0/1/3/5; Stage 2
+deferred per design §9). What remains before Phase 1 can claim its
+wins: (a) bench validation — Stage 3 §6.3 (cold-read tail) and Stage 5
+§8.3 (cross-commit dedup), both network-backed; (b) promoting the
+`PROJGIT_PREFETCH_BLOBS` / `PROJGIT_MAINTENANCE_INTERVAL_SECS` env gates
+to CLI flags once bench-tuned.
 
 Phase 2 (writable) is intentionally undecided and gated on the
 [`../design/writable-worktrees.md`](../design/writable-worktrees.md)
