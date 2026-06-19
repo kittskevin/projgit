@@ -6,7 +6,8 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (plan drafted; Stage 1 / R1 in progress).
+> Last updated: 2026-06-19 (plan drafted; **Stage 1 / R1 shipped** —
+> `dotgit::build_writable_index_bytes` + `WRITABLE_CORE_CONFIG`, tested).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -66,14 +67,14 @@ Stage 7  checkout-under-live-mount (§10.7) + upper crash-consistency
 
 Stop-the-line gates between stages are the "must prove" lines below.
 
-### Stage 1 — R1: writable-mode index synthesis  *(in progress)*
+### Stage 1 — R1: writable-mode index synthesis  *(SHIPPED 2026-06-19)*
 
-**What.** A new `projgit_core::dotgit::build_writable_index_bytes(store,
-commit_oid)` that produces seed `.git/index` bytes for a writable
-worktree: entries carry real `mode` + `oid` (as today) **plus** real
-`size` (from `ObjectStore::header`, no content read) and a stable
-`mtime` (from `ObjectStore::commit_time`), and **do not** set
-`ASSUME_VALID`. Paired with a `core.checkStat = minimal` config so git
+**What.** `projgit_core::dotgit::build_writable_index_bytes(store,
+commit_oid)` produces seed `.git/index` bytes for a writable worktree:
+entries carry real `mode` + `oid` (as today) **plus** real `size` (from
+`ObjectStore::header`, no content read) and a stable `mtime` (from
+`ObjectStore::commit_time`), and **do not** set `ASSUME_VALID`. Paired
+with `dotgit::WRITABLE_CORE_CONFIG` (`core.checkStat = minimal`) so git
 compares only mtime+size (ignoring the dev/ino/uid/gid that a synthesized
 index can't predict for a not-yet-existing mount).
 
@@ -87,6 +88,12 @@ fix for the spike's one-time-hydration finding. The read-only
   paths, entries have non-zero size = blob size and mtime = commit time.
 - `ASSUME_VALID` is not set on any entry.
 - Read-only `a1_plus_overlay` output is byte-for-byte unchanged.
+
+*All three proven by `tests/dotgit_index.rs`
+(`writable_index_*` + the unchanged read-only tests).* The live-mount
+"hydration-free first status" claim is already evidenced by the spike
+(its `update-index --refresh` produced exactly this size+mtime stat and
+status #3 had `reads=0`); the production wiring lands in Stage 2.
 
 **Defer to Stage 2:** writing the seed to a *real* per-worktree
 `.git/index` (the read-only mount keeps the synthetic overlay index;

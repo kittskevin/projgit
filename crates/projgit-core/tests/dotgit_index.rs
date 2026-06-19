@@ -306,3 +306,94 @@ fn build_is_byte_deterministic() {
         "same commit_oid must produce byte-identical index bytes"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Writable-mode index (R1) — `dotgit::build_writable_index_bytes`
+// -----------------------------------------------------------------------------
+
+/// Commit time of HEAD in unix seconds, via git.
+fn commit_time_secs(repo: &Path) -> u64 {
+    let out = String::from_utf8(git(repo, &["show", "-s", "--format=%ct", "HEAD"])).unwrap();
+    out.trim().parse().unwrap()
+}
+
+#[test]
+fn writable_index_round_trips_with_all_paths() {
+    let (repo, head) = build_fixture("writable-paths");
+    let _guard = DirGuard(repo.clone());
+    let store = Arc::new(ObjectStore::open(&repo).unwrap());
+
+    let bytes = dotgit::build_writable_index_bytes(&store, head).unwrap();
+    let file = parse_index(&bytes);
+
+    let paths: std::collections::BTreeSet<BString> = file
+        .entries()
+        .iter()
+        .map(|e| e.path(&file).to_owned())
+        .collect();
+    let expected: std::collections::BTreeSet<BString> = [
+        BString::from("README.md"),
+        BString::from("link-to-readme"),
+        BString::from("run.sh"),
+        BString::from("src/main.c"),
+        BString::from("src/util/helper.c"),
+        BString::from("src/util/helper.h"),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(paths, expected);
+}
+
+#[test]
+fn writable_index_has_no_assume_valid() {
+    // The defining difference from the read-only A1+ index: a writable
+    // mount must let git notice edits, so ASSUME_VALID must NOT be set.
+    let (repo, head) = build_fixture("writable-no-av");
+    let _guard = DirGuard(repo.clone());
+    let store = Arc::new(ObjectStore::open(&repo).unwrap());
+
+    let file = parse_index(&dotgit::build_writable_index_bytes(&store, head).unwrap());
+    assert!(!file.entries().is_empty());
+    for entry in file.entries() {
+        assert!(
+            !entry.flags.contains(gix::index::entry::Flags::ASSUME_VALID),
+            "writable index entry `{}` must NOT have ASSUME_VALID set",
+            entry.path(&file).as_bstr(),
+        );
+    }
+}
+
+#[test]
+fn writable_index_carries_real_size_and_mtime() {
+    let (repo, head) = build_fixture("writable-stat");
+    let _guard = DirGuard(repo.clone());
+    let store = Arc::new(ObjectStore::open(&repo).unwrap());
+    let ct = commit_time_secs(&repo) as u32;
+
+    let file = parse_index(&dotgit::build_writable_index_bytes(&store, head).unwrap());
+
+    for entry in file.entries() {
+        let path = entry.path(&file);
+        // Real size from the blob header (no content read) — every
+        // fixture file is non-empty.
+        assert!(
+            entry.stat.size > 0,
+            "entry `{}` must carry a real (non-zero) size, got 0",
+            path.as_bstr(),
+        );
+        // Stable mtime = the projection's commit time, so an unmodified
+        // file stat-matches the index under checkStat=minimal.
+        assert_eq!(
+            entry.stat.mtime.secs, ct,
+            "entry `{}` mtime.secs must equal HEAD commit time",
+            path.as_bstr(),
+        );
+        if path == "README.md" {
+            assert_eq!(
+                entry.stat.size, 15,
+                "README.md is `# fixture repo\\n` = 15 bytes",
+            );
+        }
+    }
+}
+
