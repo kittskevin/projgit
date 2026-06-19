@@ -29,6 +29,13 @@ pub struct MountConfig {
     /// `core.fsmonitor` hook streams it to git so `status` skips
     /// scanning. No effect on read-only mounts.
     pub fsmonitor_file: Option<std::path::PathBuf>,
+    /// Cone-mode sparse-checkout directories (worktree-relative, no
+    /// trailing slash). When non-empty on a writable mount, the overlay
+    /// hides out-of-cone directories from `readdir`/`lookup` so git's
+    /// sparse-index stays collapsed instead of expanding to a full index
+    /// (see `docs/implementation/writable-worktrees-plan.md` Stage 5 /
+    /// R2). Empty => everything is visible.
+    pub sparse_cone: Vec<String>,
 }
 
 impl Default for MountConfig {
@@ -39,6 +46,7 @@ impl Default for MountConfig {
             acl: SessionACL::Owner,
             n_threads: None,
             fsmonitor_file: None,
+            sparse_cone: Vec::new(),
         }
     }
 }

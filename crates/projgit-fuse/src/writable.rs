@@ -175,11 +175,14 @@ pub struct WritableFs<F: FsProvider> {
     ttl: Duration,
     /// Optional FSMonitor write-log file (Stage 4 / R3).
     fsmonitor_file: Option<std::path::PathBuf>,
+    /// Cone-mode sparse-checkout directories (Stage 5 / R2). Empty =>
+    /// everything visible.
+    cone: Vec<String>,
 }
 
 impl<F: FsProvider> WritableFs<F> {
     /// Wrap a read-only projection provider as a writable overlay with
-    /// no kernel-cache invalidation (TTL=0) and no FSMonitor log.
+    /// no kernel-cache invalidation (TTL=0), no FSMonitor log, no cone.
     pub fn new(lower: Arc<F>) -> Self {
         Self {
             lower,
@@ -187,15 +190,18 @@ impl<F: FsProvider> WritableFs<F> {
             inval: None,
             ttl: Duration::ZERO,
             fsmonitor_file: None,
+            cone: Vec::new(),
         }
     }
 
     /// Like [`Self::new`] but with an off-thread invalidator (enabling a
-    /// useful cache TTL) and an optional FSMonitor write-log file.
+    /// useful cache TTL), an optional FSMonitor write-log, and an
+    /// optional sparse cone.
     fn with_invalidator(
         lower: Arc<F>,
         inval: Sender<Inval>,
         fsmonitor_file: Option<std::path::PathBuf>,
+        cone: Vec<String>,
     ) -> Self {
         if let Some(p) = &fsmonitor_file {
             // Seed a baseline token with zero changed paths (clean mount).
@@ -207,6 +213,38 @@ impl<F: FsProvider> WritableFs<F> {
             inval: Some(inval),
             ttl: WRITABLE_TTL,
             fsmonitor_file,
+            cone,
+        }
+    }
+
+    /// Whether a worktree-relative `path` is visible under the sparse
+    /// cone. Cone-mode rules: files in the root and in directories that
+    /// lead to a cone dir are shown; cone directories are shown
+    /// recursively; everything else is hidden. Empty cone => all visible.
+    fn cone_visible(&self, path: &str, is_dir: bool) -> bool {
+        if self.cone.is_empty() {
+            return true;
+        }
+        let recursively_in = |d: &str| {
+            self.cone
+                .iter()
+                .any(|c| d == c || d.starts_with(&format!("{c}/")))
+        };
+        let leads_to_cone = |d: &str| {
+            d.is_empty()
+                || self
+                    .cone
+                    .iter()
+                    .any(|c| c == d || c.starts_with(&format!("{d}/")))
+        };
+        if is_dir {
+            recursively_in(path) || leads_to_cone(path)
+        } else {
+            let parent = match path.rfind('/') {
+                Some(i) => &path[..i],
+                None => "",
+            };
+            parent.is_empty() || recursively_in(parent) || leads_to_cone(parent)
         }
     }
 
@@ -300,11 +338,17 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
                 // Reconstruct + remember the worktree-relative path so the
                 // inode-keyed write path can name the FSMonitor change set.
                 let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
-                up.inode_paths
-                    .entry(ino)
-                    .or_insert_with(|| join_path(&parent_path, name));
+                let child_path = join_path(&parent_path, name);
                 match self.attr_for(&up, ino) {
-                    Ok(a) => reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
+                    Ok(a) => {
+                        // Sparse cone: hide out-of-cone entries from git.
+                        if !self.cone_visible(&child_path, matches!(a.kind, FileType::Directory)) {
+                            reply.error(errno_for(&FsError::NotFound));
+                            return;
+                        }
+                        up.inode_paths.entry(ino).or_insert(child_path);
+                        reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN);
+                    }
                     Err(e) => reply.error(errno_for(&e)),
                 }
             }
@@ -421,6 +465,18 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         }
 
         // "." and ".." first, then merged entries, paginated by offset.
+        // Sparse cone: hide out-of-cone entries so git's sparse-index
+        // stays collapsed (it expands if it sees out-of-cone worktree
+        // content).
+        if !self.cone.is_empty() {
+            let dir_path = up.inode_paths.get(&parent).cloned().unwrap_or_default();
+            entries.retain(|(_, kind, name)| {
+                self.cone_visible(
+                    &join_path(&dir_path, name),
+                    matches!(kind, FileType::Directory),
+                )
+            });
+        }
         let mut all: Vec<(u64, FileType, Vec<u8>)> = vec![
             (parent, FileType::Directory, b".".to_vec()),
             (parent, FileType::Directory, b"..".to_vec()),
@@ -734,7 +790,12 @@ pub fn mount_writable_background<F: FsProvider + 'static>(
     config: &crate::MountConfig,
 ) -> std::io::Result<fuser::BackgroundSession> {
     let (tx, rx) = std::sync::mpsc::channel::<Inval>();
-    let fs = WritableFs::with_invalidator(lower, tx, config.fsmonitor_file.clone());
+    let fs = WritableFs::with_invalidator(
+        lower,
+        tx,
+        config.fsmonitor_file.clone(),
+        config.sparse_cone.clone(),
+    );
     let mut fc = Config::default();
     fc.mount_options = vec![
         MountOption::FSName(config.name.clone()),

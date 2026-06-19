@@ -6,9 +6,9 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (plan drafted; **Stages 1–4 shipped** — R1
-> writable index, `WritableFs` overlay, R4 FUSE invalidation, and R3
-> FSMonitor write-log answered from the overlay's authoritative writes).
+> Last updated: 2026-06-19 (plan drafted; **Stages 1–5 shipped** — R1
+> writable index, `WritableFs` overlay, R4 invalidation, R3 FSMonitor
+> write-log, and R2 sparse-cone projection filtering).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -163,14 +163,25 @@ spike (349→30 getattr).
 long-running daemon (vs the file the hook reads) — the write-log is the
 same; only the transport differs.
 
-### Stage 5 — R2: projection honors the sparse cone
+### Stage 5 — R2: projection honors the sparse cone  *(SHIPPED 2026-06-19)*
 
-**What.** When a sparse cone is configured, the projection must not
-surface out-of-cone paths (readdir/lookup hide them), so git's
-sparse-index stays collapsed instead of expanding to a full index.
+**What.** `MountConfig::sparse_cone` (cone-mode directories). When
+non-empty, `WritableFs` applies cone-mode visibility in `readdir` and
+`lookup`: files in the root and in directories leading to a cone dir are
+shown, cone directories are shown recursively, and everything else is
+hidden (out-of-cone `lookup` returns `ENOENT`, out-of-cone entries are
+dropped from `readdir`). This is what keeps git's sparse-index collapsed
+— the spike showed it expands to a full index when the VFS surfaces
+out-of-cone worktree content.
 
-**Must prove:** sparse `status` is *faster* than full (not slower) and
-the on-disk index stays small at scale.
+**Proved** (`tests/writable_mount.rs::writable_mount_sparse_cone_hides_out_of_cone`):
+with `cone = [dirA]`, the root lists `README.md` + `dirA` but not `dirB`;
+`dirA` contents are visible; `dirB` is neither stat-able nor listable.
+
+**Deferred:** seeding the index with `SKIP_WORKTREE` on out-of-cone
+entries so a *git* sparse-checkout flow over the mount is clean without
+git's own `sparse-checkout set` pass (the R1 index variant for sparse
+mounts).
 
 ### Stage 6 — commit path via gix
 

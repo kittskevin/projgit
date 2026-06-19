@@ -356,3 +356,87 @@ fn writable_mount_fsmonitor_write_log() {
         "fsmonitor must surface the edit, got:\n{detected}"
     );
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn writable_mount_sparse_cone_hides_out_of_cone() {
+    // Stage 5 (R2): with a sparse cone configured, the projection must not
+    // surface out-of-cone paths (which is what keeps git's sparse-index
+    // collapsed instead of expanding to a full index — see the spike).
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+
+    let base = std::env::temp_dir().join(format!("projgit-wr-cone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let served = base.join("served");
+    std::fs::create_dir_all(&src).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::write(src.join("README.md"), b"# root\n").unwrap();
+    std::fs::create_dir_all(src.join("dirA")).unwrap();
+    std::fs::write(src.join("dirA/a.txt"), b"alpha\n").unwrap();
+    std::fs::create_dir_all(src.join("dirB/sub")).unwrap();
+    std::fs::write(src.join("dirB/b.txt"), b"bravo\n").unwrap();
+    std::fs::write(src.join("dirB/sub/c.txt"), b"charlie\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "init"]);
+    let url = format!("file://{}", src.display());
+    git_ok(
+        &base,
+        &["clone", "-q", "--no-checkout", &url, served.to_str().unwrap()],
+    );
+    let head_hex = git_ok(&served, &["rev-parse", "HEAD"]);
+    let head = gix::ObjectId::from_hex(head_hex.trim().as_bytes()).unwrap();
+
+    let store = Arc::new(ObjectStore::open(&served).unwrap());
+    let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
+    let provider = Arc::new(
+        ProjectionFsProvider::new(Projection::Commit(head), hydrating, RootOverlay::new(), 1)
+            .expect("ProjectionFsProvider::new"),
+    );
+
+    let mnt = base.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let cfg = MountConfig {
+        sparse_cone: vec!["dirA".to_string()],
+        ..MountConfig::default()
+    };
+    let _session =
+        mount_writable_background(provider, &mnt, &cfg).expect("mount_writable_background");
+    assert!(wait_for_mount(&mnt, Duration::from_secs(5)), "never mounted");
+
+    // Root shows README.md + the cone dir, but NOT the out-of-cone dirB.
+    let root: std::collections::BTreeSet<String> = std::fs::read_dir(&mnt)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(root.contains("README.md"), "root files stay visible: {root:?}");
+    assert!(root.contains("dirA"), "cone dir is visible: {root:?}");
+    assert!(
+        !root.contains("dirB"),
+        "out-of-cone dir must be hidden, got {root:?}"
+    );
+
+    // The cone dir's contents are fully visible.
+    let a: std::collections::BTreeSet<String> = std::fs::read_dir(mnt.join("dirA"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(a.contains("a.txt"), "cone dir contents visible: {a:?}");
+
+    // Out-of-cone paths are not reachable at all.
+    assert!(
+        !mnt.join("dirB").exists(),
+        "out-of-cone dir must not be stat-able"
+    );
+    assert!(
+        std::fs::read_dir(mnt.join("dirB")).is_err(),
+        "out-of-cone dir must not be listable"
+    );
+}
