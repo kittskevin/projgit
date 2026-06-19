@@ -101,6 +101,12 @@ pub struct DaemonConfig {
     /// guards against a second instance, so this is opt-in for
     /// supervisors that want a PID handle.
     pub pid_file: Option<PathBuf>,
+    /// Background CAS-maintenance interval in seconds. `Some(n)` with
+    /// `n > 0` runs `git maintenance` (MIDX + incremental repack +
+    /// commit-graph) every `n` seconds on the shared CAS; `None` /
+    /// `Some(0)` disables it. Takes precedence over the
+    /// `PROJGIT_MAINTENANCE_INTERVAL_SECS` env fallback.
+    pub maintenance_interval_secs: Option<u64>,
 }
 
 impl Default for DaemonConfig {
@@ -113,6 +119,7 @@ impl Default for DaemonConfig {
             trace: false,
             pool_size: GitCliFetcher::default_pool_size(),
             pid_file: None,
+            maintenance_interval_secs: None,
         }
     }
 }
@@ -387,11 +394,15 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     ));
 
     // Background CAS maintenance (the Scalar object-store half: MIDX +
-    // incremental repack + commit-graph). Off unless
-    // PROJGIT_MAINTENANCE_INTERVAL_SECS is set; runs off the serving
-    // path so it never blocks an RPC. See
+    // incremental repack + commit-graph). Enabled via
+    // --maintenance-interval-secs (or PROJGIT_MAINTENANCE_INTERVAL_SECS);
+    // runs off the serving path so it never blocks an RPC. See
     // docs/design/cache-transform-tier.md §14.
-    let maintenance = maintenance_interval_secs().map(|secs| {
+    let maintenance = config
+        .maintenance_interval_secs
+        .or_else(maintenance_interval_secs)
+        .filter(|&n| n > 0)
+        .map(|secs| {
         let state = state.clone();
         tracing::info!("background maintenance enabled (every {secs}s)");
         std::thread::Builder::new()

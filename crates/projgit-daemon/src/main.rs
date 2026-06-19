@@ -94,6 +94,13 @@ fn main() -> anyhow::Result<()> {
         /// neither is set.
         #[arg(long, value_name = "DIR")]
         cache_dir: Option<PathBuf>,
+
+        /// Run background CAS maintenance (MIDX + incremental repack +
+        /// commit-graph) every <SECS> seconds on the shared store, off
+        /// the serving path. Omitted / 0 disables it. Overrides the
+        /// PROJGIT_MAINTENANCE_INTERVAL_SECS env var.
+        #[arg(long, value_name = "SECS")]
+        maintenance_interval_secs: Option<u64>,
     }
 
     let cli = Cli::parse();
@@ -125,6 +132,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(dir) = cli.cache_dir {
         config.cache_dir = Some(dir);
     }
+    config.maintenance_interval_secs = cli.maintenance_interval_secs;
 
     // Signal handling lives in the binary, not the library, because
     // `ctrlc::set_handler` is a process-wide resource (set-once) and

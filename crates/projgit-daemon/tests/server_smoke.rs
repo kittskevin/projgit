@@ -39,6 +39,7 @@ fn spawn_daemon(label: &str) -> (PathBuf, thread::JoinHandle<anyhow::Result<()>>
         trace: false,
         pool_size: 1,
         pid_file: None,
+        maintenance_interval_secs: None,
     };
     let handle = thread::spawn(move || run(config));
 
