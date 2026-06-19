@@ -361,3 +361,54 @@ fn attach_to_different_source_is_source_mismatch() {
     let _ = std::fs::remove_dir_all(&repo_a);
     let _ = std::fs::remove_dir_all(&repo_b);
 }
+
+#[test]
+fn fetch_many_makes_objects_resident_one_probe_per_input() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, blob_oid) = build_fixture("fetch-many-fixture");
+    let (sock, handle) = spawn_daemon("fetch-many");
+
+    match rpc(
+        &sock,
+        &Request::Attach {
+            source: repo.to_string_lossy().into_owned(),
+        },
+    ) {
+        Response::Attached { .. } => {}
+        other => panic!("attach: got {other:?}"),
+    }
+
+    // Mix a real (locally present) blob with a syntactically valid
+    // but absent OID: the present one comes back resident, the
+    // absent one as a per-OID Error, one probe per input in order.
+    let absent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned();
+    match rpc(
+        &sock,
+        &Request::FetchMany {
+            oids: vec![blob_oid.clone(), absent.clone()],
+        },
+    ) {
+        Response::HeaderProbes { probes } => {
+            assert_eq!(probes.len(), 2, "one probe per input OID");
+            match &probes[0] {
+                HeaderProbeWire::Present { oid }
+                | HeaderProbeWire::PresentWithHeader { oid, .. } => {
+                    assert_eq!(oid, &blob_oid);
+                }
+                other => panic!("probe[0] = {other:?}"),
+            }
+            match &probes[1] {
+                HeaderProbeWire::Error { oid, .. } => assert_eq!(oid, &absent),
+                other => panic!("probe[1] = {other:?}"),
+            }
+        }
+        other => panic!("fetch_many: got {other:?}"),
+    }
+
+    let _ = rpc(&sock, &Request::Shutdown);
+    handle.join().unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&repo);
+}

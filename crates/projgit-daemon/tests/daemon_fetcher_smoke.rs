@@ -169,6 +169,39 @@ fn fetch_object_unknown_surfaces_backend_error() {
 }
 
 #[test]
+fn fetch_objects_batch_makes_present_resident_and_per_oid_errors() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, blob_oid) = build_fixture("fetch-many");
+    let (sock, handle) = spawn_daemon("fetch-many");
+    attach(&sock, &repo);
+
+    let fetcher = DaemonFetcher::new(sock.clone());
+    let absent = gix::ObjectId::from_hex(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+    let probes = fetcher.fetch_objects(&[blob_oid, absent]);
+
+    assert_eq!(probes.len(), 2, "one probe per input OID, in order");
+    assert!(
+        matches!(
+            &probes[0],
+            HeaderProbe::Present(o) | HeaderProbe::PresentWithHeader(o, _, _) if *o == blob_oid
+        ),
+        "present blob resident: {:?}",
+        probes[0],
+    );
+    assert!(
+        matches!(&probes[1], HeaderProbe::Error(o, _) if *o == absent),
+        "absent OID errors: {:?}",
+        probes[1],
+    );
+
+    shutdown(&sock, handle);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
 fn fetch_object_after_daemon_crash_returns_transport_error() {
     if !git_available() {
         eprintln!("SKIP: git CLI not available");
