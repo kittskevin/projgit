@@ -242,3 +242,117 @@ fn writable_mount_status_edit_add() {
         "same-size edit must be detected (Stage 3 invalidation), got:\n{status3}"
     );
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn writable_mount_fsmonitor_write_log() {
+    // Stage 4 (R3): the overlay's write-log answers a core.fsmonitor hook
+    // so git can skip scanning, and an edit is still reported via the log.
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+
+    let (served, head) = build_served("fsmonitor");
+    let base = served.parent().unwrap().to_path_buf();
+    let _guard = DirGuard(base.clone());
+    let git_dir = served.join(".git");
+    let fsm = base.join("fsm-log");
+    let hook = base.join("fsmonitor-hook.sh");
+
+    let store = Arc::new(ObjectStore::open(&served).expect("open store"));
+    let index_bytes = dotgit::build_writable_index_bytes(&store, head).expect("writable index");
+    std::fs::write(git_dir.join("index"), &index_bytes).expect("seed index");
+
+    // A core.fsmonitor hook (query protocol v2) that streams the overlay
+    // write-log verbatim. In production projgit installs this; the daemon
+    // answers from its authoritative write log.
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nif [ -n \"$VWORKTREE_FSM\" ] && [ -s \"$VWORKTREE_FSM\" ]; then cat \"$VWORKTREE_FSM\"; else printf '%s\\0' 0; fi\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
+    let provider = Arc::new(
+        ProjectionFsProvider::new(Projection::Commit(head), hydrating, RootOverlay::new(), 1)
+            .expect("ProjectionFsProvider::new"),
+    );
+
+    let mnt = base.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let cfg = MountConfig {
+        fsmonitor_file: Some(fsm.clone()),
+        ..MountConfig::default()
+    };
+    let _session =
+        mount_writable_background(provider, &mnt, &cfg).expect("mount_writable_background");
+    assert!(wait_for_mount(&mnt, Duration::from_secs(5)), "never mounted");
+
+    let mnt_s = mnt.to_str().unwrap();
+    let gd_s = git_dir.to_str().unwrap();
+    let fsm_s = fsm.to_str().unwrap();
+    let hook_s = hook.to_str().unwrap();
+    // git invocation that exports VWORKTREE_FSM so the hook can read the log.
+    let run_git = |args: &[&str]| -> String {
+        let mut full = vec!["--git-dir", gd_s, "--work-tree", mnt_s, "-c", "safe.directory=*"];
+        full.extend_from_slice(args);
+        let out = Command::new("git")
+            .args(&full)
+            .current_dir(&base)
+            .env("VWORKTREE_FSM", fsm_s)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t.invalid")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    run_git(&["config", "core.checkStat", "minimal"]);
+    run_git(&["config", "core.fsmonitorHookVersion", "2"]);
+    run_git(&["config", "core.fsmonitor", hook_s]);
+    // Persist an fsmonitor baseline into the index, then settle.
+    run_git(&["update-index", "--refresh"]);
+    run_git(&["status", "--porcelain"]);
+
+    // Clean mount + fsmonitor => clean status (no false positives).
+    let clean = run_git(&["status", "--porcelain"]);
+    assert!(
+        clean.trim().is_empty(),
+        "fsmonitor clean status must be empty, got:\n{clean}"
+    );
+
+    // Edit a file: the overlay records it in the write-log; the hook
+    // reports it; git detects it (one settle query absorbs the documented
+    // post-change lag).
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mnt.join("dir/a.txt"))
+            .unwrap();
+        f.write_all(b"VIA-FSMONITOR\n").unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let log = std::fs::read(&fsm).unwrap();
+    let log_str = String::from_utf8_lossy(&log);
+    assert!(
+        log_str.contains("dir/a.txt"),
+        "write-log must list the edited path, got: {log_str:?}"
+    );
+    run_git(&["status", "--porcelain"]); // settle
+    let detected = run_git(&["status", "--porcelain"]);
+    assert!(
+        detected.contains("M dir/a.txt"),
+        "fsmonitor must surface the edit, got:\n{detected}"
+    );
+}

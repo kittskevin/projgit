@@ -6,9 +6,9 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (plan drafted; **Stages 1–3 shipped** — R1
-> writable index, `WritableFs` writable FUSE overlay, and R4 off-thread
-> FUSE cache invalidation with a restored attr-cache TTL).
+> Last updated: 2026-06-19 (plan drafted; **Stages 1–4 shipped** — R1
+> writable index, `WritableFs` overlay, R4 FUSE invalidation, and R3
+> FSMonitor write-log answered from the overlay's authoritative writes).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -142,16 +142,26 @@ in-place edit — where size is unchanged so only the mtime distinguishes
 it, and the kernel would otherwise serve a cached `getattr` within the
 TTL — is correctly detected by `git status` as `M dir/b.txt`.
 
-### Stage 4 — R3: daemon FSMonitor
+### Stage 4 — R3: daemon FSMonitor  *(SHIPPED 2026-06-19)*
 
-**What.** A `core.fsmonitor` integration answered from the daemon's
-authoritative write log: monotonic **timestamp** tokens (git rejects
-integer tokens) + the precise modified-paths set (the materialized set
-from §6). The query does zero filesystem scanning.
+**What.** `WritableFs` maintains an authoritative **write-log**: it
+reconstructs each inode's worktree-relative path from `lookup` calls,
+and every mutating handler records the changed path into a cumulative
+set behind a **monotonic nanosecond token** (git rejects small-integer
+tokens). When `MountConfig::fsmonitor_file` is set, the overlay rewrites
+that file (`<token>\0 <path>\0 ...`) on every change; a `core.fsmonitor`
+hook (query protocol v2) streams it to git, which then skips scanning.
 
-**Must prove:** clean `status` scan cost drops sharply (spike: 349→30
-getattr); after an edit, the reported path is detected within the
-documented one-query settle.
+**Proved** (`tests/writable_mount.rs::writable_mount_fsmonitor_write_log`,
+real mount + a hook): clean `status` under fsmonitor stays clean (no
+false positives); after an in-mount edit the write-log lists the path
+and git reports `M dir/a.txt` (one settle query absorbs git's documented
+post-change lag). The scan-cost reduction itself was quantified in the
+spike (349→30 getattr).
+
+**Deferred:** answering the fsmonitor query over a live socket from a
+long-running daemon (vs the file the hook reads) — the write-log is the
+same; only the transport differs.
 
 ### Stage 5 — R2: projection honors the sparse cone
 

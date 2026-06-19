@@ -83,6 +83,37 @@ impl Inval {
     }
 }
 
+/// Monotonic nanosecond clock for FSMonitor tokens.
+fn now_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Join a worktree-relative parent path with a child name.
+fn join_path(parent: &str, name: &[u8]) -> String {
+    let name = String::from_utf8_lossy(name);
+    if parent.is_empty() {
+        name.into_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// Write the FSMonitor write-log file: `<token>\0 <path>\0 ...`. A
+/// `core.fsmonitor` hook streams it to git verbatim.
+fn write_fsm(path: &Path, token: u64, paths: &std::collections::BTreeSet<String>) {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(token.to_string().as_bytes());
+    buf.push(0);
+    for p in paths {
+        buf.extend_from_slice(p.as_bytes());
+        buf.push(0);
+    }
+    let _ = std::fs::write(path, &buf);
+}
+
 
 /// A file or directory created inside the mount (no lower backing).
 struct CreatedNode {
@@ -107,6 +138,15 @@ struct Upper {
     whiteouts: HashMap<u64, HashSet<Vec<u8>>>,
     /// Inodes whose mtime should read as "now" (materialized/edited).
     modified: HashSet<u64>,
+    /// Worktree-relative path of each inode the kernel has looked up,
+    /// reconstructed from `lookup` calls (parent path + name). Lets the
+    /// inode-keyed write path name the FSMonitor changed-paths set.
+    inode_paths: HashMap<u64, String>,
+    /// FSMonitor write-log: worktree-relative paths changed since mount.
+    modified_paths: std::collections::BTreeSet<String>,
+    /// Monotonic, timestamp-shaped FSMonitor token (git rejects small
+    /// integer tokens; see spikes/writable-nofork RESULTS.md finding #3).
+    fsm_token: u64,
     /// Counter for fresh upper inodes (OR'd with `SYNTHETIC_INODE_BIT`).
     next: u64,
 }
@@ -133,28 +173,40 @@ pub struct WritableFs<F: FsProvider> {
     inval: Option<Sender<Inval>>,
     /// Attr/entry cache TTL handed to the kernel.
     ttl: Duration,
+    /// Optional FSMonitor write-log file (Stage 4 / R3).
+    fsmonitor_file: Option<std::path::PathBuf>,
 }
 
 impl<F: FsProvider> WritableFs<F> {
     /// Wrap a read-only projection provider as a writable overlay with
-    /// no kernel-cache invalidation (TTL=0).
+    /// no kernel-cache invalidation (TTL=0) and no FSMonitor log.
     pub fn new(lower: Arc<F>) -> Self {
         Self {
             lower,
             up: Mutex::new(Upper::default()),
             inval: None,
             ttl: Duration::ZERO,
+            fsmonitor_file: None,
         }
     }
 
-    /// Like [`Self::new`] but with an off-thread invalidator, enabling a
-    /// useful attr/data cache TTL backed by explicit invalidation.
-    fn with_invalidator(lower: Arc<F>, inval: Sender<Inval>) -> Self {
+    /// Like [`Self::new`] but with an off-thread invalidator (enabling a
+    /// useful cache TTL) and an optional FSMonitor write-log file.
+    fn with_invalidator(
+        lower: Arc<F>,
+        inval: Sender<Inval>,
+        fsmonitor_file: Option<std::path::PathBuf>,
+    ) -> Self {
+        if let Some(p) = &fsmonitor_file {
+            // Seed a baseline token with zero changed paths (clean mount).
+            write_fsm(p, now_nanos(), &std::collections::BTreeSet::new());
+        }
         Self {
             lower,
             up: Mutex::new(Upper::default()),
             inval: Some(inval),
             ttl: WRITABLE_TTL,
+            fsmonitor_file,
         }
     }
 
@@ -167,6 +219,16 @@ impl<F: FsProvider> WritableFs<F> {
     fn invalidate_entry(&self, parent: u64, name: &[u8]) {
         if let Some(tx) = &self.inval {
             let _ = tx.send(Inval::Entry(parent, name.to_vec()));
+        }
+    }
+
+    /// Record a worktree-relative path as changed and refresh the
+    /// FSMonitor write-log (monotonic token + cumulative changed set).
+    fn record_change(&self, up: &mut Upper, path: String) {
+        up.modified_paths.insert(path);
+        up.fsm_token = now_nanos().max(up.fsm_token + 1);
+        if let Some(p) = &self.fsmonitor_file {
+            write_fsm(p, up.fsm_token, &up.modified_paths);
         }
     }
 
@@ -231,13 +293,21 @@ impl<F: FsProvider> WritableFs<F> {
 
 impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let up = self.up.lock().unwrap();
+        let mut up = self.up.lock().unwrap();
         let name = name.as_bytes();
         match self.resolve_child(&up, parent.0, name) {
-            Ok(ino) => match self.attr_for(&up, ino) {
-                Ok(a) => reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
-                Err(e) => reply.error(errno_for(&e)),
-            },
+            Ok(ino) => {
+                // Reconstruct + remember the worktree-relative path so the
+                // inode-keyed write path can name the FSMonitor change set.
+                let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+                up.inode_paths
+                    .entry(ino)
+                    .or_insert_with(|| join_path(&parent_path, name));
+                match self.attr_for(&up, ino) {
+                    Ok(a) => reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
+                    Err(e) => reply.error(errno_for(&e)),
+                }
+            }
             Err(e) => reply.error(errno_for(&e)),
         }
     }
@@ -399,6 +469,9 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             }
             up.content.entry(ino.0).or_default().resize(newsize as usize, 0);
             up.modified.insert(ino.0);
+            if let Some(path) = up.inode_paths.get(&ino.0).cloned() {
+                self.record_change(&mut up, path);
+            }
         }
         let attr = self.attr_for(&up, ino.0);
         drop(up);
@@ -439,6 +512,9 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         }
         buf[start..end].copy_from_slice(data);
         up.modified.insert(ino.0);
+        if let Some(path) = up.inode_paths.get(&ino.0).cloned() {
+            self.record_change(&mut up, path);
+        }
         drop(up);
         self.invalidate_inode(ino.0);
         reply.written(data.len() as u32);
@@ -472,6 +548,10 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         if let Some(s) = up.whiteouts.get_mut(&parent.0) {
             s.remove(&name);
         }
+        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        let child_path = join_path(&parent_path, &name);
+        up.inode_paths.insert(ino, child_path.clone());
+        self.record_change(&mut up, child_path);
         let attr = self.attr_for(&up, ino);
         drop(up);
         self.invalidate_entry(parent.0, &name);
@@ -512,6 +592,8 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         if let Some(s) = up.whiteouts.get_mut(&parent.0) {
             s.remove(&name);
         }
+        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        up.inode_paths.insert(ino, join_path(&parent_path, &name));
         let attr = self.attr_for(&up, ino);
         drop(up);
         self.invalidate_entry(parent.0, &name);
@@ -536,6 +618,9 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             up.modified.remove(&ino);
         }
         up.whiteouts.entry(parent.0).or_default().insert(name.clone());
+        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        let path = join_path(&parent_path, &name);
+        self.record_change(&mut up, path);
         drop(up);
         self.invalidate_entry(parent.0, &name);
         reply.ok();
@@ -593,6 +678,13 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             node.parent = newparent.0;
             node.name = newname.clone();
         }
+        let old_parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        let new_parent_path = up.inode_paths.get(&newparent.0).cloned().unwrap_or_default();
+        let old_path = join_path(&old_parent_path, &name);
+        let new_path = join_path(&new_parent_path, &newname);
+        up.inode_paths.insert(src, new_path.clone());
+        self.record_change(&mut up, old_path);
+        self.record_change(&mut up, new_path);
         drop(up);
         self.invalidate_entry(parent.0, &name);
         self.invalidate_entry(newparent.0, &newname);
@@ -642,7 +734,7 @@ pub fn mount_writable_background<F: FsProvider + 'static>(
     config: &crate::MountConfig,
 ) -> std::io::Result<fuser::BackgroundSession> {
     let (tx, rx) = std::sync::mpsc::channel::<Inval>();
-    let fs = WritableFs::with_invalidator(lower, tx);
+    let fs = WritableFs::with_invalidator(lower, tx, config.fsmonitor_file.clone());
     let mut fc = Config::default();
     fc.mount_options = vec![
         MountOption::FSName(config.name.clone()),

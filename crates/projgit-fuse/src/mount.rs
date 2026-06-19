@@ -22,6 +22,13 @@ pub struct MountConfig {
     pub acl: SessionACL,
     /// Number of FUSE event-loop threads. `None` => single-threaded.
     pub n_threads: Option<usize>,
+    /// Optional path to a FSMonitor **write-log** file. When set on a
+    /// writable mount ([`crate::mount_writable_background`]), the overlay
+    /// rewrites this file on every change with a monotonic token + the
+    /// NUL-terminated worktree-relative paths modified since mount; a
+    /// `core.fsmonitor` hook streams it to git so `status` skips
+    /// scanning. No effect on read-only mounts.
+    pub fsmonitor_file: Option<std::path::PathBuf>,
 }
 
 impl Default for MountConfig {
@@ -31,6 +38,7 @@ impl Default for MountConfig {
             subtype: "projgit".to_owned(),
             acl: SessionACL::Owner,
             n_threads: None,
+            fsmonitor_file: None,
         }
     }
 }
