@@ -1,4 +1,4 @@
-//! Writable worktree overlay (Phase 2, Stage 2).
+//! Writable worktree overlay (Phase 2).
 //!
 //! A [`fuser::Filesystem`] that layers an in-memory **upper**
 //! materialization store over a read-only [`FsProvider`] **lower**
@@ -13,27 +13,23 @@
 //! - Newly created files/dirs live entirely in the upper store; deleted
 //!   entries are recorded as whiteouts.
 //!
-//! This is the design-faithful counterpart to the
-//! `spikes/writable-nofork` harness (which proved stock git drives such
-//! a mount without a fork), re-homed over the production [`FsProvider`].
+//! ## Path-keyed upper (Stage 7)
 //!
-//! ## Scope (Stage 2)
-//!
-//! Read/write/create/unlink/mkdir/rmdir/rename/setattr are implemented.
-//! The upper store is **in-memory** (on-disk overlay + crash
-//! consistency are later stages), and the attribute-cache TTL is **zero**
-//! — a production mount will keep a useful TTL and push a FUSE
-//! invalidation on write (Stage 3 / R4); see
-//! `docs/implementation/writable-worktrees-plan.md`.
+//! Materialized/created entries (`edits`) and deletions (`whiteouts`)
+//! are keyed by **worktree-relative path**, not inode. A baseline swap
+//! ([`WritableHandle::swap_baseline`], a `checkout` of a different
+//! commit) changes the inode of any path whose blob OID differs, so a
+//! path-keyed upper lets local edits **survive a checkout** (EdenFS
+//! semantics) — only the per-baseline inode cache is cleared on swap.
 //!
 //! ## Inode namespace
 //!
 //! Lower inodes come from the [`FsProvider`] (high bit clear for tree
-//! entries). New upper entries are allocated in the **synthetic** inode
-//! space (high bit set, [`SYNTHETIC_INODE_BIT`]), keeping them disjoint
-//! from lower tree inodes. Writable worktrees mount with an empty
-//! `RootOverlay` (the `.git/` lives outside the mount), so there is no
-//! clash with dotgit synthetic inodes.
+//! entries). Created entries (no lower backing) are allocated in the
+//! **synthetic** inode space (high bit set, [`SYNTHETIC_INODE_BIT`]),
+//! keeping them disjoint from lower tree inodes. Writable worktrees
+//! mount with an empty `RootOverlay` (the `.git/` lives outside the
+//! mount), so there is no clash with dotgit synthetic inodes.
 
 use crate::adapter::{errno_for, to_fuser_attr, to_fuser_kind};
 use fuser::{
@@ -43,7 +39,7 @@ use fuser::{
 };
 use projgit_core::overlay::SYNTHETIC_INODE_BIT;
 use projgit_core::{Attr, FileType, FsError, FsProvider};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -52,10 +48,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 /// Attr/entry cache TTL for a writable mount **with** an invalidator
-/// attached. Writes push a FUSE invalidation (Stage 3 / R4) off the
-/// handler thread, so the kernel can safely cache attrs/data for
-/// unmodified files between writes. A mount with no invalidator uses
-/// `Duration::ZERO` (every getattr re-asks us) and stays correct.
+/// attached. Writes push a FUSE invalidation off the handler thread, so
+/// the kernel can safely cache attrs/data for unmodified files between
+/// writes. A mount with no invalidator uses `Duration::ZERO` (every
+/// getattr re-asks us) and stays correct.
 const WRITABLE_TTL: Duration = Duration::from_secs(1);
 const GEN: Generation = Generation(0);
 
@@ -101,9 +97,25 @@ fn join_path(parent: &str, name: &[u8]) -> String {
     }
 }
 
+/// Parent path of a worktree-relative path (`""` for a top-level entry).
+fn parent_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
+/// Final component of a worktree-relative path.
+fn basename(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
 /// Write the FSMonitor write-log file: `<token>\0 <path>\0 ...`. A
 /// `core.fsmonitor` hook streams it to git verbatim.
-fn write_fsm(path: &Path, token: u64, paths: &std::collections::BTreeSet<String>) {
+fn write_fsm(path: &Path, token: u64, paths: &BTreeSet<String>) {
     let mut buf = Vec::new();
     buf.extend_from_slice(token.to_string().as_bytes());
     buf.push(0);
@@ -114,45 +126,45 @@ fn write_fsm(path: &Path, token: u64, paths: &std::collections::BTreeSet<String>
     let _ = std::fs::write(path, &buf);
 }
 
-
-/// A file or directory created inside the mount (no lower backing).
-struct CreatedNode {
-    parent: u64,
-    name: Vec<u8>,
+/// A materialized or created entry in the upper layer, keyed by path.
+struct Edit {
     kind: FileType,
     mode: u16,
+    /// File/symlink bytes (empty for directories).
+    content: Vec<u8>,
+    /// `true` if this is a *modified* lower file (the path also exists in
+    /// the lower projection); `false` if created fresh in the mount.
+    /// Drives readdir (created entries must be injected; modified-lower
+    /// ones are already in the lower listing) and inode resolution.
+    from_lower: bool,
 }
 
 /// The upper materialization layer.
+///
+/// The path-keyed `edits` / `whiteouts` are the source of truth and
+/// **survive a baseline swap**; the inode maps are a per-baseline cache
+/// rebuilt from `lookup` and cleared on swap.
 #[derive(Default)]
 struct Upper {
-    /// Materialized bytes, keyed by inode (a modified lower file or a
-    /// created file). Presence here means "serve from upper".
-    content: HashMap<u64, Vec<u8>>,
-    /// New entries created in the mount, keyed by their fresh inode.
-    created: HashMap<u64, CreatedNode>,
-    /// Per-parent additions: name -> child inode (created entries, plus
-    /// re-pointed entries from `rename`).
-    additions: HashMap<u64, BTreeMap<Vec<u8>, u64>>,
-    /// Per-parent whiteouts: names that have been deleted/hidden.
-    whiteouts: HashMap<u64, HashSet<Vec<u8>>>,
-    /// Inodes whose mtime should read as "now" (materialized/edited).
-    modified: HashSet<u64>,
-    /// Worktree-relative path of each inode the kernel has looked up,
-    /// reconstructed from `lookup` calls (parent path + name). Lets the
-    /// inode-keyed write path name the FSMonitor changed-paths set.
-    inode_paths: HashMap<u64, String>,
-    /// `(parent_inode, name)` of each looked-up inode, so a baseline swap
-    /// can enqueue precise `inval_entry` calls (the kernel must re-lookup
-    /// changed paths by name, since a changed file's inode differs in the
-    /// new baseline).
-    inode_parent_name: HashMap<u64, (u64, Vec<u8>)>,
-    /// FSMonitor write-log: worktree-relative paths changed since mount.
-    modified_paths: std::collections::BTreeSet<String>,
-    /// Monotonic, timestamp-shaped FSMonitor token (git rejects small
-    /// integer tokens; see spikes/writable-nofork RESULTS.md finding #3).
+    /// Materialized/created entries, keyed by worktree-relative path.
+    edits: HashMap<String, Edit>,
+    /// Deleted/hidden worktree-relative paths.
+    whiteouts: HashSet<String>,
+    /// FSMonitor write-log: paths changed since mount.
+    modified_paths: BTreeSet<String>,
+    /// Monotonic, timestamp-shaped FSMonitor token.
     fsm_token: u64,
-    /// Counter for fresh upper inodes (OR'd with `SYNTHETIC_INODE_BIT`).
+
+    // ---- per-baseline inode cache (cleared on swap) ----
+    /// inode -> worktree-relative path (recorded on lookup).
+    inode_paths: HashMap<u64, String>,
+    /// `(parent_inode, name)` per looked-up inode, so a swap can enqueue
+    /// precise `inval_entry` calls.
+    inode_parent_name: HashMap<u64, (u64, Vec<u8>)>,
+    /// path -> inode for *created* entries (no lower backing) so repeat
+    /// lookups return a stable inode within a baseline.
+    path_inode: HashMap<String, u64>,
+    /// Counter for fresh synthetic inodes.
     next: u64,
 }
 
@@ -160,11 +172,6 @@ impl Upper {
     fn alloc(&mut self) -> u64 {
         self.next += 1;
         SYNTHETIC_INODE_BIT | self.next
-    }
-    fn is_whiteouted(&self, parent: u64, name: &[u8]) -> bool {
-        self.whiteouts
-            .get(&parent)
-            .is_some_and(|s| s.contains(name))
     }
 }
 
@@ -210,8 +217,7 @@ impl<F: FsProvider> WritableFs<F> {
         cone: Vec<String>,
     ) -> Self {
         if let Some(p) = &fsmonitor_file {
-            // Seed a baseline token with zero changed paths (clean mount).
-            write_fsm(p, now_nanos(), &std::collections::BTreeSet::new());
+            write_fsm(p, now_nanos(), &BTreeSet::new());
         }
         Self {
             lower: Arc::new(Mutex::new(lower)),
@@ -228,14 +234,25 @@ impl<F: FsProvider> WritableFs<F> {
         self.lower.lock().unwrap().clone()
     }
 
-    /// A handle that shares this overlay's swappable state, so a caller
-    /// can [`WritableHandle::swap_baseline`] under the live mount.
+    /// A handle sharing this overlay's swappable state.
     fn handle(&self) -> WritableHandle<F> {
         WritableHandle {
             lower: self.lower.clone(),
             up: self.up.clone(),
             inval: self.inval.clone(),
             fsmonitor_file: self.fsmonitor_file.clone(),
+        }
+    }
+
+    fn invalidate_inode(&self, ino: u64) {
+        if let Some(tx) = &self.inval {
+            let _ = tx.send(Inval::Inode(ino));
+        }
+    }
+
+    fn invalidate_entry(&self, parent: u64, name: &[u8]) {
+        if let Some(tx) = &self.inval {
+            let _ = tx.send(Inval::Entry(parent, name.to_vec()));
         }
     }
 
@@ -262,23 +279,8 @@ impl<F: FsProvider> WritableFs<F> {
         if is_dir {
             recursively_in(path) || leads_to_cone(path)
         } else {
-            let parent = match path.rfind('/') {
-                Some(i) => &path[..i],
-                None => "",
-            };
+            let parent = parent_of(path);
             parent.is_empty() || recursively_in(parent) || leads_to_cone(parent)
-        }
-    }
-
-    fn invalidate_inode(&self, ino: u64) {
-        if let Some(tx) = &self.inval {
-            let _ = tx.send(Inval::Inode(ino));
-        }
-    }
-
-    fn invalidate_entry(&self, parent: u64, name: &[u8]) {
-        if let Some(tx) = &self.inval {
-            let _ = tx.send(Inval::Entry(parent, name.to_vec()));
         }
     }
 
@@ -292,39 +294,70 @@ impl<F: FsProvider> WritableFs<F> {
         }
     }
 
-    /// Resolve an inode's attributes (upper override, else lower).
-    fn attr_for(&self, up: &Upper, ino: u64) -> Result<Attr, FsError> {
-        if let Some(node) = up.created.get(&ino) {
-            let size = up.content.get(&ino).map(|b| b.len() as u64).unwrap_or(0);
-            let mut a = match node.kind {
-                FileType::Directory => Attr::directory(ino),
-                FileType::Symlink => Attr::symlink(ino, size),
-                FileType::RegularFile => Attr::regular_file(ino, size, node.mode),
-            };
-            a.mode = node.mode;
-            a.mtime = SystemTime::now();
-            return Ok(a);
+    /// Resolve `(parent, name)` -> child inode for a path, honoring
+    /// edits/whiteouts before the lower projection, and recording the
+    /// inode cache. Returns `NotFound` for whiteouted paths.
+    fn resolve(&self, up: &mut Upper, parent: u64, name: &[u8], child_path: &str) -> Result<u64, FsError> {
+        if up.whiteouts.contains(child_path) {
+            return Err(FsError::NotFound);
         }
-        let mut a = self.lower().getattr(ino)?;
-        if let Some(buf) = up.content.get(&ino) {
-            a.size = buf.len() as u64;
-        }
-        if up.modified.contains(&ino) {
-            a.mtime = SystemTime::now();
-        }
-        Ok(a)
+        let ino = match up.edits.get(child_path) {
+            Some(edit) if edit.from_lower => {
+                // Modified lower file: bind to the lower inode if the path
+                // still exists in the current baseline, else resurrect it
+                // under a stable synthetic inode.
+                match self.lower().lookup(parent, name) {
+                    Ok(a) => a.inode,
+                    Err(_) => self.created_inode(up, child_path),
+                }
+            }
+            Some(_) => self.created_inode(up, child_path),
+            None => self.lower().lookup(parent, name)?.inode,
+        };
+        up.inode_paths.insert(ino, child_path.to_string());
+        up.inode_parent_name
+            .entry(ino)
+            .or_insert_with(|| (parent, name.to_vec()));
+        Ok(ino)
     }
 
-    /// Ensure `ino`'s content is present in the upper store, copying the
-    /// lower bytes in on first materialization.
-    fn materialize(&self, up: &mut Upper, ino: u64) -> Result<(), FsError> {
-        if up.content.contains_key(&ino) {
+    /// Stable synthetic inode for a created/resurrected path.
+    fn created_inode(&self, up: &mut Upper, path: &str) -> u64 {
+        if let Some(&ino) = up.path_inode.get(path) {
+            return ino;
+        }
+        let ino = up.alloc();
+        up.path_inode.insert(path.to_string(), ino);
+        ino
+    }
+
+    /// Attributes for an inode (upper edit override, else lower).
+    fn attr_for(&self, up: &Upper, ino: u64) -> Result<Attr, FsError> {
+        if let Some(path) = up.inode_paths.get(&ino) {
+            if let Some(edit) = up.edits.get(path) {
+                let size = edit.content.len() as u64;
+                let mut a = match edit.kind {
+                    FileType::Directory => Attr::directory(ino),
+                    FileType::Symlink => Attr::symlink(ino, size),
+                    FileType::RegularFile => Attr::regular_file(ino, size, edit.mode),
+                };
+                a.mode = edit.mode;
+                a.mtime = SystemTime::now();
+                return Ok(a);
+            }
+        }
+        self.lower().getattr(ino)
+    }
+
+    /// Ensure a modified-lower file's bytes are materialized into `edits`.
+    fn materialize(&self, up: &mut Upper, ino: u64, path: &str) -> Result<(), FsError> {
+        if up.edits.contains_key(path) {
             return Ok(());
         }
-        // Lower file: read its full content through the projection.
         let lower = self.lower();
-        let size = lower.getattr(ino)?.size;
-        let mut buf = Vec::with_capacity(size as usize);
+        let attr = lower.getattr(ino)?;
+        let size = attr.size;
+        let mut content = Vec::with_capacity(size as usize);
         let mut off = 0u64;
         while off < size {
             let chunk = lower.read(ino, off, 64 * 1024)?;
@@ -332,23 +365,18 @@ impl<F: FsProvider> WritableFs<F> {
                 break;
             }
             off += chunk.len() as u64;
-            buf.extend_from_slice(&chunk);
+            content.extend_from_slice(&chunk);
         }
-        up.content.insert(ino, buf);
-        up.modified.insert(ino);
+        up.edits.insert(
+            path.to_string(),
+            Edit {
+                kind: FileType::RegularFile,
+                mode: attr.mode & 0o777,
+                content,
+                from_lower: true,
+            },
+        );
         Ok(())
-    }
-
-    /// Resolve `(parent, name)` to a child inode, honoring upper
-    /// additions/whiteouts before the lower projection.
-    fn resolve_child(&self, up: &Upper, parent: u64, name: &[u8]) -> Result<u64, FsError> {
-        if up.is_whiteouted(parent, name) {
-            return Err(FsError::NotFound);
-        }
-        if let Some(&ino) = up.additions.get(&parent).and_then(|m| m.get(name)) {
-            return Ok(ino);
-        }
-        Ok(self.lower().lookup(parent, name)?.inode)
     }
 }
 
@@ -356,28 +384,19 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let mut up = self.up.lock().unwrap();
         let name = name.as_bytes();
-        match self.resolve_child(&up, parent.0, name) {
-            Ok(ino) => {
-                // Reconstruct + remember the worktree-relative path so the
-                // inode-keyed write path can name the FSMonitor change set.
-                let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
-                let child_path = join_path(&parent_path, name);
-                match self.attr_for(&up, ino) {
-                    Ok(a) => {
-                        // Sparse cone: hide out-of-cone entries from git.
-                        if !self.cone_visible(&child_path, matches!(a.kind, FileType::Directory)) {
-                            reply.error(errno_for(&FsError::NotFound));
-                            return;
-                        }
-                        up.inode_paths.entry(ino).or_insert(child_path);
-                        up.inode_parent_name
-                            .entry(ino)
-                            .or_insert_with(|| (parent.0, name.to_vec()));
-                        reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN);
+        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        let child_path = join_path(&parent_path, name);
+        match self.resolve(&mut up, parent.0, name, &child_path) {
+            Ok(ino) => match self.attr_for(&up, ino) {
+                Ok(a) => {
+                    if !self.cone_visible(&child_path, matches!(a.kind, FileType::Directory)) {
+                        reply.error(errno_for(&FsError::NotFound));
+                        return;
                     }
-                    Err(e) => reply.error(errno_for(&e)),
+                    reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN);
                 }
-            }
+                Err(e) => reply.error(errno_for(&e)),
+            },
             Err(e) => reply.error(errno_for(&e)),
         }
     }
@@ -392,11 +411,15 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         let up = self.up.lock().unwrap();
-        if let Some(buf) = up.content.get(&ino.0) {
-            let b = buf.clone();
-            drop(up);
-            reply.data(&b);
-            return;
+        if let Some(path) = up.inode_paths.get(&ino.0) {
+            if let Some(edit) = up.edits.get(path) {
+                if matches!(edit.kind, FileType::Symlink) {
+                    let b = edit.content.clone();
+                    drop(up);
+                    reply.data(&b);
+                    return;
+                }
+            }
         }
         drop(up);
         match self.lower().readlink(ino.0) {
@@ -421,13 +444,16 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         reply: ReplyData,
     ) {
         let up = self.up.lock().unwrap();
-        if let Some(buf) = up.content.get(&ino.0) {
-            let start = (offset as usize).min(buf.len());
-            let end = (start + size as usize).min(buf.len());
-            let slice = buf[start..end].to_vec();
-            drop(up);
-            reply.data(&slice);
-            return;
+        if let Some(path) = up.inode_paths.get(&ino.0) {
+            if let Some(edit) = up.edits.get(path) {
+                let buf = &edit.content;
+                let start = (offset as usize).min(buf.len());
+                let end = (start + size as usize).min(buf.len());
+                let slice = buf[start..end].to_vec();
+                drop(up);
+                reply.data(&slice);
+                return;
+            }
         }
         drop(up);
         match self.lower().read(ino.0, offset, size) {
@@ -446,28 +472,26 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
     ) {
         let up = self.up.lock().unwrap();
         let parent = ino.0;
-        // A created directory has no lower backing; start empty.
+        let dir_path = up.inode_paths.get(&parent).cloned().unwrap_or_default();
+        // A created (no lower backing) directory has no lower listing.
         let is_created_dir = up
-            .created
-            .get(&parent)
-            .is_some_and(|n| matches!(n.kind, FileType::Directory));
-        let mut entries: Vec<(u64, FileType, Vec<u8>)> = Vec::new();
-        let empty_whiteouts = HashSet::new();
-        let whiteouts = up.whiteouts.get(&parent).unwrap_or(&empty_whiteouts);
-        let additions = up.additions.get(&parent);
+            .edits
+            .get(&dir_path)
+            .is_some_and(|e| !e.from_lower && matches!(e.kind, FileType::Directory));
 
+        let mut entries: Vec<(u64, FileType, Vec<u8>)> = Vec::new();
+        let mut lower_names: HashSet<Vec<u8>> = HashSet::new();
         if !is_created_dir {
             match self.lower().readdir(parent, 0) {
                 Ok(lower) => {
                     for e in lower {
                         let name = e.name.to_vec();
-                        if whiteouts.contains(&name) {
+                        let child_path = join_path(&dir_path, &name);
+                        if up.whiteouts.contains(&child_path) {
                             continue;
                         }
-                        if additions.is_some_and(|m| m.contains_key(&name)) {
-                            continue; // overridden by an upper addition
-                        }
-                        entries.push((e.inode, e.kind, name));
+                        lower_names.insert(name.clone());
+                        entries.push((/* inode filled at add */ 0, e.kind, name));
                     }
                 }
                 Err(e) => {
@@ -476,26 +500,23 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
                 }
             }
         }
-        if let Some(m) = additions {
-            for (name, &cino) in m {
-                if whiteouts.contains(name) {
-                    continue;
-                }
-                let kind = up
-                    .created
-                    .get(&cino)
-                    .map(|n| n.kind)
-                    .unwrap_or(FileType::RegularFile);
-                entries.push((cino, kind, name.clone()));
+        // Inject created entries (edits with no lower backing) under this dir.
+        for (path, edit) in up.edits.iter() {
+            if edit.from_lower || up.whiteouts.contains(path) {
+                continue;
             }
+            if parent_of(path) != dir_path {
+                continue;
+            }
+            let name = basename(path).as_bytes().to_vec();
+            if lower_names.contains(&name) {
+                continue; // already listed by lower
+            }
+            entries.push((0, edit.kind, name));
         }
 
-        // "." and ".." first, then merged entries, paginated by offset.
-        // Sparse cone: hide out-of-cone entries so git's sparse-index
-        // stays collapsed (it expands if it sees out-of-cone worktree
-        // content).
+        // Cone filter.
         if !self.cone.is_empty() {
-            let dir_path = up.inode_paths.get(&parent).cloned().unwrap_or_default();
             entries.retain(|(_, kind, name)| {
                 self.cone_visible(
                     &join_path(&dir_path, name),
@@ -503,14 +524,18 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
                 )
             });
         }
-        let mut all: Vec<(u64, FileType, Vec<u8>)> = vec![
-            (parent, FileType::Directory, b".".to_vec()),
-            (parent, FileType::Directory, b"..".to_vec()),
+
+        let mut all: Vec<(FileType, Vec<u8>)> = vec![
+            (FileType::Directory, b".".to_vec()),
+            (FileType::Directory, b"..".to_vec()),
         ];
-        all.extend(entries);
-        for (i, (cino, kind, name)) in all.iter().enumerate().skip(offset as usize) {
+        all.extend(entries.into_iter().map(|(_, k, n)| (k, n)));
+        for (i, (kind, name)) in all.iter().enumerate().skip(offset as usize) {
+            // The kernel only needs a non-zero inode for `.`/`..`; for
+            // real entries it re-`lookup`s by name (readdirplus is not
+            // implemented), so a placeholder inode is fine here.
             let full = reply.add(
-                INodeNo(*cino),
+                INodeNo(if i < 2 { parent.max(1) } else { u64::MAX }),
                 (i + 1) as u64,
                 to_fuser_kind(*kind),
                 OsStr::from_bytes(name),
@@ -542,18 +567,16 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         reply: ReplyAttr,
     ) {
         let mut up = self.up.lock().unwrap();
-        if let Some(newsize) = size {
-            if !up.content.contains_key(&ino.0) && !up.created.contains_key(&ino.0) {
-                if let Err(e) = self.materialize(&mut up, ino.0) {
-                    reply.error(errno_for(&e));
-                    return;
-                }
+        let path = up.inode_paths.get(&ino.0).cloned();
+        if let (Some(newsize), Some(path)) = (size, path.clone()) {
+            if let Err(e) = self.materialize(&mut up, ino.0, &path) {
+                reply.error(errno_for(&e));
+                return;
             }
-            up.content.entry(ino.0).or_default().resize(newsize as usize, 0);
-            up.modified.insert(ino.0);
-            if let Some(path) = up.inode_paths.get(&ino.0).cloned() {
-                self.record_change(&mut up, path);
+            if let Some(edit) = up.edits.get_mut(&path) {
+                edit.content.resize(newsize as usize, 0);
             }
+            self.record_change(&mut up, path);
         }
         let attr = self.attr_for(&up, ino.0);
         drop(up);
@@ -580,23 +603,27 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         reply: ReplyWrite,
     ) {
         let mut up = self.up.lock().unwrap();
-        if !up.content.contains_key(&ino.0) && !up.created.contains_key(&ino.0) {
-            if let Err(e) = self.materialize(&mut up, ino.0) {
-                reply.error(errno_for(&e));
+        let path = match up.inode_paths.get(&ino.0).cloned() {
+            Some(p) => p,
+            None => {
+                reply.error(errno_for(&FsError::NotFound));
                 return;
             }
+        };
+        if let Err(e) = self.materialize(&mut up, ino.0, &path) {
+            reply.error(errno_for(&e));
+            return;
         }
-        let buf = up.content.entry(ino.0).or_default();
-        let start = offset as usize;
-        let end = start + data.len();
-        if buf.len() < end {
-            buf.resize(end, 0);
+        {
+            let edit = up.edits.get_mut(&path).unwrap();
+            let start = offset as usize;
+            let end = start + data.len();
+            if edit.content.len() < end {
+                edit.content.resize(end, 0);
+            }
+            edit.content[start..end].copy_from_slice(data);
         }
-        buf[start..end].copy_from_slice(data);
-        up.modified.insert(ino.0);
-        if let Some(path) = up.inode_paths.get(&ino.0).cloned() {
-            self.record_change(&mut up, path);
-        }
+        self.record_change(&mut up, path);
         drop(up);
         self.invalidate_inode(ino.0);
         reply.written(data.len() as u32);
@@ -612,31 +639,27 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let name = name.as_bytes().to_vec();
+        let name = name.as_bytes();
         let mut up = self.up.lock().unwrap();
-        let ino = up.alloc();
-        up.created.insert(
-            ino,
-            CreatedNode {
-                parent: parent.0,
-                name: name.clone(),
+        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        let path = join_path(&parent_path, name);
+        up.whiteouts.remove(&path);
+        up.edits.insert(
+            path.clone(),
+            Edit {
                 kind: FileType::RegularFile,
                 mode: (mode as u16) & 0o777,
+                content: Vec::new(),
+                from_lower: false,
             },
         );
-        up.additions.entry(parent.0).or_default().insert(name.clone(), ino);
-        up.content.insert(ino, Vec::new());
-        up.modified.insert(ino);
-        if let Some(s) = up.whiteouts.get_mut(&parent.0) {
-            s.remove(&name);
-        }
-        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
-        let child_path = join_path(&parent_path, &name);
-        up.inode_paths.insert(ino, child_path.clone());
-        self.record_change(&mut up, child_path);
+        let ino = self.created_inode(&mut up, &path);
+        up.inode_paths.insert(ino, path.clone());
+        up.inode_parent_name.insert(ino, (parent.0, name.to_vec()));
+        self.record_change(&mut up, path);
         let attr = self.attr_for(&up, ino);
         drop(up);
-        self.invalidate_entry(parent.0, &name);
+        self.invalidate_entry(parent.0, name);
         match attr {
             Ok(a) => reply.created(
                 &self.ttl,
@@ -658,27 +681,26 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let name = name.as_bytes().to_vec();
+        let name = name.as_bytes();
         let mut up = self.up.lock().unwrap();
-        let ino = up.alloc();
-        up.created.insert(
-            ino,
-            CreatedNode {
-                parent: parent.0,
-                name: name.clone(),
+        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        let path = join_path(&parent_path, name);
+        up.whiteouts.remove(&path);
+        up.edits.insert(
+            path.clone(),
+            Edit {
                 kind: FileType::Directory,
                 mode: (mode as u16) & 0o777,
+                content: Vec::new(),
+                from_lower: false,
             },
         );
-        up.additions.entry(parent.0).or_default().insert(name.clone(), ino);
-        if let Some(s) = up.whiteouts.get_mut(&parent.0) {
-            s.remove(&name);
-        }
-        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
-        up.inode_paths.insert(ino, join_path(&parent_path, &name));
+        let ino = self.created_inode(&mut up, &path);
+        up.inode_paths.insert(ino, path.clone());
+        up.inode_parent_name.insert(ino, (parent.0, name.to_vec()));
         let attr = self.attr_for(&up, ino);
         drop(up);
-        self.invalidate_entry(parent.0, &name);
+        self.invalidate_entry(parent.0, name);
         match attr {
             Ok(a) => reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
             Err(e) => reply.error(errno_for(&e)),
@@ -686,25 +708,16 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.as_bytes().to_vec();
+        let name = name.as_bytes();
         let mut up = self.up.lock().unwrap();
-        // If it was an upper addition, drop it; otherwise whiteout the
-        // lower entry.
-        let was_added = up
-            .additions
-            .get_mut(&parent.0)
-            .and_then(|m| m.remove(&name));
-        if let Some(ino) = was_added {
-            up.content.remove(&ino);
-            up.created.remove(&ino);
-            up.modified.remove(&ino);
-        }
-        up.whiteouts.entry(parent.0).or_default().insert(name.clone());
         let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
-        let path = join_path(&parent_path, &name);
+        let path = join_path(&parent_path, name);
+        up.edits.remove(&path);
+        up.path_inode.remove(&path);
+        up.whiteouts.insert(path.clone());
         self.record_change(&mut up, path);
         drop(up);
-        self.invalidate_entry(parent.0, &name);
+        self.invalidate_entry(parent.0, name);
         reply.ok();
     }
 
@@ -722,54 +735,63 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         _flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let name = name.as_bytes().to_vec();
-        let newname = newname.as_bytes().to_vec();
+        let name = name.as_bytes();
+        let newname = newname.as_bytes();
         let mut up = self.up.lock().unwrap();
-        let src = match self.resolve_child(&up, parent.0, &name) {
-            Ok(i) => i,
-            Err(e) => {
-                reply.error(errno_for(&e));
-                return;
+        let src_parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        let dst_parent_path = up.inode_paths.get(&newparent.0).cloned().unwrap_or_default();
+        let src_path = join_path(&src_parent_path, name);
+        let dst_path = join_path(&dst_parent_path, newname);
+        if up.whiteouts.contains(&src_path) {
+            reply.error(errno_for(&FsError::NotFound));
+            return;
+        }
+
+        // Ensure the source bytes are captured at the destination path.
+        if let Some(edit) = up.edits.remove(&src_path) {
+            up.path_inode.remove(&src_path);
+            up.edits.insert(
+                dst_path.clone(),
+                Edit {
+                    from_lower: false,
+                    ..edit
+                },
+            );
+        } else {
+            // Plain lower file: materialize its bytes under the dst path.
+            if let Ok(a) = self.lower().lookup(parent.0, name) {
+                if let Ok(attr) = self.lower().getattr(a.inode) {
+                    let mut content = Vec::new();
+                    let mut off = 0u64;
+                    let lower = self.lower();
+                    while off < attr.size {
+                        match lower.read(a.inode, off, 64 * 1024) {
+                            Ok(chunk) if !chunk.is_empty() => {
+                                off += chunk.len() as u64;
+                                content.extend_from_slice(&chunk);
+                            }
+                            _ => break,
+                        }
+                    }
+                    up.edits.insert(
+                        dst_path.clone(),
+                        Edit {
+                            kind: attr.kind,
+                            mode: attr.mode & 0o777,
+                            content,
+                            from_lower: false,
+                        },
+                    );
+                }
             }
-        };
-        // Materialize a lower source so the moved entry keeps its bytes
-        // even though its name (and thus lower path) changes.
-        let is_lower_file = !up.created.contains_key(&src)
-            && self
-                .lower()
-                .getattr(src)
-                .map(|a| matches!(a.kind, FileType::RegularFile))
-                .unwrap_or(false);
-        if is_lower_file {
-            let _ = self.materialize(&mut up, src);
         }
-        // Detach the source name.
-        up.additions
-            .get_mut(&parent.0)
-            .map(|m| m.remove(&name));
-        up.whiteouts.entry(parent.0).or_default().insert(name.clone());
-        // Point the destination at the same inode; overwrite any target.
-        up.additions
-            .entry(newparent.0)
-            .or_default()
-            .insert(newname.clone(), src);
-        if let Some(s) = up.whiteouts.get_mut(&newparent.0) {
-            s.remove(&newname);
-        }
-        if let Some(node) = up.created.get_mut(&src) {
-            node.parent = newparent.0;
-            node.name = newname.clone();
-        }
-        let old_parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
-        let new_parent_path = up.inode_paths.get(&newparent.0).cloned().unwrap_or_default();
-        let old_path = join_path(&old_parent_path, &name);
-        let new_path = join_path(&new_parent_path, &newname);
-        up.inode_paths.insert(src, new_path.clone());
-        self.record_change(&mut up, old_path);
-        self.record_change(&mut up, new_path);
+        up.whiteouts.remove(&dst_path);
+        up.whiteouts.insert(src_path.clone());
+        self.record_change(&mut up, src_path);
+        self.record_change(&mut up, dst_path);
         drop(up);
-        self.invalidate_entry(parent.0, &name);
-        self.invalidate_entry(newparent.0, &newname);
+        self.invalidate_entry(parent.0, name);
+        self.invalidate_entry(newparent.0, newname);
         reply.ok();
     }
 
@@ -817,44 +839,16 @@ pub struct WritableHandle<F: FsProvider> {
     fsmonitor_file: Option<std::path::PathBuf>,
 }
 
-/// Errors from [`WritableHandle::swap_baseline`].
-#[derive(Debug)]
-pub enum SwapError {
-    /// The overlay has outstanding materialized edits / created entries /
-    /// whiteouts; swapping the baseline would lose them. Commit or
-    /// discard first. (EdenFS-style edit-survival across a swap is a
-    /// documented Stage 7 follow-up — see
-    /// `docs/implementation/writable-worktrees-plan.md`.)
-    NotClean,
-}
-
-impl std::fmt::Display for SwapError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SwapError::NotClean => {
-                write!(f, "cannot swap baseline: overlay has outstanding changes")
-            }
-        }
-    }
-}
-impl std::error::Error for SwapError {}
-
 impl<F: FsProvider> WritableHandle<F> {
     /// Swap the LOWER baseline under the live mount (a `checkout` of a
-    /// different commit). Requires a **clean** overlay (no materialized
-    /// edits, created entries, or whiteouts). On success, the kernel's
-    /// attr + entry caches for every previously looked-up inode are
-    /// invalidated (off-thread) so subsequent accesses re-resolve against
-    /// `new_lower` — unmodified files re-virtualize to the new baseline.
-    pub fn swap_baseline(&self, new_lower: Arc<F>) -> Result<(), SwapError> {
+    /// different commit). Local edits and whiteouts are **path-keyed**, so
+    /// they survive the swap (EdenFS semantics — your local change shadows
+    /// the checked-out version). Only the per-baseline inode cache is
+    /// cleared; the kernel's attr + entry caches for every previously
+    /// looked-up inode are invalidated (off-thread) so unmodified files
+    /// re-virtualize to `new_lower`.
+    pub fn swap_baseline(&self, new_lower: Arc<F>) {
         let mut up = self.up.lock().unwrap();
-        let dirty = !up.content.is_empty()
-            || !up.created.is_empty()
-            || !up.modified_paths.is_empty()
-            || up.whiteouts.values().any(|s| !s.is_empty());
-        if dirty {
-            return Err(SwapError::NotClean);
-        }
         // Point the overlay at the new baseline.
         *self.lower.lock().unwrap() = new_lower;
         // Re-lookup everything: the kernel must drop dentries (a changed
@@ -865,14 +859,16 @@ impl<F: FsProvider> WritableHandle<F> {
                 let _ = tx.send(Inval::Inode(*ino));
             }
         }
+        // Clear the per-baseline inode cache; `edits` / `whiteouts` /
+        // `modified_paths` survive (path-keyed).
         up.inode_paths.clear();
         up.inode_parent_name.clear();
+        up.path_inode.clear();
         // Advance the FSMonitor token so a watcher sees state changed.
         up.fsm_token = now_nanos().max(up.fsm_token + 1);
         if let Some(p) = &self.fsmonitor_file {
             write_fsm(p, up.fsm_token, &up.modified_paths);
         }
-        Ok(())
     }
 }
 
@@ -890,7 +886,7 @@ pub fn mount_writable_background<F: FsProvider + 'static>(
 
 /// Like [`mount_writable_background`] but also returns a
 /// [`WritableHandle`] for swapping the LOWER baseline under the live
-/// mount (Stage 7 / checkout-under-live-mount).
+/// mount (checkout-under-live-mount).
 pub fn mount_writable_background_with_handle<F: FsProvider + 'static>(
     lower: Arc<F>,
     mountpoint: impl AsRef<Path>,

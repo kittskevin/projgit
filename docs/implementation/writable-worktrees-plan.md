@@ -6,10 +6,10 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (**Stages 1–6 shipped**; **Stage 7 core
-> shipped** — `swap_baseline` under a live mount for the clean-worktree
-> checkout, with entry-cache invalidation; edit-survival, git-checkout
-> integration, and the crash journal remain).
+> Last updated: 2026-06-19 (**Stages 1–6 shipped**; **Stage 7 swap +
+> edit-survival shipped** — path-keyed overlay, `swap_baseline` under a
+> live mount with EdenFS-style edit-survival across checkout; git-checkout
+> integration and the crash journal remain).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -200,40 +200,39 @@ materialized set via `gix` (with the cache-tree extension) so commit
 cost is proportional to the change rather than git re-reading the
 worktree. Correctness is in hand; this is a perf follow-up.
 
-### Stage 7 — checkout-under-live-mount + crash consistency  *(core SHIPPED 2026-06-19; follow-ups remain)*
+### Stage 7 — checkout-under-live-mount + crash consistency  *(swap + edit-survival SHIPPED 2026-06-19; follow-ups remain)*
 
 **Shipped.** `WritableFs` now shares its `lower` baseline + `up` state
 (both `Arc<Mutex<…>>`), and `mount_writable_background_with_handle`
 returns a `WritableHandle` whose `swap_baseline(new_lower)` swaps the
 LOWER projection under the live mount — a `checkout` of a different
-commit. On swap it enqueues precise `inval_entry(parent, name)` +
-`inval_inode` for every previously looked-up inode (tracked via
-`inode_parent_name`) through the Stage 3 off-thread invalidator, so the
-kernel re-resolves changed paths by name against the new baseline, and
-advances the FSMonitor token. Swapping is refused (`SwapError::NotClean`)
-while the overlay holds outstanding edits.
+commit. The upper layer is **path-keyed** (`edits: HashMap<String, Edit>`
++ `whiteouts: HashSet<String>`), so local edits **survive a checkout**
+(EdenFS semantics: a local edit shadows the checked-out version); only
+the per-baseline inode cache is cleared on swap. The swap enqueues
+precise `inval_entry(parent, name)` + `inval_inode` for every previously
+looked-up inode (tracked via `inode_parent_name`) through the Stage 3
+off-thread invalidator, so the kernel re-resolves changed paths by name
+against the new baseline, and advances the FSMonitor token.
 
 **Proved** (`tests/writable_mount.rs::writable_mount_swap_baseline_serves_new_commit`,
-real mount): mount commit A (`README=A`, `dir/x.txt=one`), then
-`swap_baseline` to commit B — the mount re-virtualizes to B
-(`README=B`, `dir/x.txt=two`, the B-only `dir/y.txt` appears); a swap
-while a local edit is outstanding is refused.
+real mount): mount commit A (`README=A`, `dir/x.txt=one`), `swap_baseline`
+to commit B — the mount re-virtualizes (`README=B`, `dir/x.txt=two`, the
+B-only `dir/y.txt` appears); then edit `dir/x.txt` under B and swap back
+to A — `README` re-virtualizes to A but the local edit survives the
+checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
 
-**Remaining follow-ups (the harder half).**
-1. **Edit-survival across checkout** (EdenFS semantics): the upper is
-   inode-keyed, so a swap currently requires a clean overlay. Re-key
-   materialization by path so edits carry across a swap, then drop the
-   `NotClean` restriction.
-2. **git-checkout integration**: have git's `checkout` *drive* the swap
+**Remaining follow-ups.**
+1. **git-checkout integration**: have git's `checkout` *drive* the swap
    (update HEAD/index + `swap_baseline`) instead of materializing the
    whole diff into the worktree — the daemon observing the HEAD change
    + sparse/skip-worktree is the likely seam.
-3. **Crash consistency**: move the upper to an on-disk overlay, then add
+2. **Crash consistency**: move the upper to an on-disk overlay, then add
    a minimal journal (§10.3). Small blast radius (immutable LOWER), but
    nonzero.
 
-**Recommended order for the follow-ups:** on-disk upper → path-keyed
-materialization → git-checkout integration → journal.
+**Recommended order for the follow-ups:** on-disk upper → git-checkout
+integration → journal.
 
 ## 3. Out of scope (this plan)
 

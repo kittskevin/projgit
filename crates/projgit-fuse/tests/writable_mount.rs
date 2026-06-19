@@ -533,9 +533,7 @@ fn writable_mount_swap_baseline_serves_new_commit() {
     assert!(!mnt.join("dir/y.txt").exists(), "y.txt is not in commit A");
 
     // Swap to commit B under the live mount.
-    handle
-        .swap_baseline(make_provider(head_b, 2))
-        .expect("clean swap should succeed");
+    handle.swap_baseline(make_provider(head_b, 2));
     // Let the off-thread invalidator reach the kernel.
     std::thread::sleep(Duration::from_millis(250));
 
@@ -556,19 +554,31 @@ fn writable_mount_swap_baseline_serves_new_commit() {
         "file added in commit B must appear after the swap"
     );
 
-    // A swap with outstanding edits is refused (EdenFS-style edit-survival
-    // across checkout is a documented Stage 7 follow-up).
+    // Edit-survival across checkout: edit a file under baseline B, then
+    // swap back to A. The local edit (path-keyed) shadows A's version.
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
-            .open(mnt.join("README.md"))
+            .open(mnt.join("dir/x.txt"))
             .unwrap();
-        f.write_all(b"local edit\n").unwrap();
+        f.write_all(b"EDIT\n").unwrap();
     }
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(
-        handle.swap_baseline(make_provider(head_a, 3)).is_err(),
-        "swap must be refused while the overlay has outstanding edits"
+    std::thread::sleep(Duration::from_millis(100));
+    handle.swap_baseline(make_provider(head_a, 3));
+    std::thread::sleep(Duration::from_millis(250));
+
+    // README re-virtualizes to A (it was never edited).
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("README.md")).unwrap(),
+        "A\n",
+        "unedited file re-virtualizes to the new baseline"
+    );
+    // The local edit survives the checkout (EdenFS semantics): it shadows
+    // A's "one\n" with the B-derived edited content.
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("dir/x.txt")).unwrap(),
+        "two\nEDIT\n",
+        "local edit must survive the checkout and shadow the new baseline"
     );
 }

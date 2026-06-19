@@ -41,8 +41,7 @@ pub use adapter::ProjgitFuse;
 pub use mount::{mount, mount_background, MountConfig};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use writable::{
-    mount_writable_background, mount_writable_background_with_handle, SwapError, WritableFs,
-    WritableHandle,
+    mount_writable_background, mount_writable_background_with_handle, WritableFs, WritableHandle,
 };
 
 /// Re-export of [`fuser::BackgroundSession`] so callers don't need
