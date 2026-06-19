@@ -386,6 +386,20 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         config.pool_size,
     ));
 
+    // Background CAS maintenance (the Scalar object-store half: MIDX +
+    // incremental repack + commit-graph). Off unless
+    // PROJGIT_MAINTENANCE_INTERVAL_SECS is set; runs off the serving
+    // path so it never blocks an RPC. See
+    // docs/design/cache-transform-tier.md §14.
+    let maintenance = maintenance_interval_secs().map(|secs| {
+        let state = state.clone();
+        tracing::info!("background maintenance enabled (every {secs}s)");
+        std::thread::Builder::new()
+            .name("projgit-maint".to_owned())
+            .spawn(move || maintenance_loop(state, secs))
+            .expect("spawn maintenance thread")
+    });
+
     // Accept loop. Non-blocking would be cleaner but a self-connect
     // wakeup on shutdown is good enough for V1 and matches what most
     // small unix-socket daemons do.
@@ -410,6 +424,13 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         }
     }
 
+    // Join the maintenance thread so its `Arc<DaemonState>` is released
+    // before we drop `state` (and unmount). It exits at its next
+    // shutdown check (within one sleep slice when idle).
+    if let Some(h) = maintenance {
+        let _ = h.join();
+    }
+
     tracing::info!("shutting down");
     // Drop the listener first so no new connections succeed.
     drop(listener);
@@ -424,6 +445,48 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     drop(state);
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Maintenance interval from `PROJGIT_MAINTENANCE_INTERVAL_SECS`.
+/// `None` (unset / unparsable / 0) disables background maintenance.
+fn maintenance_interval_secs() -> Option<u64> {
+    std::env::var("PROJGIT_MAINTENANCE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Background CAS-maintenance loop: every `interval_secs`, if the
+/// daemon is attached to a source, run `projgit_core::run_maintenance`
+/// on the shared CAS. Sleeps in short slices so shutdown is prompt;
+/// returns when shutdown is requested. A maintenance failure is logged
+/// and the loop continues (best-effort upkeep).
+fn maintenance_loop(state: Arc<DaemonState>, interval_secs: u64) {
+    let interval = std::time::Duration::from_secs(interval_secs);
+    let slice = std::time::Duration::from_millis(250);
+    loop {
+        let mut slept = std::time::Duration::ZERO;
+        while slept < interval {
+            if state.should_shut_down() {
+                return;
+            }
+            std::thread::sleep(slice);
+            slept += slice;
+        }
+        if state.should_shut_down() {
+            return;
+        }
+        let git_dir = match state.active.lock() {
+            Ok(g) => g.as_ref().map(|r| r.git_dir.clone()),
+            Err(_) => None,
+        };
+        if let Some(git_dir) = git_dir {
+            match projgit_core::run_maintenance(&git_dir) {
+                Ok(()) => tracing::debug!("maintenance ran on {}", git_dir.display()),
+                Err(e) => tracing::warn!("maintenance failed: {e}"),
+            }
+        }
+    }
 }
 
 /// Per-connection handler. V1 protocol is one request → one response →
