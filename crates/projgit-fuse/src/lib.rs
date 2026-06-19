@@ -32,11 +32,15 @@
 mod adapter;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod mount;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod writable;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use adapter::ProjgitFuse;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use mount::{mount, mount_background, MountConfig};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use writable::{mount_writable_background, WritableFs};
 
 /// Re-export of [`fuser::BackgroundSession`] so callers don't need
 /// a direct dependency on `fuser` to keep a [`mount_background`]

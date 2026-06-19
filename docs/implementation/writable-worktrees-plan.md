@@ -6,8 +6,9 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (plan drafted; **Stage 1 / R1 shipped** —
-> `dotgit::build_writable_index_bytes` + `WRITABLE_CORE_CONFIG`, tested).
+> Last updated: 2026-06-19 (plan drafted; **Stages 1 & 2 shipped** —
+> R1 `build_writable_index_bytes`, and `WritableFs` writable FUSE overlay
+> + `mount_writable_background`, with a real-mount integration test).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -99,20 +100,31 @@ status #3 had `reads=0`); the production wiring lands in Stage 2.
 `.git/index` (the read-only mount keeps the synthetic overlay index;
 writable mounts need a real writable `.git`).
 
-### Stage 2 — writable FUSE path
+### Stage 2 — writable FUSE path  *(SHIPPED 2026-06-19)*
 
-**What.** A writable mount mode in `projgit-fuse` (today hard-wired
-read-only): an UPPER materialization layer (in-memory first, on-disk
-overlay later) over the LOWER projection, implementing `create` /
-`write` / `setattr` / `unlink` / `rename` / `mkdir` with
-materialize-on-write (copy lower→upper on first write, then serve
-upper-over-lower). Gated behind a `--writable` flag; the default
-read-only path stays untouched. The per-worktree `.git` becomes real +
-writable (seeded with Stage 1's index).
+**What.** `projgit_fuse::WritableFs<F: FsProvider>` — a `fuser::Filesystem`
+that layers an in-memory UPPER materialization store over the read-only
+LOWER `FsProvider` projection, implementing `read` / `write` / `create`
+/ `setattr` / `unlink` / `mkdir` / `rmdir` / `rename` with
+materialize-on-write (copy lower→upper on first write, serve
+upper-over-lower; new entries get fresh inodes in the synthetic space,
+disjoint from lower tree inodes). `mount_writable_background` mounts it
+read-write (no `MountOption::RO`); the default read-only `mount_background`
+path is untouched. The per-worktree `.git` is external (seeded with
+Stage 1's writable index).
 
-**Must prove:** edit a file in the mount → `git status` (normal scan)
-reports exactly it → `git add` works; untouched files stay virtual.
-(This is the spike's M4 minus FSMonitor.)
+**Proved (integration test `tests/writable_mount.rs`, real FUSE mount):**
+clean `git status` on the fresh mount (no fork — also the end-to-end
+validation of R1); edit a tracked file → `status` reports exactly
+`M dir/a.txt` → `git add` stages it; create a new file → `readdir`
+merges it → `status` shows `?? dir/new.txt` → `git add`; an untouched
+file stays virtual (served from the lower projection).
+
+**Deferred within Stage 2:** in-memory upper (on-disk overlay + crash
+consistency = Stage 7); attr-cache TTL is 0 (Stage 3 / R4 restores it
+with FUSE invalidation); `.git`-writable-inside-the-mount and the CLI
+`--writable` flag wiring (ergonomics; the mechanism is proven via
+`mount_writable_background` + an external git-dir).
 
 ### Stage 3 — R4: FUSE invalidation on write
 
