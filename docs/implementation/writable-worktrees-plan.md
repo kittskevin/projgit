@@ -6,9 +6,9 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (plan drafted; **Stages 1 & 2 shipped** —
-> R1 `build_writable_index_bytes`, and `WritableFs` writable FUSE overlay
-> + `mount_writable_background`, with a real-mount integration test).
+> Last updated: 2026-06-19 (plan drafted; **Stages 1–3 shipped** — R1
+> writable index, `WritableFs` writable FUSE overlay, and R4 off-thread
+> FUSE cache invalidation with a restored attr-cache TTL).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -126,16 +126,21 @@ with FUSE invalidation); `.git`-writable-inside-the-mount and the CLI
 `--writable` flag wiring (ergonomics; the mechanism is proven via
 `mount_writable_background` + an external git-dir).
 
-### Stage 3 — R4: FUSE invalidation on write
+### Stage 3 — R4: FUSE invalidation on write  *(SHIPPED 2026-06-19)*
 
-**What.** On every materializing write/setattr, push a
-`fuser::Notifier::inval_inode` (attr + data) so the kernel never serves
-a stale `getattr`/page after a write. Restores a useful attr-cache TTL
-(the spike used TTL=0). Same mechanism seeds the harder Stage 7
-checkout-invalidation.
+**What.** `WritableFs` now carries an optional off-thread invalidator:
+every materializing `write`/`setattr` enqueues an `inval_inode`, and
+`create`/`mkdir`/`unlink`/`rename` enqueue an `inval_entry`, drained by a
+dedicated worker thread holding the post-mount `fuser::Notifier`
+(calling the notifier from inside a handler can deadlock the kernel).
+With invalidation in place the attr/entry cache TTL is restored to a
+useful value (1s) via `mount_writable_background`; `WritableFs::new`
+(no invalidator) keeps TTL=0 and stays correct.
 
-**Must prove:** with a non-zero TTL, the first post-write `status`
-detects the edit (no false-negative).
+**Proved** (`tests/writable_mount.rs`, new step 5): a **same-size**
+in-place edit — where size is unchanged so only the mtime distinguishes
+it, and the kernel would otherwise serve a cached `getattr` within the
+TTL — is correctly detected by `git status` as `M dir/b.txt`.
 
 ### Stage 4 — R3: daemon FSMonitor
 

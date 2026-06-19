@@ -220,4 +220,25 @@ fn writable_mount_status_edit_add() {
     // ---- 4. untouched file is still served from the lower projection ----
     let bravo = std::fs::read_to_string(mnt.join("dir/b.txt")).expect("read untouched");
     assert_eq!(bravo, "bravo\n", "untouched file stays virtual + correct");
+
+    // ---- 5. same-SIZE in-place edit: detection depends on the Stage 3
+    //         FUSE cache invalidation (size is unchanged, so only the
+    //         mtime change distinguishes it, and the kernel would
+    //         otherwise serve a cached getattr within the TTL). ----
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(mnt.join("dir/b.txt"))
+            .expect("open dir/b.txt for in-place write");
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(b"BRAVO\n").expect("same-size overwrite"); // 6 bytes == "bravo\n"
+    }
+    // Give the off-thread invalidator a beat to reach the kernel.
+    std::thread::sleep(Duration::from_millis(100));
+    let status3 = gitw(&["status", "--porcelain"]);
+    assert!(
+        status3.contains(" M dir/b.txt"),
+        "same-size edit must be detected (Stage 3 invalidation), got:\n{status3}"
+    );
 }

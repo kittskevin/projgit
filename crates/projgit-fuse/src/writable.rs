@@ -47,14 +47,42 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-/// Attribute-cache TTL handed to the kernel. Zero for Stage 2 so a
-/// post-write `getattr` is never served stale; Stage 3 (R4) restores a
-/// useful TTL backed by explicit FUSE invalidation on write.
-const TTL: Duration = Duration::ZERO;
+/// Attr/entry cache TTL for a writable mount **with** an invalidator
+/// attached. Writes push a FUSE invalidation (Stage 3 / R4) off the
+/// handler thread, so the kernel can safely cache attrs/data for
+/// unmodified files between writes. A mount with no invalidator uses
+/// `Duration::ZERO` (every getattr re-asks us) and stays correct.
+const WRITABLE_TTL: Duration = Duration::from_secs(1);
 const GEN: Generation = Generation(0);
+
+/// A kernel-cache invalidation, applied off the FUSE handler thread.
+/// Calling [`fuser::Notifier`] from *within* a handler can deadlock the
+/// kernel, so write handlers enqueue these and a worker thread (holding
+/// the post-mount `Notifier`) drains them.
+enum Inval {
+    /// Invalidate an inode's cached attributes + data.
+    Inode(u64),
+    /// Invalidate a `(parent, name)` directory-entry cache slot.
+    Entry(u64, Vec<u8>),
+}
+
+impl Inval {
+    fn apply(&self, n: &fuser::Notifier) {
+        match self {
+            Inval::Inode(ino) => {
+                let _ = n.inval_inode(INodeNo(*ino), 0, 0);
+            }
+            Inval::Entry(parent, name) => {
+                let _ = n.inval_entry(INodeNo(*parent), OsStr::from_bytes(name));
+            }
+        }
+    }
+}
+
 
 /// A file or directory created inside the mount (no lower backing).
 struct CreatedNode {
@@ -100,14 +128,45 @@ impl Upper {
 pub struct WritableFs<F: FsProvider> {
     lower: Arc<F>,
     up: Mutex<Upper>,
+    /// Off-thread kernel-cache invalidator. `None` => no invalidation
+    /// and `ttl == 0` (every getattr re-asks us; always correct).
+    inval: Option<Sender<Inval>>,
+    /// Attr/entry cache TTL handed to the kernel.
+    ttl: Duration,
 }
 
 impl<F: FsProvider> WritableFs<F> {
-    /// Wrap a read-only projection provider as a writable overlay.
+    /// Wrap a read-only projection provider as a writable overlay with
+    /// no kernel-cache invalidation (TTL=0).
     pub fn new(lower: Arc<F>) -> Self {
         Self {
             lower,
             up: Mutex::new(Upper::default()),
+            inval: None,
+            ttl: Duration::ZERO,
+        }
+    }
+
+    /// Like [`Self::new`] but with an off-thread invalidator, enabling a
+    /// useful attr/data cache TTL backed by explicit invalidation.
+    fn with_invalidator(lower: Arc<F>, inval: Sender<Inval>) -> Self {
+        Self {
+            lower,
+            up: Mutex::new(Upper::default()),
+            inval: Some(inval),
+            ttl: WRITABLE_TTL,
+        }
+    }
+
+    fn invalidate_inode(&self, ino: u64) {
+        if let Some(tx) = &self.inval {
+            let _ = tx.send(Inval::Inode(ino));
+        }
+    }
+
+    fn invalidate_entry(&self, parent: u64, name: &[u8]) {
+        if let Some(tx) = &self.inval {
+            let _ = tx.send(Inval::Entry(parent, name.to_vec()));
         }
     }
 
@@ -176,7 +235,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         let name = name.as_bytes();
         match self.resolve_child(&up, parent.0, name) {
             Ok(ino) => match self.attr_for(&up, ino) {
-                Ok(a) => reply.entry(&TTL, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
+                Ok(a) => reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
                 Err(e) => reply.error(errno_for(&e)),
             },
             Err(e) => reply.error(errno_for(&e)),
@@ -186,7 +245,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let up = self.up.lock().unwrap();
         match self.attr_for(&up, ino.0) {
-            Ok(a) => reply.attr(&TTL, &to_fuser_attr(&a, req.uid(), req.gid())),
+            Ok(a) => reply.attr(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid())),
             Err(e) => reply.error(errno_for(&e)),
         }
     }
@@ -341,8 +400,13 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             up.content.entry(ino.0).or_default().resize(newsize as usize, 0);
             up.modified.insert(ino.0);
         }
-        match self.attr_for(&up, ino.0) {
-            Ok(a) => reply.attr(&TTL, &to_fuser_attr(&a, req.uid(), req.gid())),
+        let attr = self.attr_for(&up, ino.0);
+        drop(up);
+        if size.is_some() {
+            self.invalidate_inode(ino.0);
+        }
+        match attr {
+            Ok(a) => reply.attr(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid())),
             Err(e) => reply.error(errno_for(&e)),
         }
     }
@@ -375,6 +439,8 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         }
         buf[start..end].copy_from_slice(data);
         up.modified.insert(ino.0);
+        drop(up);
+        self.invalidate_inode(ino.0);
         reply.written(data.len() as u32);
     }
 
@@ -406,9 +472,12 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         if let Some(s) = up.whiteouts.get_mut(&parent.0) {
             s.remove(&name);
         }
-        match self.attr_for(&up, ino) {
+        let attr = self.attr_for(&up, ino);
+        drop(up);
+        self.invalidate_entry(parent.0, &name);
+        match attr {
             Ok(a) => reply.created(
-                &TTL,
+                &self.ttl,
                 &to_fuser_attr(&a, req.uid(), req.gid()),
                 GEN,
                 FileHandle(0),
@@ -443,8 +512,11 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         if let Some(s) = up.whiteouts.get_mut(&parent.0) {
             s.remove(&name);
         }
-        match self.attr_for(&up, ino) {
-            Ok(a) => reply.entry(&TTL, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
+        let attr = self.attr_for(&up, ino);
+        drop(up);
+        self.invalidate_entry(parent.0, &name);
+        match attr {
+            Ok(a) => reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
             Err(e) => reply.error(errno_for(&e)),
         }
     }
@@ -463,7 +535,9 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             up.created.remove(&ino);
             up.modified.remove(&ino);
         }
-        up.whiteouts.entry(parent.0).or_default().insert(name);
+        up.whiteouts.entry(parent.0).or_default().insert(name.clone());
+        drop(up);
+        self.invalidate_entry(parent.0, &name);
         reply.ok();
     }
 
@@ -506,7 +580,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         up.additions
             .get_mut(&parent.0)
             .map(|m| m.remove(&name));
-        up.whiteouts.entry(parent.0).or_default().insert(name);
+        up.whiteouts.entry(parent.0).or_default().insert(name.clone());
         // Point the destination at the same inode; overwrite any target.
         up.additions
             .entry(newparent.0)
@@ -517,8 +591,11 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         }
         if let Some(node) = up.created.get_mut(&src) {
             node.parent = newparent.0;
-            node.name = newname;
+            node.name = newname.clone();
         }
+        drop(up);
+        self.invalidate_entry(parent.0, &name);
+        self.invalidate_entry(newparent.0, &newname);
         reply.ok();
     }
 
@@ -564,7 +641,8 @@ pub fn mount_writable_background<F: FsProvider + 'static>(
     mountpoint: impl AsRef<Path>,
     config: &crate::MountConfig,
 ) -> std::io::Result<fuser::BackgroundSession> {
-    let fs = WritableFs::new(lower);
+    let (tx, rx) = std::sync::mpsc::channel::<Inval>();
+    let fs = WritableFs::with_invalidator(lower, tx);
     let mut fc = Config::default();
     fc.mount_options = vec![
         MountOption::FSName(config.name.clone()),
@@ -574,5 +652,19 @@ pub fn mount_writable_background<F: FsProvider + 'static>(
     ];
     fc.acl = config.acl;
     fc.n_threads = config.n_threads;
-    fuser::spawn_mount2(fs, mountpoint, &fc)
+    let session = fuser::spawn_mount2(fs, mountpoint, &fc)?;
+    // Drain invalidations on a dedicated thread holding the post-mount
+    // Notifier — calling it from within a handler can deadlock the
+    // kernel. The thread exits when the WritableFs (and its Sender) is
+    // dropped on unmount.
+    let notifier = session.notifier();
+    std::thread::Builder::new()
+        .name("projgit-fuse-inval".to_string())
+        .spawn(move || {
+            for op in rx {
+                op.apply(&notifier);
+            }
+        })
+        .ok();
+    Ok(session)
 }
