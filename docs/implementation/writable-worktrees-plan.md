@@ -6,9 +6,10 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (plan drafted; **Stages 1–5 shipped** — R1
-> writable index, `WritableFs` overlay, R4 invalidation, R3 FSMonitor
-> write-log, and R2 sparse-cone projection filtering).
+> Last updated: 2026-06-19 (plan drafted; **Stages 1–6 shipped** — the
+> read-only→writable seam through commit: R1 index, overlay, R4
+> invalidation, R3 FSMonitor, R2 sparse cone, and a verified
+> edit→add→commit cycle. Stage 7 is the remaining hard/subtle work.).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -183,15 +184,21 @@ entries so a *git* sparse-checkout flow over the mount is clean without
 git's own `sparse-checkout set` pass (the R1 index variant for sparse
 mounts).
 
-### Stage 6 — commit path via gix
+### Stage 6 — commit path  *(SHIPPED 2026-06-19, correctness)*
 
-**What.** Turn the UPPER materialized set into trees + a commit object
-via `gix`, written to the canonical odb, with the cache-tree extension
-so commit cost is proportional to the change, not repo size.
+**What.** The full `edit → git add → git commit` cycle works against the
+writable overlay using stock git's own commit machinery (objects written
+to the canonical odb via the external git-dir). 
 
-**Must prove:** edit → add → commit produces a verified commit
-(`cat-file HEAD:<path>` carries the change), matching the spike's M4
-commit verification, now via gix rather than shelling to `git`.
+**Proved** (`tests/writable_mount.rs`, step 3b): after editing a tracked
+file and creating a new one, `git commit` succeeds; `git cat-file -p
+HEAD:dir/a.txt` carries the edit, `HEAD:dir/new.txt` has the created
+content, and `git status` is clean again post-commit.
+
+**Deferred:** the *optimization* of deriving trees directly from the
+materialized set via `gix` (with the cache-tree extension) so commit
+cost is proportional to the change rather than git re-reading the
+worktree. Correctness is in hand; this is a perf follow-up.
 
 ### Stage 7 — checkout-under-live-mount + crash consistency
 

@@ -217,6 +217,25 @@ fn writable_mount_status_edit_add() {
         "created file must stage, got:\n{staged2}"
     );
 
+    // ---- 3b. commit the staged changes and verify (Stage 6) ----
+    gitw(&["commit", "-q", "-m", "spike: edit + new file"]);
+    let head_a = gitw(&["cat-file", "-p", "HEAD:dir/a.txt"]);
+    assert!(
+        head_a.contains("EDIT"),
+        "committed dir/a.txt must carry the edit, got:\n{head_a}"
+    );
+    let head_new = gitw(&["cat-file", "-p", "HEAD:dir/new.txt"]);
+    assert_eq!(
+        head_new.trim(),
+        "fresh",
+        "committed dir/new.txt must have the created content"
+    );
+    let post_commit = gitw(&["status", "--porcelain"]);
+    assert!(
+        post_commit.trim().is_empty(),
+        "after commit the worktree is clean again, got:\n{post_commit}"
+    );
+
     // ---- 4. untouched file is still served from the lower projection ----
     let bravo = std::fs::read_to_string(mnt.join("dir/b.txt")).expect("read untouched");
     assert_eq!(bravo, "bravo\n", "untouched file stays virtual + correct");
