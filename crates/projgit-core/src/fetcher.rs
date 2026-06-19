@@ -337,7 +337,21 @@ impl<F: Fetcher> HydratingObjectStore<F> {
         if oids.is_empty() {
             return Vec::new();
         }
-        let probes = self.fetcher.fetch_objects(oids);
+        // Pre-pass: objects whose bytes are already resident need no
+        // fetch -- synthesise `Present` for them so callers (and
+        // fetchers that don't self-check presence, e.g. `NoopFetcher`)
+        // see them as resident. Only absent OIDs reach the fetcher.
+        let mut to_fetch: Vec<ObjectId> = Vec::with_capacity(oids.len());
+        for &oid in oids {
+            if !self.store.contains(oid) {
+                to_fetch.push(oid);
+            }
+        }
+        if to_fetch.is_empty() {
+            return oids.iter().map(|oid| HeaderProbe::Present(*oid)).collect();
+        }
+
+        let probes = self.fetcher.fetch_objects(&to_fetch);
         for probe in &probes {
             match probe {
                 HeaderProbe::PresentWithHeader(oid, kind, size)
@@ -350,7 +364,23 @@ impl<F: Fetcher> HydratingObjectStore<F> {
                 HeaderProbe::Error(_, _) => {}
             }
         }
-        probes
+
+        // Reassemble in input order; already-present OIDs synthesise
+        // `Present`.
+        let mut by_oid: std::collections::HashMap<ObjectId, HeaderProbe> =
+            std::collections::HashMap::with_capacity(probes.len());
+        for probe in probes {
+            let oid = match &probe {
+                HeaderProbe::Present(o) => *o,
+                HeaderProbe::PresentWithHeader(o, _, _) => *o,
+                HeaderProbe::HeaderOnly(o, _, _) => *o,
+                HeaderProbe::Error(o, _) => *o,
+            };
+            by_oid.insert(oid, probe);
+        }
+        oids.iter()
+            .map(|oid| by_oid.remove(oid).unwrap_or(HeaderProbe::Present(*oid)))
+            .collect()
     }
 
     /// Eagerly warm the full *tree* closure reachable from
