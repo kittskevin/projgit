@@ -371,18 +371,21 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
       `repositoryformatversion=1` (`read_partial_clone_filter`), so git
       treats absent objects as promisor-fetchable, not fatal.
    Regression test (hermetic, `file://` partial clone, no network):
-   `cli_writable_partial_clone_edit_commit`. **Known limitation:** the
-   first `git status`/index-refresh over a partial clone mass-hydrates
-   the tree (git content-checks every size-0 entry, and even fsmonitor's
-   first query does a full baseline refresh) — the GVFS
-   `core.virtualfilesystem` problem; a local `file://` clone hides it
-   (fast local hydration) but a network promisor makes it slow. Deferring
-   the hydration needs pre-populated fsmonitor index state or the thin
-   virtualfilesystem hook (out of scope).
+   `cli_writable_partial_clone_edit_commit`. **First-status hydration \u2014
+   SOLVED (opt-in `--fsmonitor`):** the first `git status` over a partial
+   clone would content-check every size-0 entry, mass-hydrating the tree
+   (even fsmonitor's first query does a full baseline refresh \u2014 the GVFS
+   `core.virtualfilesystem` problem). `--fsmonitor` now **pre-populates an
+   FSMN index extension** marking every entry valid
+   (`build_writable_index_bytes_fsmonitor`: an all-zeros EWAH dirty
+   bitmap + null trailer read under `index.skipHash`), so git's first
+   query trusts every unmodified entry and skips the scan \u2014 no fork.
+   Proved by `cli_writable_fsmonitor_avoids_partial_clone_hydration` (real
+   partial clone with `uploadpack.allowFilter`: missing-blob count is
+   unchanged across the first `status`; without the seed it drops to 0).
 
-**Recommended order for the remaining follow-ups:** pre-populated
-fsmonitor index state to avoid partial-clone first-status hydration;
-blob GC / odb-linked commit perf; then the stock-checkout
+**Recommended order for the remaining follow-ups:** blob GC of the upper
+content store / odb-linked commit perf; then the stock-checkout
 `SKIP_WORKTREE` / thin-patch investigation if a workload demands O(1)
 *stock* checkout.
 

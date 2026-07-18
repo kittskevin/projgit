@@ -322,7 +322,31 @@ pub fn build_writable_index_bytes(
     store: &ObjectStore,
     commit_oid: ObjectId,
 ) -> Result<Vec<u8>, IndexBuildError> {
-    build_writable_index_bytes_inner(store, commit_oid, &[])
+    build_writable_index_bytes_inner(store, commit_oid, &[], false)
+}
+
+/// Like [`build_writable_index_bytes`] but **seeds a pre-populated
+/// FSMonitor (`FSMN`) index extension** marking every entry as
+/// fsmonitor-valid (an all-zeros "dirty" EWAH bitmap).
+///
+/// This is the load-bearing optimization for a **partial-clone**
+/// writable mount: without it, the first `git status` has no fsmonitor
+/// baseline, so git content-checks every entry — and because a
+/// `blob:none` clone has no blob bytes, that mass-hydrates the whole
+/// tree. With the seed present, git's first query trusts every
+/// unmodified entry (the `core.fsmonitor` hook returns an empty
+/// changed-set on a fresh mount) and skips the scan entirely; only
+/// edited paths (reported by the hook) are checked. Mirrors what
+/// GVFS/Scalar do, with no git fork.
+///
+/// The trailing index hash is written as null (git reads it under
+/// `index.skipHash = true`, which the writable mount sets), so no raw
+/// SHA-1 recompute is needed after splicing the extension.
+pub fn build_writable_index_bytes_fsmonitor(
+    store: &ObjectStore,
+    commit_oid: ObjectId,
+) -> Result<Vec<u8>, IndexBuildError> {
+    build_writable_index_bytes_inner(store, commit_oid, &[], true)
 }
 
 /// Like [`build_writable_index_bytes`] but for a **sparse** (cone-mode)
@@ -342,7 +366,7 @@ pub fn build_writable_index_bytes_sparse(
     commit_oid: ObjectId,
     cone: &[String],
 ) -> Result<Vec<u8>, IndexBuildError> {
-    build_writable_index_bytes_inner(store, commit_oid, cone)
+    build_writable_index_bytes_inner(store, commit_oid, cone, false)
 }
 
 /// Whether an index file `path` is inside the cone (i.e. its parent
@@ -371,6 +395,7 @@ fn build_writable_index_bytes_inner(
     store: &ObjectStore,
     commit_oid: ObjectId,
     cone: &[String],
+    fsmonitor: bool,
 ) -> Result<Vec<u8>, IndexBuildError> {
     use std::time::UNIX_EPOCH;
 
@@ -424,11 +449,73 @@ fn build_writable_index_bytes_inner(
         }
     }
 
+    if fsmonitor {
+        // Emit the body (header + entries + tree-cache, no EOIE, no
+        // trailing hash) via `State::write_to`, splice in a pre-populated
+        // `FSMN` extension marking every entry valid, then write a null
+        // trailer (read under `index.skipHash`).
+        let entry_count = state.entries().len();
+        let hash_len = repo.object_hash().len_in_bytes();
+        let mut bytes = Vec::new();
+        state
+            .write_to(
+                &mut bytes,
+                gix::index::write::Options {
+                    extensions: gix::index::write::Extensions::Given {
+                        tree_cache: true,
+                        end_of_index_entry: false,
+                    },
+                    skip_hash: true,
+                },
+            )
+            .map_err(IndexBuildError::Write)?;
+        append_fsmonitor_extension(&mut bytes, entry_count);
+        bytes.resize(bytes.len() + hash_len, 0);
+        return Ok(bytes);
+    }
+
     let file = gix::index::File::from_state(state, std::path::PathBuf::new());
     let mut bytes = Vec::new();
     file.write_to(&mut bytes, gix::index::write::Options::default())
         .map_err(IndexBuildError::Write)?;
     Ok(bytes)
+}
+
+/// Append a pre-populated FSMonitor (`FSMN`) index extension marking all
+/// `entry_count` entries valid (an all-zeros "dirty" EWAH bitmap), so
+/// git's first `status` trusts every unmodified entry without a scan.
+///
+/// FSMN v2 layout: `version:u32=2 | token(NUL-terminated) | ewah_size:u32
+/// | ewah`. The EWAH for an all-zeros bitmap of N bits is a fixed 20-byte
+/// structure: `num_bits:u32 | word_count:u32=1 | rlw:u64 | rlw_pos:u32=0`,
+/// where the single run-length word encodes `ceil(N/64)` clean zero-words.
+fn append_fsmonitor_extension(out: &mut Vec<u8>, entry_count: usize) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .to_string();
+
+    // All-zeros EWAH dirty bitmap for `entry_count` bits.
+    let clean_words = (entry_count as u64).div_ceil(64);
+    let mut ewah = Vec::with_capacity(20);
+    ewah.extend_from_slice(&(entry_count as u32).to_be_bytes()); // num_bits
+    ewah.extend_from_slice(&1u32.to_be_bytes()); // compressed word count
+    ewah.extend_from_slice(&(clean_words << 1).to_be_bytes()); // RLW: run of zeros
+    ewah.extend_from_slice(&0u32.to_be_bytes()); // position of the last RLW
+
+    let mut data = Vec::new();
+    data.extend_from_slice(&2u32.to_be_bytes()); // FSMN version 2
+    data.extend_from_slice(token.as_bytes());
+    data.push(0); // NUL-terminated token
+    data.extend_from_slice(&(ewah.len() as u32).to_be_bytes());
+    data.extend_from_slice(&ewah);
+
+    out.extend_from_slice(b"FSMN");
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(&data);
 }
 
 /// Minimal `[core]` config for a **writable** worktree mount. Adds

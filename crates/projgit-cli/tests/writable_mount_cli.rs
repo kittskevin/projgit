@@ -42,6 +42,27 @@ fn git_ok(cwd: &Path, args: &[&str]) -> String {
     stdout
 }
 
+/// Count objects missing from `git_dir`'s odb (promised by the promisor)
+/// — i.e. blobs not yet hydrated in a partial clone.
+fn count_missing_objects(git_dir: &Path) -> usize {
+    let (_ok, out) = git(
+        git_dir,
+        &["rev-list", "--objects", "--all", "--missing=print"],
+    );
+    out.lines().filter(|l| l.starts_with('?')).count()
+}
+
+/// The projgit cache's clone directory (the one entry that isn't the
+/// `worktrees/` scratch dir).
+fn find_clone_dir(cache: &Path) -> PathBuf {
+    std::fs::read_dir(cache)
+        .expect("read cache dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()) != Some("worktrees"))
+        .expect("clone dir under cache")
+}
+
 fn wait_for_mount(mp: &Path, timeout: Duration) -> bool {
     let parent_dev = mp
         .parent()
@@ -936,6 +957,76 @@ fn cli_writable_partial_clone_edit_commit() {
     assert_eq!(committed, "alpha\nEDIT\n", "committed edit must be readable");
     let newc = git_ok(&mnt, &["cat-file", "-p", "HEAD:dir/new.txt"]);
     assert_eq!(newc, "fresh\n", "new file must be committed");
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_fsmonitor_avoids_partial_clone_hydration() {
+    // Over a real partial (blob:none) clone, `--fsmonitor` seeds a
+    // pre-populated FSMN index extension so git's first `status` trusts
+    // every unmodified entry and does NOT content-check them — no mass
+    // blob hydration. (Without the seed, the same first status hydrates
+    // the whole tree; confirmed by the plain partial-clone path.)
+    let base = std::env::temp_dir().join(format!("projgit-cli-fsmnhydr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    // Let the local `file://` upload-pack honor `--filter` so projgit's
+    // clone is a REAL partial clone (blobs absent).
+    git_ok(&src, &["config", "uploadpack.allowFilter", "true"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    for i in 0..8 {
+        std::fs::write(src.join(format!("dir/f{i}.txt")), format!("content number {i}\n")).unwrap();
+    }
+    std::fs::write(src.join("README.md"), b"readme\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "init"]);
+
+    let src_abs = std::fs::canonicalize(&src).unwrap();
+    let url = format!("file://{}", src_abs.display());
+    let mut child = Command::new(PROJGIT_BIN)
+        .args(["mount", "--writable", "--fsmonitor", "--cache-dir"])
+        .arg(&cache)
+        .arg(&url)
+        .arg(&mnt)
+        .spawn()
+        .expect("spawn projgit mount --writable --fsmonitor file://");
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(15)),
+        "mount never came up"
+    );
+
+    // Sanity: this is a real partial clone (blobs absent).
+    let clone = find_clone_dir(&cache);
+    let before = count_missing_objects(&clone);
+    assert!(
+        before > 0,
+        "test must exercise a real partial clone (missing blobs); got {before} \
+         (is uploadpack.allowFilter honored?)"
+    );
+
+    // First status is clean AND does not hydrate any blob.
+    let s = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(s.trim().is_empty(), "fresh mount must be clean:\n{s}");
+    let after = count_missing_objects(&clone);
+    assert_eq!(
+        after, before,
+        "the FSMN seed must let git trust unmodified entries — no hydration on \
+         first status (before={before}, after={after})"
+    );
 
     // Tear down.
     let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();

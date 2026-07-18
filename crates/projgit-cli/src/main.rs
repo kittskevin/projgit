@@ -1770,6 +1770,7 @@ fn prepare_writable(
         &args.mountpoint,
         branch.as_deref(),
         remote_url.as_deref(),
+        args.fsmonitor,
     )?;
     let where_ = match (&branch, &remote_url) {
         (Some(b), Some(_)) => format!("on branch '{b}' (push → origin)"),
@@ -1831,6 +1832,7 @@ struct WritableGitDir {
 /// remount and the projection is re-pinned to its `HEAD` (uncommitted
 /// in-memory edits are still lost until the upper is made durable).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn setup_writable_gitdir(
     clone_git_dir: &Path,
     store: &projgit_core::ObjectStore,
@@ -1839,6 +1841,7 @@ fn setup_writable_gitdir(
     mountpoint: &Path,
     branch: Option<&str>,
     remote_url: Option<&str>,
+    fsmonitor: bool,
 ) -> Result<WritableGitDir> {
     use std::collections::hash_map::DefaultHasher;
     use std::fmt::Write as _;
@@ -1909,6 +1912,11 @@ fn setup_writable_gitdir(
         "[core]\n\trepositoryformatversion = {repo_format}\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\tcheckStat = minimal\n\tworktree = {}\n",
         mp_abs.display()
     );
+    if fsmonitor {
+        // The FSMN-seeded index is written with a null trailer; git reads
+        // it under skipHash (2.40+), avoiding a raw index-hash recompute.
+        config.push_str("[index]\n\tskipHash = true\n");
+    }
     if let Some(url) = remote_url {
         let _ = write!(
             config,
@@ -1928,8 +1936,13 @@ fn setup_writable_gitdir(
         }
     }
     std::fs::write(gd.join("config"), config)?;
-    let index = projgit_core::dotgit::build_writable_index_bytes(store, commit_oid)
-        .context("building writable index")?;
+    let index = if fsmonitor {
+        projgit_core::dotgit::build_writable_index_bytes_fsmonitor(store, commit_oid)
+            .context("building writable fsmonitor index")?
+    } else {
+        projgit_core::dotgit::build_writable_index_bytes(store, commit_oid)
+            .context("building writable index")?
+    };
     std::fs::write(gd.join("index"), index)?;
     Ok(WritableGitDir {
         path: gd,
