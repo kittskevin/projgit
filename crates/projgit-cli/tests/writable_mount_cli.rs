@@ -780,3 +780,85 @@ fn cli_writable_stock_commit_reconciles_via_hook() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_fsmonitor_over_socket() {
+    // `--fsmonitor` installs a core.fsmonitor hook that streams the
+    // mount's modified-path set over the control socket. Verify the
+    // config is wired, the query returns the edited path, and status is
+    // still correct.
+    let base = std::env::temp_dir().join(format!("projgit-cli-fsm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    std::fs::write(src.join("dir/f.txt"), b"hello\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "c1"]);
+
+    // Mount with --fsmonitor.
+    let mut child = Command::new(PROJGIT_BIN)
+        .args(["mount", "--writable", "--fsmonitor", "--cache-dir"])
+        .arg(&cache)
+        .arg(&src)
+        .arg(&mnt)
+        .spawn()
+        .expect("spawn projgit mount --writable --fsmonitor");
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(10)),
+        "mount never came up"
+    );
+
+    // core.fsmonitor is wired to the mount's hook.
+    let cfg = git_ok(&mnt, &["config", "core.fsmonitor"]);
+    assert!(
+        cfg.contains("projgit-fsmonitor"),
+        "core.fsmonitor must point at the mount hook, got: {cfg:?}"
+    );
+
+    // Clean mount: no false positives.
+    let s0 = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(s0.trim().is_empty(), "fresh mount must be clean:\n{s0}");
+
+    // Edit a file, then query fsmonitor directly (what git's hook runs).
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mnt.join("dir/f.txt"))
+            .unwrap();
+        f.write_all(b"EDIT\n").unwrap();
+    }
+    let out = Command::new(PROJGIT_BIN)
+        .args(["__fsmonitor", "2", "0"])
+        .current_dir(&mnt)
+        .output()
+        .expect("spawn projgit __fsmonitor");
+    assert!(out.status.success(), "fsmonitor query must succeed");
+    let resp = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        resp.contains("dir/f.txt"),
+        "fsmonitor response must list the edited path, got: {resp:?}"
+    );
+
+    // And git status still surfaces the edit with fsmonitor enabled.
+    let s1 = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(
+        s1.contains("M dir/f.txt"),
+        "status must surface the edit under fsmonitor:\n{s1}"
+    );
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+}

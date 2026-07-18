@@ -266,9 +266,9 @@ fn snapshot_records(up: &Upper) -> Vec<Record> {
     recs
 }
 
-/// Write the FSMonitor write-log file: `<token>\0 <path>\0 ...`. A
-/// `core.fsmonitor` hook streams it to git verbatim.
-fn write_fsm(path: &Path, token: u64, paths: &BTreeSet<String>) {
+/// FSMonitor (query protocol v2) response bytes: `<token>\0<path>\0…`.
+/// A `core.fsmonitor` hook streams this to git verbatim.
+fn fsm_bytes(token: u64, paths: &BTreeSet<String>) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(token.to_string().as_bytes());
     buf.push(0);
@@ -276,7 +276,13 @@ fn write_fsm(path: &Path, token: u64, paths: &BTreeSet<String>) {
         buf.extend_from_slice(p.as_bytes());
         buf.push(0);
     }
-    let _ = std::fs::write(path, &buf);
+    buf
+}
+
+/// Write the FSMonitor write-log file. A `core.fsmonitor` hook streams
+/// it to git verbatim.
+fn write_fsm(path: &Path, token: u64, paths: &BTreeSet<String>) {
+    let _ = std::fs::write(path, fsm_bytes(token, paths));
 }
 
 /// A materialized or created entry in the upper layer, keyed by path.
@@ -1102,6 +1108,15 @@ impl<F: FsProvider> WritableHandle<F> {
         if let Some(j) = &self.journal {
             let _ = j.compact(&live);
         }
+    }
+
+    /// Current FSMonitor (query protocol v2) response bytes: the
+    /// monotonic token followed by NUL-separated worktree-relative paths
+    /// modified since mount. A `core.fsmonitor` hook (answered over the
+    /// control socket) streams this to git so `status` skips scanning.
+    pub fn fsmonitor_response(&self) -> Vec<u8> {
+        let up = self.up.lock().unwrap();
+        fsm_bytes(up.fsm_token, &up.modified_paths)
     }
 }
 

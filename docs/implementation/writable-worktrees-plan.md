@@ -323,7 +323,16 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    own ref writes since it notifies directly.) Proved by
    `cli_writable_stock_commit_reconciles_via_hook` (a stock `git commit`
    is observed via the hook, reconciling the committed edit out of the
-   upper). *Boundary (documented):* making **stock** `git
+   upper). **FSMonitor over the socket (2026-07-18, opt-in
+   `--fsmonitor`):** `projgit mount --writable --fsmonitor` installs a
+   `core.fsmonitor` hook (query protocol v2) that shells `projgit
+   __fsmonitor`, streaming the mount's `<token>\0<paths>` set from the
+   control socket so `git status` skips scanning the virtual worktree
+   (the big-worktree win); `WritableHandle::fsmonitor_response` serves it
+   from the upper's authoritative modified set, and a socket failure exits
+   non-zero so git safely full-scans. Proved by
+   `cli_writable_fsmonitor_over_socket`. *Boundary (documented):* making
+   **stock** `git
    checkout` stay fully virtual for unmodified files needs `SKIP_WORKTREE`
    management (racy index writes) or a thin `core.virtualfilesystem`-style
    patch — out of scope; stock checkout still works but eagerly

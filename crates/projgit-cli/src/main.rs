@@ -69,6 +69,17 @@ enum Command {
     /// not intended for direct use.
     #[command(name = "__swap-notify", hide = true)]
     SwapNotify,
+    /// (internal) Answer git's `core.fsmonitor` query for a writable
+    /// mount by streaming the mount's modified-path set from its control
+    /// socket. Invoked by the scratch git dir's fsmonitor hook; not
+    /// intended for direct use.
+    #[command(name = "__fsmonitor", hide = true)]
+    Fsmonitor {
+        /// `<version> <token>` passed by git (ignored; we return the
+        /// current token + cumulative set).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -179,6 +190,13 @@ struct MountArgs {
     /// `--daemon-socket`.
     #[arg(long)]
     writable: bool,
+
+    /// Enable FSMonitor for a `--writable` mount: install a
+    /// `core.fsmonitor` hook that streams the mount's modified-path set
+    /// over its control socket, so `git status` skips scanning the
+    /// virtual worktree. A win on large worktrees; requires `--writable`.
+    #[arg(long, requires = "writable")]
+    fsmonitor: bool,
 
     /// Pass the `allow_other` FUSE mount option, so users other than
     /// the one running `projgit mount` can read the mount.
@@ -385,6 +403,7 @@ fn main() -> Result<()> {
         Command::Attach(args) => cmd_attach(args),
         Command::Checkout(args) => cmd_checkout(args),
         Command::SwapNotify => cmd_swap_notify(),
+        Command::Fsmonitor { .. } => cmd_fsmonitor(),
     }
 }
 
@@ -573,6 +592,13 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
         // alongside the scratch git dir, so it survives an unmount.
         upper_dir = Some(wt.path.join("projgit-upper"));
         writable_scratch = Some(wt.path.clone());
+        // Optional: point git's fsmonitor at the mount's control socket so
+        // `status` skips scanning the virtual worktree.
+        if args.fsmonitor {
+            if let Err(e) = install_fsmonitor_hook(&wt.path) {
+                eprintln!("projgit: fsmonitor setup failed ({e:#}); status will do a full scan");
+            }
+        }
         (build_writable_overlay(&wt.path)?, true)
     } else {
         (build_root_overlay(&args, &projection, &store, &git_dir)?, false)
@@ -1188,6 +1214,11 @@ impl<F: projgit_core::Fetcher + 'static> Swapper<F> {
         *cur = Some(commit);
         Ok(true)
     }
+
+    /// Current FSMonitor (query protocol v2) response bytes for the mount.
+    fn fsmonitor_response(&self) -> Vec<u8> {
+        self.handle.fsmonitor_response()
+    }
 }
 
 /// Watch a writable mount's scratch git dir `HEAD` and swap the LOWER
@@ -1282,18 +1313,25 @@ where
                         if reader.read_line(&mut line).is_err() {
                             continue;
                         }
-                        let reply = match line.trim().strip_prefix("SWAP ") {
-                            Some(hex) => match gix::ObjectId::from_hex(hex.as_bytes()) {
-                                Ok(oid) => match swapper.swap_to(oid) {
-                                    Ok(_) => "OK\n".to_string(),
-                                    Err(e) => format!("ERR {e:#}\n"),
-                                },
-                                Err(_) => "ERR bad oid\n".to_string(),
-                            },
-                            None => "ERR bad request\n".to_string(),
-                        };
                         let mut stream = stream;
-                        let _ = stream.write_all(reply.as_bytes());
+                        let line = line.trim();
+                        if line.starts_with("FSMONITOR") {
+                            // Binary v2 response; closing the stream is the
+                            // client's EOF.
+                            let _ = stream.write_all(&swapper.fsmonitor_response());
+                        } else {
+                            let reply = match line.strip_prefix("SWAP ") {
+                                Some(hex) => match gix::ObjectId::from_hex(hex.as_bytes()) {
+                                    Ok(oid) => match swapper.swap_to(oid) {
+                                        Ok(_) => "OK\n".to_string(),
+                                        Err(e) => format!("ERR {e:#}\n"),
+                                    },
+                                    Err(_) => "ERR bad oid\n".to_string(),
+                                },
+                                None => "ERR bad request\n".to_string(),
+                            };
+                            let _ = stream.write_all(reply.as_bytes());
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(100));
@@ -1481,6 +1519,86 @@ fn cmd_swap_notify() -> Result<()> {
 /// Non-unix stub.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn cmd_swap_notify() -> Result<()> {
+    Ok(())
+}
+
+/// `projgit __fsmonitor <version> <token>` — git's `core.fsmonitor`
+/// query program for a writable mount. git runs it with cwd = the
+/// worktree and no `GIT_DIR`, so we resolve the git dir from the cwd and
+/// stream the mount's v2 response (`<token>\0<path>\0…`) from the
+/// control socket to stdout. Any failure exits non-zero so git falls
+/// back to a full worktree scan (safe).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cmd_fsmonitor() -> Result<()> {
+    if fsmonitor_query().is_none() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fsmonitor_query() -> Option<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let cwd = std::env::current_dir().ok()?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&cwd)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let git_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let socket = git_dir.join(CONTROL_SOCKET_NAME);
+    let mut stream = UnixStream::connect(&socket).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    stream.write_all(b"FSMONITOR\n").ok()?;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).ok()?;
+    std::io::stdout().write_all(&resp).ok()?;
+    Some(())
+}
+
+/// Non-unix stub: no control socket, so git full-scans.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn cmd_fsmonitor() -> Result<()> {
+    std::process::exit(1);
+}
+
+/// Install a `core.fsmonitor` hook into the writable scratch git dir
+/// (query protocol v2) that streams the mount's modified-path set from
+/// the control socket, and point git's config at it. Lets `git status`
+/// skip scanning the (virtual) worktree — the big-worktree win.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn install_fsmonitor_hook(scratch: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::current_exe().context("resolving projgit binary path")?;
+    let hooks = scratch.join("hooks");
+    std::fs::create_dir_all(&hooks)?;
+    let hook = hooks.join("projgit-fsmonitor");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\nexec \"{}\" __fsmonitor \"$@\"\n", exe.display()),
+    )?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    let hook_abs = std::fs::canonicalize(&hook)?;
+    git_run(
+        std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(scratch)
+            .args(["config", "core.fsmonitorHookVersion", "2"]),
+    )?;
+    git_run(
+        std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(scratch)
+            .arg("config")
+            .arg("core.fsmonitor")
+            .arg(&hook_abs),
+    )?;
     Ok(())
 }
 
