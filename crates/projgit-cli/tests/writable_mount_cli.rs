@@ -862,3 +862,83 @@ fn cli_writable_fsmonitor_over_socket() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_partial_clone_edit_commit() {
+    // A writable mount over a PARTIAL (blob:none) clone: projgit
+    // partial-clones the `file://` source, so blobs are absent locally.
+    // Exercises the two partial-clone fixes the live GitHub validation
+    // surfaced — the writable index synthesis (size falls back to 0 when
+    // a blob header is absent) and the promisor config propagation (so
+    // git's write-tree/commit treat absent blobs as fetchable, not
+    // fatal). Without either fix the mount crashes or the commit fails.
+    let base = std::env::temp_dir().join(format!("projgit-cli-partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    std::fs::write(src.join("dir/a.txt"), b"alpha\n").unwrap();
+    std::fs::write(src.join("dir/b.txt"), b"beta\n").unwrap();
+    std::fs::write(src.join("README.md"), b"readme\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "init"]);
+
+    // Mount writable over a `file://` URL — that path goes through
+    // projgit's `--filter=blob:none` partial clone (a plain path would
+    // hardlink and skip the filter).
+    let src_abs = std::fs::canonicalize(&src).unwrap();
+    let url = format!("file://{}", src_abs.display());
+    let mut child = Command::new(PROJGIT_BIN)
+        .args(["mount", "--writable", "--cache-dir"])
+        .arg(&cache)
+        .arg(&url)
+        .arg(&mnt)
+        .spawn()
+        .expect("spawn projgit mount --writable file://");
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(15)),
+        "writable partial-clone mount never came up"
+    );
+
+    // The mount inherited the source's promisor config (the fix): git in
+    // the mount treats absent blobs as fetchable, not fatal.
+    let promisor = git_ok(&mnt, &["config", "--get", "remote.origin.promisor"]);
+    assert_eq!(
+        promisor.trim(),
+        "true",
+        "writable mount must inherit the partial-clone promisor config"
+    );
+
+    // Edit a tracked file + create a new one, then commit with stock git.
+    // (Blobs hydrate from the local file:// promisor — fast.)
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mnt.join("dir/a.txt"))
+            .unwrap();
+        f.write_all(b"EDIT\n").unwrap();
+    }
+    std::fs::write(mnt.join("dir/new.txt"), b"fresh\n").unwrap();
+    git_ok(&mnt, &["add", "-A"]);
+    let (ok, _) = git(&mnt, &["commit", "-m", "edit over a partial clone"]);
+    assert!(ok, "commit over a partial clone must succeed");
+    let committed = git_ok(&mnt, &["cat-file", "-p", "HEAD:dir/a.txt"]);
+    assert_eq!(committed, "alpha\nEDIT\n", "committed edit must be readable");
+    let newc = git_ok(&mnt, &["cat-file", "-p", "HEAD:dir/new.txt"]);
+    assert_eq!(newc, "fresh\n", "new file must be committed");
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+}

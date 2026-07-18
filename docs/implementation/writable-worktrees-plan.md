@@ -355,9 +355,34 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    `projgit-daemon/tests/xprocess_mount_smoke.rs::xprocess_writable_sidecar_edit_commit`
    (real `projgitd` + `projgit --writable --daemon-socket`: read → edit →
    status → commit, committed content read back from the shared store).
+4. **Partial-clone push correctness** — **VALIDATED 2026-07-18** against
+   the real remote (`github.com/kittskevin/projgit`): `projgit mount
+   --writable <URL>` → partial (`blob:none`) clone → commit → `git push`
+   of the delta to a throwaway branch landed on GitHub (verified oid
+   match, then deleted). The live run surfaced **two real partial-clone
+   bugs, now fixed**:
+   1. **Writable index synthesis crashed** reading blob *sizes* — a
+      `blob:none` clone has no blobs. `build_writable_index_bytes` now
+      falls back to size 0 for an absent blob header (present blobs keep
+      their real size); git content-checks those paths on first `status`.
+   2. **`write-tree`/`commit` were fatal** on absent blobs because the
+      scratch git dir lacked the promisor config. `setup_writable_gitdir`
+      now inherits `remote.origin.promisor` + `partialclonefilter` +
+      `repositoryformatversion=1` (`read_partial_clone_filter`), so git
+      treats absent objects as promisor-fetchable, not fatal.
+   Regression test (hermetic, `file://` partial clone, no network):
+   `cli_writable_partial_clone_edit_commit`. **Known limitation:** the
+   first `git status`/index-refresh over a partial clone mass-hydrates
+   the tree (git content-checks every size-0 entry, and even fsmonitor's
+   first query does a full baseline refresh) — the GVFS
+   `core.virtualfilesystem` problem; a local `file://` clone hides it
+   (fast local hydration) but a network promisor makes it slow. Deferring
+   the hydration needs pre-populated fsmonitor index state or the thin
+   virtualfilesystem hook (out of scope).
 
-**Recommended order for the remaining follow-ups:** partial-clone push
-validation; blob GC / odb-linked commit perf; then the stock-checkout
+**Recommended order for the remaining follow-ups:** pre-populated
+fsmonitor index state to avoid partial-clone first-status hydration;
+blob GC / odb-linked commit perf; then the stock-checkout
 `SKIP_WORKTREE` / thin-patch investigation if a workload demands O(1)
 *stock* checkout.
 

@@ -401,7 +401,15 @@ fn build_writable_index_bytes_inner(
     };
 
     for (i, entry) in state.entries_mut().iter_mut().enumerate() {
-        let (_kind, size) = store.header(entry.id).map_err(IndexBuildError::Store)?;
+        // Real size from the blob header when it's resident. In a
+        // `blob:none` **partial clone** the blob isn't local (only
+        // commits + trees are), so fall back to size 0 rather than
+        // failing the whole mount: git then content-checks that path on
+        // the first `status` (hydrating it), and with `--fsmonitor`
+        // unmodified paths aren't checked at all, so there's no mass
+        // hydration. A present blob keeps its real size (the first
+        // status stays clean without hydration).
+        let size = store.header(entry.id).map(|(_kind, s)| s).unwrap_or(0);
         entry.stat.size = size.min(u32::MAX as u64) as u32;
         entry.stat.mtime = stamp;
         entry.stat.ctime = stamp;

@@ -1898,8 +1898,15 @@ fn setup_writable_gitdir(
     // their objects are already reachable via the object-store symlink.
     std::fs::write(gd.join("packed-refs"), import_source_refs(clone_git_dir))?;
 
+    // Inherit the source's partial-clone (promisor) config so git in the
+    // mount treats objects absent from a `blob:none` clone as
+    // promisor-fetchable from origin (not fatal): `write-tree` / `commit`
+    // then work without every referenced blob being local, and cold
+    // objects fault in on demand.
+    let promisor_filter = read_partial_clone_filter(clone_git_dir);
+    let repo_format = if promisor_filter.is_some() { 1 } else { 0 };
     let mut config = format!(
-        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\tcheckStat = minimal\n\tworktree = {}\n",
+        "[core]\n\trepositoryformatversion = {repo_format}\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\tcheckStat = minimal\n\tworktree = {}\n",
         mp_abs.display()
     );
     if let Some(url) = remote_url {
@@ -1907,6 +1914,12 @@ fn setup_writable_gitdir(
             config,
             "[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
         );
+        if let Some(filter) = &promisor_filter {
+            let _ = write!(
+                config,
+                "\tpromisor = true\n\tpartialclonefilter = {filter}\n"
+            );
+        }
         if let Some(b) = branch {
             let _ = write!(
                 config,
@@ -2069,6 +2082,36 @@ fn read_clone_remote_url(git_dir: &Path) -> Option<String> {
     }
     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!url.is_empty()).then_some(url)
+}
+
+/// The clone's partial-clone (promisor) filter spec (e.g. `blob:none`),
+/// if the source is a promisor partial clone — so a writable mount can
+/// inherit the promisor config and treat absent objects as fetchable
+/// rather than fatal. `None` for full clones / local repos.
+fn read_partial_clone_filter(git_dir: &Path) -> Option<String> {
+    let promisor = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["config", "--get", "remote.origin.promisor"])
+        .output()
+        .ok()?;
+    if !promisor.status.success()
+        || String::from_utf8_lossy(&promisor.stdout).trim() != "true"
+    {
+        return None;
+    }
+    let filter = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["config", "--get", "remote.origin.partialclonefilter"])
+        .output()
+        .ok()?;
+    let spec = String::from_utf8_lossy(&filter.stdout).trim().to_string();
+    Some(if spec.is_empty() {
+        "blob:none".to_string()
+    } else {
+        spec
+    })
 }
 
 /// Apply A2 ref visibility to `overlay` when `projection` is a
