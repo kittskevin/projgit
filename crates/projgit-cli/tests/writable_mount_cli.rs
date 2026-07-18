@@ -134,3 +134,91 @@ fn cli_writable_mount_edit_add_commit() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_mount_commit_and_push_to_branch() {
+    // The full dev loop: mount a source that has a remote, edit + commit
+    // on its branch inside the mount, then `git push` to the remote.
+    let base = std::env::temp_dir().join(format!("projgit-cli-push-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let remote = base.join("remote.git");
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    // Bare remote.
+    std::fs::create_dir_all(&remote).unwrap();
+    let (ok, _) = git(&remote, &["init", "-q", "--bare", "-b", "main", "."]);
+    assert!(ok, "git init --bare");
+
+    // Source repo with `origin` -> the bare remote; initial commit pushed.
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    std::fs::write(src.join("dir/f.txt"), b"hello\nworld\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "init"]);
+    git_ok(&src, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git_ok(&src, &["push", "-q", "-u", "origin", "main"]);
+
+    // Mount the source writable.
+    let mut child = Command::new(PROJGIT_BIN)
+        .args(["mount", "--writable"])
+        .arg(&src)
+        .arg(&mnt)
+        .spawn()
+        .expect("spawn projgit mount --writable");
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(10)),
+        "writable mount never came up"
+    );
+
+    // The mount is on the branch 'main' with 'origin' configured.
+    let branch = git_ok(&mnt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(branch.trim(), "main", "writable mount must be on branch main");
+    let origin = git_ok(&mnt, &["remote", "get-url", "origin"]);
+    assert_eq!(
+        origin.trim(),
+        remote.to_str().unwrap(),
+        "origin must point at the source's remote"
+    );
+
+    // Edit + commit on the branch inside the mount.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mnt.join("dir/f.txt"))
+            .unwrap();
+        f.write_all(b"PUSHED\n").unwrap();
+    }
+    git_ok(&mnt, &["add", "-A"]);
+    let (ok, _) = git(&mnt, &["commit", "-m", "edit + push via writable mount"]);
+    assert!(ok, "commit must succeed");
+
+    // Push to the remote.
+    let (ok, push_out) = git(&mnt, &["push", "-q", "origin", "main"]);
+    assert!(ok, "git push must succeed:\n{push_out}");
+
+    // The bare remote now has the new commit + content.
+    let (ok, remote_content) = git(&remote, &["cat-file", "-p", "main:dir/f.txt"]);
+    assert!(ok, "reading pushed file from remote");
+    assert_eq!(
+        remote_content, "hello\nworld\nPUSHED\n",
+        "the remote branch must carry the edit pushed from the writable mount"
+    );
+    let (_ok, remote_log) = git(&remote, &["log", "--oneline"]);
+    assert!(
+        remote_log.contains("edit + push via writable mount"),
+        "remote branch must have the commit:\n{remote_log}"
+    );
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+}

@@ -139,6 +139,18 @@ clean status → edit + new file → `M`/`??` → `add` → `commit` → verifie
 content). First-cut limits: in-memory upper (edits lost on unmount unless
 committed); not combinable with `--subtree`/`--no-dotgit`/`--daemon-socket`.
 
+**Remote + branch wiring (SHIPPED 2026-07-18).** The writable scratch
+git dir now starts on a **named branch** (symbolic `HEAD` →
+`refs/heads/<branch>`: the `--ref` branch, or the clone's default HEAD
+branch; `--commit` stays detached) and inherits the source's
+`remote.origin.url`, wiring branch upstream. So the full dev loop works:
+`edit → git commit → git push` to a remote branch, no manual `git remote
+add` / `switch -c`. Proved by
+`writable_mount_cli.rs::cli_writable_mount_commit_and_push_to_branch`
+(bare remote + source: mount on `main`, edit, commit, `git push`, and the
+bare remote receives the content). Remaining: persistence across unmount
+(on-disk upper — the scratch dir is still recreated fresh each mount).
+
 ### Stage 3 — R4: FUSE invalidation on write  *(SHIPPED 2026-06-19)*
 
 **What.** `WritableFs` now carries an optional off-thread invalidator:

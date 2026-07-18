@@ -507,9 +507,24 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
         let commit_oid = projection
             .resolve_commit(&store)
             .context("resolving projection commit for --writable")?;
-        let scratch = setup_writable_gitdir(&git_dir, &store, commit_oid, &args.mountpoint)?;
+        let branch = writable_branch_name(&args, &git_dir);
+        let remote_url = read_clone_remote_url(&git_dir)
+            .or_else(|| source_is_url.then(|| args.source.clone()));
+        let scratch = setup_writable_gitdir(
+            &git_dir,
+            &store,
+            commit_oid,
+            &args.mountpoint,
+            branch.as_deref(),
+            remote_url.as_deref(),
+        )?;
+        let where_ = match (&branch, &remote_url) {
+            (Some(b), Some(_)) => format!("on branch '{b}' (push → origin)"),
+            (Some(b), None) => format!("on branch '{b}' (no remote configured)"),
+            (None, _) => "detached HEAD".to_string(),
+        };
         eprintln!(
-            "projgit: writable mount — git dir at {} (edits are in-memory; commit to persist)",
+            "projgit: writable mount — {where_} — git dir {} (edits in-memory; commit to persist)",
             scratch.display()
         );
         (build_writable_overlay(&scratch)?, true)
@@ -1137,9 +1152,15 @@ fn build_writable_overlay(scratch_gitdir: &Path) -> Result<projgit_core::RootOve
 /// Create a real, writable git dir on disk for a writable worktree
 /// mount. It alternates to the shared clone's object store (so reads
 /// reach the partial-clone packs / on-demand-hydrated objects), carries
-/// a detached `HEAD` at the projection commit, a **writable** index
-/// (real per-entry stat, no `ASSUME_VALID`), and `core.worktree`
-/// pointing at the mountpoint + `core.checkStat = minimal`.
+/// a **writable** index (real per-entry stat, no `ASSUME_VALID`), and
+/// `core.worktree` pointing at the mountpoint + `core.checkStat =
+/// minimal`.
+///
+/// When `branch` is `Some`, `HEAD` is symbolic (`refs/heads/<branch>`)
+/// so commits advance a named branch; otherwise `HEAD` is detached at
+/// the projection commit. When `remote_url` is `Some`, an `origin`
+/// remote is configured (with branch upstream) so `git push` works out
+/// of the box.
 ///
 /// Located under the system temp dir, keyed by the mountpoint, and
 /// recreated fresh each mount (first-cut: in-memory upper, so a fresh
@@ -1149,8 +1170,11 @@ fn setup_writable_gitdir(
     store: &projgit_core::ObjectStore,
     commit_oid: gix::ObjectId,
     mountpoint: &Path,
+    branch: Option<&str>,
+    remote_url: Option<&str>,
 ) -> Result<PathBuf> {
     use std::collections::hash_map::DefaultHasher;
+    use std::fmt::Write as _;
     use std::hash::{Hash, Hasher};
 
     let mp_abs = std::fs::canonicalize(mountpoint)
@@ -1163,7 +1187,18 @@ fn setup_writable_gitdir(
     std::fs::create_dir_all(gd.join("refs/heads"))?;
     std::fs::create_dir_all(gd.join("refs/tags"))?;
 
-    std::fs::write(gd.join("HEAD"), format!("{commit_oid}\n"))?;
+    // HEAD: symbolic on a branch, or detached at the commit.
+    match branch {
+        Some(b) => {
+            std::fs::write(gd.join("HEAD"), format!("ref: refs/heads/{b}\n"))?;
+            let ref_path = gd.join("refs/heads").join(b);
+            if let Some(parent) = ref_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(ref_path, format!("{commit_oid}\n"))?;
+        }
+        None => std::fs::write(gd.join("HEAD"), format!("{commit_oid}\n"))?,
+    }
     std::fs::write(gd.join("packed-refs"), b"")?;
     let clone_objects = std::fs::canonicalize(clone_git_dir.join("objects"))
         .with_context(|| format!("canonicalizing {}/objects", clone_git_dir.display()))?;
@@ -1171,15 +1206,64 @@ fn setup_writable_gitdir(
         gd.join("objects/info/alternates"),
         format!("{}\n", clone_objects.display()),
     )?;
-    let config = format!(
-        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = false\n\tcheckStat = minimal\n\tworktree = {}\n",
+
+    let mut config = format!(
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\tcheckStat = minimal\n\tworktree = {}\n",
         mp_abs.display()
     );
+    if let Some(url) = remote_url {
+        let _ = write!(
+            config,
+            "[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+        );
+        if let Some(b) = branch {
+            let _ = write!(
+                config,
+                "[branch \"{b}\"]\n\tremote = origin\n\tmerge = refs/heads/{b}\n"
+            );
+        }
+    }
     std::fs::write(gd.join("config"), config)?;
     let index = projgit_core::dotgit::build_writable_index_bytes(store, commit_oid)
         .context("building writable index")?;
     std::fs::write(gd.join("index"), index)?;
     Ok(gd)
+}
+
+/// The branch a writable mount should commit onto, or `None` for a
+/// detached HEAD. `--commit <oid>` is always detached; an explicit
+/// `--ref <branch>` uses that branch; otherwise the clone's default
+/// branch (its `HEAD` symref) is used.
+fn writable_branch_name(args: &MountArgs, git_dir: &Path) -> Option<String> {
+    if args.commit.is_some() {
+        return None;
+    }
+    if let Some(r) = &args.r#ref {
+        let name = r.strip_prefix("refs/heads/").unwrap_or(r);
+        if name != "HEAD" {
+            return Some(name.to_string());
+        }
+    }
+    // Default / `HEAD`: read the clone's HEAD symref for its default branch.
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    head.strip_prefix("ref: refs/heads/")
+        .map(|s| s.trim().to_string())
+}
+
+/// The clone's configured `remote.origin.url`, if any — so a writable
+/// mount can `push` to the same place the source came from.
+fn read_clone_remote_url(git_dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
 }
 
 /// Apply A2 ref visibility to `overlay` when `projection` is a
