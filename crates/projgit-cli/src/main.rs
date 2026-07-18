@@ -63,6 +63,12 @@ enum Command {
     /// mount's git index + HEAD via plumbing; the running mount observes
     /// the HEAD change and re-projects the worktree (local edits survive).
     Checkout(CheckoutArgs),
+    /// (internal) Notify a running writable mount that `HEAD` moved, over
+    /// its control socket, so it re-projects. Invoked by the scratch git
+    /// dir's `reference-transaction` hook after a stock git operation;
+    /// not intended for direct use.
+    #[command(name = "__swap-notify", hide = true)]
+    SwapNotify,
 }
 
 #[derive(Debug, clap::Args)]
@@ -378,6 +384,7 @@ fn main() -> Result<()> {
         Command::MountMulti(args) => cmd_mount_multi(args),
         Command::Attach(args) => cmd_attach(args),
         Command::Checkout(args) => cmd_checkout(args),
+        Command::SwapNotify => cmd_swap_notify(),
     }
 }
 
@@ -1039,7 +1046,18 @@ where
                     std::sync::Arc::new(Swapper::new(provider.clone(), handle, scratch.clone()));
                 let socket = scratch.join(CONTROL_SOCKET_NAME);
                 control = Some(spawn_control_listener(swapper.clone(), socket, stop.clone()));
-                watcher = Some(spawn_head_watcher(swapper, scratch, stop.clone()));
+                // Prefer the `reference-transaction` hook to observe stock
+                // git ops (push, synchronous). Fall back to the HEAD poll
+                // watcher only if the hook can't be installed.
+                match install_reference_hook(&scratch) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "projgit: reference-transaction hook install failed ({e:#}); using HEAD poll fallback"
+                        );
+                        watcher = Some(spawn_head_watcher(swapper, scratch, stop.clone()));
+                    }
+                }
             }
             None => drop(handle),
         }
@@ -1342,6 +1360,7 @@ fn cmd_checkout(args: CheckoutArgs) -> Result<()> {
         std::process::Command::new("git")
             .arg("--git-dir")
             .arg(&git_dir)
+            .env("PROJGIT_SUPPRESS_HOOK", "1")
             .args(["read-tree", &commit]),
     )
     .context("updating the index to the target tree")?;
@@ -1352,6 +1371,7 @@ fn cmd_checkout(args: CheckoutArgs) -> Result<()> {
             std::process::Command::new("git")
                 .arg("--git-dir")
                 .arg(&git_dir)
+                .env("PROJGIT_SUPPRESS_HOOK", "1")
                 .args(["symbolic-ref", "HEAD", &format!("refs/heads/{}", args.refname)]),
         )
         .context("switching HEAD to the branch")?;
@@ -1360,6 +1380,7 @@ fn cmd_checkout(args: CheckoutArgs) -> Result<()> {
             std::process::Command::new("git")
                 .arg("--git-dir")
                 .arg(&git_dir)
+                .env("PROJGIT_SUPPRESS_HOOK", "1")
                 .args(["update-ref", "--no-deref", "HEAD", &commit]),
         )
         .context("moving detached HEAD")?;
@@ -1422,6 +1443,73 @@ fn notify_mount_swap(git_dir: &Path, commit: &str) -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn notify_mount_swap(_git_dir: &Path, _commit: &str) -> bool {
     false
+}
+
+/// `projgit __swap-notify` — invoked by the scratch git dir's
+/// `reference-transaction` hook after a stock git op moves `HEAD`. Reads
+/// the git dir (from `GIT_DIR`, which git sets for hooks, else the cwd),
+/// resolves `HEAD`, and drives the mount's baseline swap over the control
+/// socket. Silent + best-effort: a missing mount / socket is a no-op.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cmd_swap_notify() -> Result<()> {
+    let git_dir = match std::env::var_os("GIT_DIR") {
+        Some(g) => {
+            let p = PathBuf::from(g);
+            if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir()?.join(p)
+            }
+        }
+        None => {
+            let cwd = std::env::current_dir()?;
+            let out = git_capture(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&cwd)
+                    .args(["rev-parse", "--absolute-git-dir"]),
+            )?;
+            PathBuf::from(out.trim())
+        }
+    };
+    if let Some(oid) = resolve_head_commit_fast(&git_dir) {
+        let _ = notify_mount_swap(&git_dir, &oid.to_string());
+    }
+    Ok(())
+}
+
+/// Non-unix stub.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn cmd_swap_notify() -> Result<()> {
+    Ok(())
+}
+
+/// Install the `reference-transaction` hook into the writable scratch git
+/// dir so STOCK git operations (`checkout`/`switch`/`reset`/`commit`/
+/// `pull`) that move `HEAD` push the change to the mount over the control
+/// socket — replacing the poll watcher. The hook shells the current
+/// `projgit` binary; `$PROJGIT_SUPPRESS_HOOK` lets `projgit checkout`
+/// suppress it for its own ref updates (it notifies directly).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn install_reference_hook(scratch: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::current_exe().context("resolving projgit binary path")?;
+    let hooks = scratch.join("hooks");
+    std::fs::create_dir_all(&hooks)?;
+    let hook = hooks.join("reference-transaction");
+    let script = format!(
+        "#!/bin/sh\n\
+         # projgit writable worktree: notify the mount when HEAD moves so it\n\
+         # re-projects. Installed by `projgit mount --writable`.\n\
+         cat >/dev/null\n\
+         [ \"$1\" = committed ] || exit 0\n\
+         [ -n \"$PROJGIT_SUPPRESS_HOOK\" ] && exit 0\n\
+         \"{}\" __swap-notify >/dev/null 2>&1 || true\n",
+        exe.display()
+    );
+    std::fs::write(&hook, script)?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
 }
 
 /// Run a `git` command, returning its stdout on success or an error

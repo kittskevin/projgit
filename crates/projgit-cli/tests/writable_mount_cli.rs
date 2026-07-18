@@ -715,3 +715,68 @@ fn cli_writable_checkout_synchronous_over_control_socket() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_stock_commit_reconciles_via_hook() {
+    // STOCK git operations we don't control are observed via the scratch
+    // git dir's `reference-transaction` hook (not the poll watcher): a
+    // stock `git commit` fires the hook, which swaps the mount to the new
+    // commit and reconciles the now-committed edit out of the upper — so
+    // it no longer shadows a later checkout of the parent as a phantom.
+    let base = std::env::temp_dir().join(format!("projgit-cli-hook-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::write(src.join("x.txt"), b"base\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "c1"]);
+    let c1 = git_ok(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let mut child = spawn_writable(&src, &mnt, &cache);
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(10)),
+        "mount never came up"
+    );
+    assert_eq!(std::fs::read_to_string(mnt.join("x.txt")).unwrap(), "base\n");
+
+    // Materialize an edit, then commit it with STOCK git (fires the hook).
+    std::fs::write(mnt.join("x.txt"), b"edited\n").unwrap();
+    git_ok(&mnt, &["commit", "-q", "-am", "c2"]);
+
+    // The hook must have swapped + reconciled the edit out of the upper.
+    // Checking out c1 (parent) must therefore show base — if the stock
+    // commit had NOT been observed, the "edited" upper entry would shadow
+    // c1 and this would read "edited".
+    let out = Command::new(PROJGIT_BIN)
+        .args(["checkout", "-C"])
+        .arg(&mnt)
+        .arg(&c1)
+        .output()
+        .expect("spawn projgit checkout <c1>");
+    assert!(
+        out.status.success(),
+        "checkout c1 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wait_for_content(&mnt.join("x.txt"), "base\n", Duration::from_secs(10)),
+        "stock commit must be observed via the hook so its edit doesn't shadow the parent: {:?}",
+        std::fs::read_to_string(mnt.join("x.txt"))
+    );
+    let s = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(s.trim().is_empty(), "status must be clean:\n{s}");
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+}

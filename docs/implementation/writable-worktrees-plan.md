@@ -313,10 +313,17 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    over it **synchronously** (`SWAP <oid>` → `OK`) and returns only once
    the mount applied it — no poll lag, safe to script
    (`cli_writable_checkout_synchronous_over_control_socket`; the command
-   reports "mount re-projected", the synchronous ack). The poll watcher
-   stays as the safety net for stock git ops; a `reference-transaction`
-   hook to push those over the socket and retire the poll is the next
-   step. *Boundary (documented):* making **stock** `git
+   reports "mount re-projected", the synchronous ack). **Stock ops via a
+   ref hook (2026-07-18):** the scratch git dir installs a
+   `reference-transaction` hook that, on any committed HEAD move by STOCK
+   git (`checkout`/`switch`/`reset`/`commit`/`pull`), shells `projgit
+   __swap-notify` to drive the same synchronous swap over the socket —
+   so the poll watcher is now only a **fallback** used if the hook can't
+   be installed. (`projgit checkout` sets `PROJGIT_SUPPRESS_HOOK` for its
+   own ref writes since it notifies directly.) Proved by
+   `cli_writable_stock_commit_reconciles_via_hook` (a stock `git commit`
+   is observed via the hook, reconciling the committed edit out of the
+   upper). *Boundary (documented):* making **stock** `git
    checkout` stay fully virtual for unmodified files needs `SKIP_WORKTREE`
    management (racy index writes) or a thin `core.virtualfilesystem`-style
    patch — out of scope; stock checkout still works but eagerly
