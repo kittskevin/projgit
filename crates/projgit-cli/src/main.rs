@@ -467,14 +467,8 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     // at that path, and use a DaemonFetcher to coordinate cold-path
     // hydration. The FUSE protocol loop runs locally so a daemon
     // crash degrades to brief cold-fetch unavailability rather than
-    // killing the mount.
-    if args.writable && args.daemon_socket.is_some() {
-        bail!("--writable is not supported with --daemon-socket (sidecar) yet");
-    }
-    if let Some(sock) = args.daemon_socket.clone() {
-        return cmd_mount_via_daemon(args, sock);
-    }
-
+    // killing the mount. `--writable` composes with the sidecar: the
+    // scratch worktree shares the daemon's CAS.
     if args.writable {
         if args.no_dotgit {
             bail!("--writable cannot be combined with --no-dotgit (it needs a synthesized .git link)");
@@ -482,6 +476,9 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
         if args.subtree.is_some() {
             bail!("--writable cannot be combined with --subtree");
         }
+    }
+    if let Some(sock) = args.daemon_socket.clone() {
+        return cmd_mount_via_daemon(args, sock);
     }
 
     // 1. Resolve `source` to a local git directory.
@@ -554,52 +551,14 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     let mut upper_dir: Option<PathBuf> = None;
     let mut writable_scratch: Option<PathBuf> = None;
     let (overlay, writable) = if args.writable {
-        let requested_oid = projection
-            .resolve_commit(&store)
-            .context("resolving projection commit for --writable")?;
-        let branch = writable_branch_name(&args, &git_dir);
-        let remote_url = read_clone_remote_url(&git_dir)
-            .or_else(|| source_is_url.then(|| args.source.clone()));
-        let worktrees_root = resolve_cache_dir(args.cache_dir.as_deref())?.join("worktrees");
-        let wt = setup_writable_gitdir(
-            &git_dir,
-            &store,
-            requested_oid,
-            &worktrees_root,
-            &args.mountpoint,
-            branch.as_deref(),
-            remote_url.as_deref(),
-        )?;
+        let w = prepare_writable(&args, &store, &git_dir, &projection, source_is_url)?;
         // Pin the LOWER projection to the worktree's effective commit:
         // the requested tip on a fresh worktree, or the persisted HEAD
         // when reusing one whose branch advanced via committed work.
-        projection = projgit_core::Projection::Commit(wt.commit);
-        let where_ = match (&branch, &remote_url) {
-            (Some(b), Some(_)) => format!("on branch '{b}' (push → origin)"),
-            (Some(b), None) => format!("on branch '{b}' (no remote configured)"),
-            (None, _) => "detached HEAD".to_string(),
-        };
-        let state = if wt.reused {
-            "reused — prior work restored (committed + uncommitted edits)"
-        } else {
-            "fresh — changes persist across unmount"
-        };
-        eprintln!(
-            "projgit: writable mount — {where_} — git dir {} ({state})",
-            wt.path.display()
-        );
-        // Persist the uncommitted upper (materialized edits + whiteouts)
-        // alongside the scratch git dir, so it survives an unmount.
-        upper_dir = Some(wt.path.join("projgit-upper"));
-        writable_scratch = Some(wt.path.clone());
-        // Optional: point git's fsmonitor at the mount's control socket so
-        // `status` skips scanning the virtual worktree.
-        if args.fsmonitor {
-            if let Err(e) = install_fsmonitor_hook(&wt.path) {
-                eprintln!("projgit: fsmonitor setup failed ({e:#}); status will do a full scan");
-            }
-        }
-        (build_writable_overlay(&wt.path)?, true)
+        projection = projgit_core::Projection::Commit(w.commit);
+        upper_dir = Some(w.upper_dir);
+        writable_scratch = Some(w.scratch);
+        (w.overlay, true)
     } else {
         (build_root_overlay(&args, &projection, &store, &git_dir)?, false)
     };
@@ -727,7 +686,25 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
     //    store. The daemon has already populated refs as part of
     //    Attach (partial-clone wrote `.git/refs/`); the sidecar
     //    sees them through gix's normal ref-resolution.
-    let projection = build_projection(&args, &store)?;
+    //    Mutable because a writable mount re-pins it to the scratch
+    //    worktree's effective commit.
+    let mut projection = build_projection(&args, &store)?;
+
+    // Writable vs read-only overlay. A `--writable` sidecar shares the
+    // daemon's CAS (the scratch git dir's objects link into `git_dir`,
+    // so committed + hydrated objects both land in the shared store).
+    let (overlay, writable, upper_dir, writable_scratch) = if args.writable {
+        let w = prepare_writable(&args, &store, &git_dir, &projection, looks_like_url(&args.source))?;
+        projection = projgit_core::Projection::Commit(w.commit);
+        (w.overlay, true, Some(w.upper_dir), Some(w.scratch))
+    } else {
+        (
+            build_root_overlay(&args, &projection, &store, &git_dir)?,
+            false,
+            None,
+            None,
+        )
+    };
 
     // 4. DaemonFetcher coordinates cold-path hydration with the
     //    daemon. Warm paths read straight from the shared CAS and
@@ -740,11 +717,11 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
     // via FetchMany. Mirrors the daemon's handle_mount warm.
     spawn_tree_warm(&hydrating, &projection);
 
-    let overlay = build_root_overlay(&args, &projection, &store, &git_dir)?;
     let mut cfg = MountConfig::default();
     if args.allow_other {
         cfg.acl = projgit_fuse::SessionACL::All;
     }
+    cfg.upper_dir = upper_dir;
     let mp = args.mountpoint.clone();
     let print_stats = args.stats;
 
@@ -752,7 +729,7 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
         ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
             .context("building ProjectionFsProvider")?,
     );
-    run_mount(provider, &mp, &cfg, print_stats, /* writable */ false, None)
+    run_mount(provider, &mp, &cfg, print_stats, writable, writable_scratch)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1750,6 +1727,76 @@ fn build_writable_overlay(scratch_gitdir: &Path) -> Result<projgit_core::RootOve
     let mut overlay = RootOverlay::new();
     overlay.insert(".git", SyntheticEntry::file(content));
     Ok(overlay)
+}
+
+/// Everything a writable mount needs on top of a projection: the `.git`
+/// overlay, the upper-journal dir, the scratch git dir (for the control
+/// socket / watcher), and the effective projection commit (re-pinned to
+/// the persisted `HEAD` when reusing a worktree).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct WritableSetup {
+    overlay: projgit_core::RootOverlay,
+    upper_dir: PathBuf,
+    scratch: PathBuf,
+    commit: gix::ObjectId,
+}
+
+/// Prepare the writable scratch git dir + overlay for a `--writable`
+/// mount. Shared by the standalone ([`cmd_mount`]) and sidecar
+/// ([`cmd_mount_via_daemon`]) paths — the only difference between them is
+/// where the object store / fetcher come from; the writable worktree
+/// setup (scratch git dir sharing `git_dir`'s CAS, seeded index, imported
+/// refs, optional fsmonitor hook) is identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn prepare_writable(
+    args: &MountArgs,
+    store: &projgit_core::ObjectStore,
+    git_dir: &Path,
+    projection: &projgit_core::Projection,
+    source_is_url: bool,
+) -> Result<WritableSetup> {
+    let requested_oid = projection
+        .resolve_commit(store)
+        .context("resolving projection commit for --writable")?;
+    let branch = writable_branch_name(args, git_dir);
+    let remote_url =
+        read_clone_remote_url(git_dir).or_else(|| source_is_url.then(|| args.source.clone()));
+    let worktrees_root = resolve_cache_dir(args.cache_dir.as_deref())?.join("worktrees");
+    let wt = setup_writable_gitdir(
+        git_dir,
+        store,
+        requested_oid,
+        &worktrees_root,
+        &args.mountpoint,
+        branch.as_deref(),
+        remote_url.as_deref(),
+    )?;
+    let where_ = match (&branch, &remote_url) {
+        (Some(b), Some(_)) => format!("on branch '{b}' (push → origin)"),
+        (Some(b), None) => format!("on branch '{b}' (no remote configured)"),
+        (None, _) => "detached HEAD".to_string(),
+    };
+    let state = if wt.reused {
+        "reused — prior work restored (committed + uncommitted edits)"
+    } else {
+        "fresh — changes persist across unmount"
+    };
+    eprintln!(
+        "projgit: writable mount — {where_} — git dir {} ({state})",
+        wt.path.display()
+    );
+    if args.fsmonitor {
+        if let Err(e) = install_fsmonitor_hook(&wt.path) {
+            eprintln!("projgit: fsmonitor setup failed ({e:#}); status will do a full scan");
+        }
+    }
+    let overlay = build_writable_overlay(&wt.path)?;
+    Ok(WritableSetup {
+        overlay,
+        upper_dir: wt.path.join("projgit-upper"),
+        scratch: wt.path.clone(),
+        commit: wt.commit,
+    })
 }
 
 /// A prepared writable scratch git dir.

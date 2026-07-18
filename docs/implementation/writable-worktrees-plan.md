@@ -344,10 +344,22 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    against the baseline; §10.3). Possible follow-ups: blob GC of the
    content store, and linking journal blobs directly into the odb so
    `commit` derives trees from them (Stage 6 perf).
+3. **Writable sidecar (`--daemon-socket` + `--writable`)** — **SHIPPED**
+   2026-07-18. A writable worktree now composes with the daemon sidecar:
+   the CLI holds the FUSE fd locally and uses `projgitd` as the shared
+   CAS/fetcher, so N writable worktrees on a host share one object store
+   and coalesced fetches. The writable setup (`prepare_writable`) is
+   shared between the standalone and sidecar paths; the scratch git dir's
+   objects link into the daemon's `git_dir`, so committed + hydrated
+   objects both land in the shared CAS. Proved by
+   `projgit-daemon/tests/xprocess_mount_smoke.rs::xprocess_writable_sidecar_edit_commit`
+   (real `projgitd` + `projgit --writable --daemon-socket`: read → edit →
+   status → commit, committed content read back from the shared store).
 
-**Recommended order for the remaining follow-ups:** daemon-socket
-FSMonitor / writable sidecar; then the stock-checkout `SKIP_WORKTREE` /
-thin-patch investigation if a workload demands O(1) *stock* checkout.
+**Recommended order for the remaining follow-ups:** partial-clone push
+validation; blob GC / odb-linked commit perf; then the stock-checkout
+`SKIP_WORKTREE` / thin-patch investigation if a workload demands O(1)
+*stock* checkout.
 
 ## 3. Out of scope (this plan)
 
