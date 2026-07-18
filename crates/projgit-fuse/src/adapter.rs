@@ -178,7 +178,7 @@ impl<F: FsProvider + 'static> Filesystem for ProjgitFuse<F> {
 // type conversions
 // -----------------------------------------------------------------------------
 
-fn to_fuser_kind(k: FileType) -> FuserFileType {
+pub(crate) fn to_fuser_kind(k: FileType) -> FuserFileType {
     match k {
         FileType::RegularFile => FuserFileType::RegularFile,
         FileType::Directory => FuserFileType::Directory,
@@ -186,7 +186,7 @@ fn to_fuser_kind(k: FileType) -> FuserFileType {
     }
 }
 
-fn to_fuser_attr(a: &Attr, req_uid: u32, req_gid: u32) -> FileAttr {
+pub(crate) fn to_fuser_attr(a: &Attr, req_uid: u32, req_gid: u32) -> FileAttr {
     let kind = to_fuser_kind(a.kind);
     FileAttr {
         ino: INodeNo(a.inode),
@@ -216,7 +216,7 @@ fn to_fuser_attr(a: &Attr, req_uid: u32, req_gid: u32) -> FileAttr {
     }
 }
 
-fn errno_for(e: &FsError) -> Errno {
+pub(crate) fn errno_for(e: &FsError) -> Errno {
     match e {
         FsError::NotFound => Errno::ENOENT,
         FsError::NotADirectory => Errno::ENOTDIR,

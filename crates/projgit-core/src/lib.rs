@@ -76,3 +76,33 @@ pub use tree_cache::TreeCacheStats;
 
 /// Crate version, exposed to the CLI and other consumers.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Git blob object id (SHA-1, hex) of `content` — i.e.
+/// `sha1("blob " + len + "\0" + content)`.
+///
+/// Used to content-address materialized upper-layer blobs (writable
+/// worktree crash journal) so identical content dedups and the names
+/// line up with git's own object database.
+pub fn blob_oid_hex(content: &[u8]) -> String {
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, content)
+        .to_hex()
+        .to_string()
+}
+
+#[cfg(test)]
+mod blob_oid_tests {
+    use super::blob_oid_hex;
+
+    #[test]
+    fn matches_git_hash_object() {
+        // `git hash-object` of the empty blob and of "hello\n".
+        assert_eq!(
+            blob_oid_hex(b""),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+        assert_eq!(
+            blob_oid_hex(b"hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
+    }
+}

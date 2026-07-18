@@ -22,6 +22,26 @@ pub struct MountConfig {
     pub acl: SessionACL,
     /// Number of FUSE event-loop threads. `None` => single-threaded.
     pub n_threads: Option<usize>,
+    /// Optional path to a FSMonitor **write-log** file. When set on a
+    /// writable mount ([`crate::mount_writable_background`]), the overlay
+    /// rewrites this file on every change with a monotonic token + the
+    /// NUL-terminated worktree-relative paths modified since mount; a
+    /// `core.fsmonitor` hook streams it to git so `status` skips
+    /// scanning. No effect on read-only mounts.
+    pub fsmonitor_file: Option<std::path::PathBuf>,
+    /// Cone-mode sparse-checkout directories (worktree-relative, no
+    /// trailing slash). When non-empty on a writable mount, the overlay
+    /// hides out-of-cone directories from `readdir`/`lookup` so git's
+    /// sparse-index stays collapsed instead of expanding to a full index
+    /// (see `docs/implementation/writable-worktrees-plan.md` Stage 5 /
+    /// R2). Empty => everything is visible.
+    pub sparse_cone: Vec<String>,
+    /// Optional directory for the writable **upper** crash journal. When
+    /// set on a writable mount, materialized/created files + whiteouts
+    /// are persisted here (append-only journal + content-addressed
+    /// blobs) and replayed on the next mount, so *uncommitted* edits
+    /// survive an unmount (design §10.3). No effect on read-only mounts.
+    pub upper_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for MountConfig {
@@ -31,6 +51,9 @@ impl Default for MountConfig {
             subtype: "projgit".to_owned(),
             acl: SessionACL::Owner,
             n_threads: None,
+            fsmonitor_file: None,
+            sparse_cone: Vec::new(),
+            upper_dir: None,
         }
     }
 }

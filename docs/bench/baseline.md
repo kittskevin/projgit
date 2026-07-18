@@ -1180,3 +1180,92 @@ PROJGIT_NETWORK_TESTS=1 PROJGIT_CATFILE_TRACE=1 \
   bigger-than-`cargo` target (10K–100K files) before we can claim
   anything about monorepo behaviour. Worth doing once we have a
   reason to believe the shape changes at that scale.
+
+## Results — cache + transform tier (`rust-lang/log` @ master)
+
+Captured 2026-06-19 in the projgit devcontainer (`/dev/fuse`
+present), real GitHub HTTPS network. This section records the
+read-only **cache + transform tier** Phase 1 mechanisms (eager
+tree warm, blob-byte prefetch, CAS maintenance loop) shipped this
+session. Design:
+[`../design/cache-transform-tier.md`](../design/cache-transform-tier.md);
+as-built reference:
+[`../implementation/how-it-works.md`](../implementation/how-it-works.md);
+session narrative:
+[`../handoffs/2026-06-19-cache-transform-tier-implementation.md`](../handoffs/2026-06-19-cache-transform-tier-implementation.md).
+
+These are **manual single-session captures from a live mount**, not
+median-of-3 harness numbers like the sections above. Treat them as
+*shape* evidence, not calibrated digits — see the honest findings
+below for the conditions each win depends on.
+
+| Win | Result | Condition |
+| --- | --- | --- |
+| Blob-free `readdir` vs stock git | **~16×** (0.43 ms vs 7.1 ms) | always (tree metadata without blob fault) |
+| Eager-tree warm (`ls -R` local) | instant (~4 ms, trees all warm) | after background warm completes |
+| Blob prefetch (`readdir → gap → read`) | **~200×** (0.004 s warm vs 0.808 s cold) | **only** when the workload has a readdir→think→read gap |
+| Daemon multiplexing (4 sidecars, 1 CAS) | **1.98× wall, 3.95× disk** vs 4 independent clones | N≥4 with blob overlap |
+| Cross-commit maintenance | MIDX + commit-graph written | see honest finding #3 |
+
+### Reproduce
+
+```sh
+# Always rebuild the release binary first — the CLI binary and the
+# bench_mount example build separately; a stale `projgit` silently
+# runs old code (its --stats lacking `blobs_warmed` is the tell).
+cargo build --release -p projgit-cli
+
+# Eager-tree warm + blob-free readdir (foreground mount; SIGINT to
+# print --stats and exit — `fusermount -u` skips the stats print).
+PROJGIT_NETWORK_TESTS=1 \
+  target/release/projgit mount https://github.com/rust-lang/log <mnt> --stats &
+# ... exercise the mount (ls -R, read files) ...
+pkill -INT -f "projgit mount"
+
+# Blob-byte prefetch (env-gated, default OFF; 1 MiB size cap):
+PROJGIT_PREFETCH_BLOBS=1 PROJGIT_PREFETCH_BLOB_CAP_BYTES=1048576 \
+  target/release/projgit mount https://github.com/rust-lang/log <mnt> --stats
+
+# CAS maintenance loop (daemon-side, default OFF):
+projgitd --maintenance-interval-secs 300
+```
+
+### Honest findings (read before trusting the headline table)
+
+- **Blob prefetch is gap-dependent.** It delivers ~200× *only when
+  the workload has a readdir→think→read gap* (the agent pattern: list
+  a dir, reason, then read). In a tight walk→read microbench it shows
+  **no change** — the background prefetch can't get ahead, and the
+  on-demand path doesn't block on it by design. The win is real for
+  the target workload but is not a universal speedup.
+
+- **On the GitCli backend, blob prefetch is partly redundant.** The
+  always-on T1 *header* prefetch uses `cat-file --batch-check`, which
+  in a partial clone faults the **full** object in — so a header batch
+  doubles as a bytes batch. Stage 3's distinct value is the **GVFS**
+  backend (`/gvfs/sizes` returns sizes *without* bytes), where header
+  warming and byte warming are genuinely separate operations.
+
+- **Cross-commit "physical dedup" is mostly a misnomer.** Git
+  *negotiation* already fetches each object once, so a multi-commit
+  CAS ≈ the union of objects — there is little raw duplication to
+  recover. The real maintenance win is **MIDX (O(log total) lookup
+  across accumulating packs) + commit-graph**, not disk dedup. A full
+  `repack -a -d` shrinks ~18% via **delta recompression** (not dedup),
+  and projgit deliberately uses *incremental* repack to avoid
+  rewriting a big base pack.
+
+### Caveats specific to the cache+transform tier
+
+- **Single-session, not median-of-3.** Unlike the harness sections,
+  these came from manual live mounts. Re-run with the reproduce
+  recipe before quoting digits; expect the *shape* to hold, not the
+  exact ms.
+- **All Phase 1 config gates default OFF.** `PROJGIT_PREFETCH_BLOBS`,
+  `PROJGIT_PREFETCH_BLOB_CAP_BYTES`, and
+  `projgitd --maintenance-interval-secs` are opt-in; the numbers
+  above are with the relevant gate enabled per row.
+- **`log` is small history.** Cross-commit maintenance (MIDX +
+  commit-graph) was exercised but its lookup-acceleration win only
+  shows on a CAS with many accumulated packs — not visible at this
+  scale. A bigger, multi-commit target is the natural follow-up.
