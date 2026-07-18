@@ -58,6 +58,23 @@ enum Command {
     /// Talk to a running `projgitd` (Stage 2c). Subcommands send
     /// individual control-plane RPCs over the daemon's unix socket.
     Attach(AttachArgs),
+    /// Switch a live **writable** mount to another commit/branch without
+    /// rewriting the worktree (checkout-under-live-mount). Updates the
+    /// mount's git index + HEAD via plumbing; the running mount observes
+    /// the HEAD change and re-projects the worktree (local edits survive).
+    Checkout(CheckoutArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct CheckoutArgs {
+    /// Branch, tag, or commit to switch to. Must be resolvable in the
+    /// mount's repository (fetch first if it is a new remote branch).
+    refname: String,
+
+    /// Directory inside the writable mount to operate from (like
+    /// `git -C`). Defaults to the current directory.
+    #[arg(short = 'C', long = "dir")]
+    dir: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -360,6 +377,7 @@ fn main() -> Result<()> {
         Command::Mount(args) => cmd_mount(args),
         Command::MountMulti(args) => cmd_mount_multi(args),
         Command::Attach(args) => cmd_attach(args),
+        Command::Checkout(args) => cmd_checkout(args),
     }
 }
 
@@ -508,6 +526,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     //    clone configured (typically `origin`).
     let _remote_hint = &args.remote;
     let mut upper_dir: Option<PathBuf> = None;
+    let mut writable_scratch: Option<PathBuf> = None;
     let (overlay, writable) = if args.writable {
         let requested_oid = projection
             .resolve_commit(&store)
@@ -546,6 +565,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
         // Persist the uncommitted upper (materialized edits + whiteouts)
         // alongside the scratch git dir, so it survives an unmount.
         upper_dir = Some(wt.path.join("projgit-upper"));
+        writable_scratch = Some(wt.path.clone());
         (build_writable_overlay(&wt.path)?, true)
     } else {
         (build_root_overlay(&args, &projection, &store, &git_dir)?, false)
@@ -568,7 +588,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
             ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
                 .context("building ProjectionFsProvider")?,
         );
-        run_mount(provider, &mp, &cfg, print_stats, writable)
+        run_mount(provider, &mp, &cfg, print_stats, writable, writable_scratch)
     } else {
         match args.fetcher {
             FetcherChoice::Git => {
@@ -582,7 +602,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
                     )
                     .context("building ProjectionFsProvider")?,
                 );
-                run_mount(provider, &mp, &cfg, print_stats, writable)
+                run_mount(provider, &mp, &cfg, print_stats, writable, writable_scratch)
             }
             #[cfg(feature = "gvfs-fetcher")]
             FetcherChoice::Gvfs => {
@@ -605,7 +625,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
                     )
                     .context("building ProjectionFsProvider")?,
                 );
-                run_mount(provider, &mp, &cfg, print_stats, writable)
+                run_mount(provider, &mp, &cfg, print_stats, writable, writable_scratch)
             }
         }
     }
@@ -699,7 +719,7 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
         ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
             .context("building ProjectionFsProvider")?,
     );
-    run_mount(provider, &mp, &cfg, print_stats, /* writable */ false)
+    run_mount(provider, &mp, &cfg, print_stats, /* writable */ false, None)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -993,6 +1013,7 @@ fn run_mount<F>(
     config: &projgit_fuse::MountConfig,
     print_stats: bool,
     writable: bool,
+    writable_scratch: Option<PathBuf>,
 ) -> Result<()>
 where
     F: projgit_core::Fetcher + 'static,
@@ -1002,9 +1023,24 @@ where
         mountpoint.display(),
         if writable { "writable" } else { "read-only" },
     );
+    // A writable mount keeps its `WritableHandle` so a HEAD watcher can
+    // swap the LOWER baseline when the user checks out a different commit
+    // (checkout-under-live-mount). Read-only mounts don't need it.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut watcher: Option<std::thread::JoinHandle<()>> = None;
     let session = if writable {
-        projgit_fuse::mount_writable_background(provider.clone(), mountpoint, config)
-            .with_context(|| format!("mounting (writable) at {}", mountpoint.display()))?
+        let (session, handle) =
+            projgit_fuse::mount_writable_background_with_handle(provider.clone(), mountpoint, config)
+                .with_context(|| format!("mounting (writable) at {}", mountpoint.display()))?;
+        if let Some(scratch) = writable_scratch {
+            watcher = Some(spawn_head_watcher(
+                provider.clone(),
+                handle,
+                scratch,
+                stop.clone(),
+            ));
+        }
+        session
     } else {
         projgit_fuse::mount_background(provider.clone(), mountpoint, config)
             .with_context(|| format!("mounting at {}", mountpoint.display()))?
@@ -1020,7 +1056,11 @@ where
     rx.recv().ok();
 
     eprintln!("projgit: unmounting…");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(session);
+    if let Some(w) = watcher {
+        let _ = w.join();
+    }
 
     if print_stats {
         let store = provider.store().store();
@@ -1062,6 +1102,178 @@ where
     eprintln!("projgit: unmounted.");
     Ok(())
 }
+
+/// Watch a writable mount's scratch git dir `HEAD` and swap the LOWER
+/// baseline whenever it moves — so a `git checkout` / `switch` / `reset`
+/// / `pull` / `projgit checkout` inside the mount re-virtualizes the
+/// worktree to the new commit (checkout-under-live-mount) instead of
+/// leaving stale content. Local edits survive (the upper is path-keyed).
+///
+/// The watcher polls (no external notify dependency); it exits when
+/// `stop` is set on unmount. Building the new baseline reuses the same
+/// hydrating store + fetcher via [`ProjectionFsProvider::store_arc`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_head_watcher<F>(
+    provider: std::sync::Arc<projgit_core::ProjectionFsProvider<F>>,
+    handle: projgit_fuse::WritableHandle<projgit_core::ProjectionFsProvider<F>>,
+    scratch: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()>
+where
+    F: projgit_core::Fetcher + 'static,
+{
+    use projgit_core::Projection;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    std::thread::Builder::new()
+        .name("projgit-head-watcher".to_string())
+        .spawn(move || {
+            let mut current = read_git_dir_head_commit(&scratch);
+            // Fresh projection id per swap so inode namespaces don't clash.
+            let mut next_id = 2u64;
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let head = read_git_dir_head_commit(&scratch);
+                let Some(oid) = head else { continue };
+                if head == current {
+                    continue;
+                }
+                let overlay = match build_writable_overlay(&scratch) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("projgit: checkout re-projection (overlay) failed: {e:#}");
+                        continue;
+                    }
+                };
+                match projgit_core::ProjectionFsProvider::new(
+                    Projection::Commit(oid),
+                    provider.store_arc(),
+                    overlay,
+                    next_id,
+                ) {
+                    Ok(new_lower) => {
+                        next_id += 1;
+                        handle.swap_baseline(std::sync::Arc::new(new_lower));
+                        current = head;
+                        eprintln!("projgit: checkout observed — re-projected worktree to {oid}");
+                    }
+                    Err(e) => {
+                        eprintln!("projgit: checkout re-projection to {oid} failed: {e:#}");
+                    }
+                }
+            }
+        })
+        .expect("spawning HEAD watcher thread")
+}
+
+/// `projgit checkout <ref>` — switch a live **writable** mount to another
+/// commit/branch **without rewriting the worktree**. Updates the mount's
+/// scratch git index + HEAD via plumbing (`read-tree` then
+/// `symbolic-ref`/`update-ref`), so the O(N-file) worktree write stock
+/// `git checkout` performs is avoided; the mount's HEAD watcher then
+/// swaps the LOWER baseline and the worktree re-virtualizes to the new
+/// commit. Local edits survive (the upper is path-keyed).
+fn cmd_checkout(args: CheckoutArgs) -> Result<()> {
+    let dir = match args.dir {
+        Some(d) => d,
+        None => std::env::current_dir().context("getting current directory")?,
+    };
+    // Resolve the mount's git dir (follows the `.git` gitdir-link file to
+    // the writable scratch git dir).
+    let git_dir = git_capture(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "--absolute-git-dir"]),
+    )
+    .context("resolving git dir — run `projgit checkout` inside a writable mount")?;
+    let git_dir = PathBuf::from(git_dir.trim());
+
+    // Resolve the target commit.
+    let commit = git_capture(
+        std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["rev-parse", "--verify", &format!("{}^{{commit}}", args.refname)]),
+    )
+    .with_context(|| format!("resolving ref '{}' in the mount repository", args.refname))?;
+    let commit = commit.trim().to_string();
+
+    // Is the ref a local branch (switch) or something else (detached)?
+    let is_branch = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&git_dir)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", args.refname),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    // 1) Update the index to the target tree WITHOUT touching the
+    //    worktree (no `-u`). git takes `index.lock`, so this is safe
+    //    against a concurrent `git status` in the mount.
+    git_run(
+        std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["read-tree", &commit]),
+    )
+    .context("updating the index to the target tree")?;
+
+    // 2) Move HEAD — this is what the mount's watcher observes.
+    if is_branch {
+        git_run(
+            std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .args(["symbolic-ref", "HEAD", &format!("refs/heads/{}", args.refname)]),
+        )
+        .context("switching HEAD to the branch")?;
+    } else {
+        git_run(
+            std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .args(["update-ref", "--no-deref", "HEAD", &commit]),
+        )
+        .context("moving detached HEAD")?;
+    }
+
+    let short = &commit[..commit.len().min(12)];
+    if is_branch {
+        eprintln!(
+            "projgit: checked out branch '{}' ({short}) — the mount is re-projecting",
+            args.refname
+        );
+    } else {
+        eprintln!("projgit: checked out {short} (detached HEAD) — the mount is re-projecting");
+    }
+    Ok(())
+}
+
+/// Run a `git` command, returning its stdout on success or an error
+/// carrying stderr.
+fn git_capture(cmd: &mut std::process::Command) -> Result<String> {
+    let out = cmd.output().context("spawning git")?;
+    if !out.status.success() {
+        bail!("git failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run a `git` command for its side effect, erroring on failure.
+fn git_run(cmd: &mut std::process::Command) -> Result<()> {
+    git_capture(cmd).map(|_| ())
+}
+
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1263,7 +1475,10 @@ fn setup_writable_gitdir(
         }
         None => std::fs::write(gd.join("HEAD"), format!("{commit_oid}\n"))?,
     }
-    std::fs::write(gd.join("packed-refs"), b"")?;
+    // Import the source's branches + tags (as a packed-refs snapshot) so
+    // `projgit checkout <ref>` can switch among them under the live mount;
+    // their objects are already reachable via the object-store symlink.
+    std::fs::write(gd.join("packed-refs"), import_source_refs(clone_git_dir))?;
 
     let mut config = format!(
         "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\tcheckStat = minimal\n\tworktree = {}\n",
@@ -1308,6 +1523,63 @@ fn read_git_dir_head_commit(git_dir: &Path) -> Option<gix::ObjectId> {
     }
     let hex = String::from_utf8_lossy(&out.stdout);
     gix::ObjectId::from_hex(hex.trim().as_bytes()).ok()
+}
+
+/// Build a `packed-refs` snapshot of the source's branches + tags so a
+/// writable scratch git dir can resolve any of them for
+/// checkout-under-live-mount. Remote-tracking refs (`refs/remotes/origin/*`,
+/// as a partial clone stores non-default branches) are mapped to local
+/// `refs/heads/*` when a same-named local branch isn't already present.
+/// Best effort: returns an empty file (header only) if `git` fails.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn import_source_refs(clone_git_dir: &Path) -> String {
+    use std::collections::HashSet;
+    use std::fmt::Write as _;
+
+    let mut packed = String::from("# pack-refs with: peeled fully-peeled \n");
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(clone_git_dir)
+        .args([
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+            "refs/tags",
+            "refs/remotes/origin",
+        ])
+        .output();
+    let Ok(out) = out else { return packed };
+    if !out.status.success() {
+        return packed;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut heads: HashSet<String> = HashSet::new();
+    // Local branches + tags, verbatim.
+    for line in text.lines() {
+        if let Some((oid, refname)) = line.split_once(' ') {
+            if refname.starts_with("refs/heads/") {
+                heads.insert(refname.to_string());
+                let _ = writeln!(packed, "{oid} {refname}");
+            } else if refname.starts_with("refs/tags/") {
+                let _ = writeln!(packed, "{oid} {refname}");
+            }
+        }
+    }
+    // Remote-tracking branches -> local branches when not already present.
+    for line in text.lines() {
+        if let Some((oid, refname)) = line.split_once(' ') {
+            if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                if branch == "HEAD" {
+                    continue;
+                }
+                let head = format!("refs/heads/{branch}");
+                if heads.insert(head.clone()) {
+                    let _ = writeln!(packed, "{oid} {head}");
+                }
+            }
+        }
+    }
+    packed
 }
 
 /// The branch a writable mount should commit onto, or `None` for a

@@ -141,6 +141,14 @@ impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
         &self.store
     }
 
+    /// Clone the `Arc` to the underlying [`HydratingObjectStore`], e.g.
+    /// to build a sibling provider for a different projection (a
+    /// checkout-under-live-mount baseline swap) that shares the same
+    /// object store, fetcher, and warmed caches.
+    pub fn store_arc(&self) -> Arc<HydratingObjectStore<F>> {
+        self.store.clone()
+    }
+
     /// Access the inode allocator (for diagnostics / tests).
     pub fn allocator(&self) -> &InodeAllocator {
         &self.allocator

@@ -7,11 +7,11 @@
 > verdict in its `RESULTS.md`).
 >
 > Last updated: 2026-07-18 (**Stages 1–7 shipped**; **CLI `--writable`
-> shipped** with branch + remote wiring, committed-work persistence, **and
-> an uncommitted-upper crash journal** — materialized edits + whiteouts
-> now survive an unmount and replay reconciled against the baseline.
-> Remaining: git-checkout integration; the daemon-socket FSMonitor /
-> writable-sidecar track).
+> shipped** with branch + remote wiring, committed + uncommitted
+> persistence, **and git-checkout integration** — a HEAD watcher swaps the
+> LOWER baseline on any HEAD move, plus a `projgit checkout` that switches
+> commits without rewriting the worktree. Remaining: the daemon-socket
+> FSMonitor / writable-sidecar track).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -283,10 +283,26 @@ to A — `README` re-virtualizes to A but the local edit survives the
 checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
 
 **Remaining follow-ups.**
-1. **git-checkout integration**: have git's `checkout` *drive* the swap
-   (update HEAD/index + `swap_baseline`) instead of materializing the
-   whole diff into the worktree — the daemon observing the HEAD change
-   + sparse/skip-worktree is the likely seam.
+1. **git-checkout integration** — **SHIPPED** 2026-07-18. A **HEAD
+   watcher** in the writable CLI mount polls the scratch git dir's
+   resolved `HEAD` and, on any move (`git checkout`/`switch`/`reset`/
+   `pull`/`commit`), builds a fresh LOWER for the new commit (reusing the
+   same hydrating store via `ProjectionFsProvider::store_arc`) and calls
+   `swap_baseline`, so the worktree re-virtualizes and local edits
+   survive. A **`projgit checkout <ref>`** subcommand switches commits
+   *without rewriting the worktree*: it updates the scratch index + HEAD
+   via plumbing (`read-tree` then `symbolic-ref`/`update-ref`), and the
+   watcher does the rest — an O(1) no-fork checkout. The scratch git dir
+   now imports the source's branches + tags (packed-refs snapshot) so any
+   of them is resolvable. Proved by
+   `writable_mount_cli.rs::cli_writable_checkout_reprojects_under_live_mount`
+   (switch `main`→`feature` under a live mount: worktree re-projects,
+   main-only file disappears, feature-only appears, and a local edit to a
+   shared file survives). *Boundary (documented):* making **stock** `git
+   checkout` stay fully virtual for unmodified files needs `SKIP_WORKTREE`
+   management (racy index writes) or a thin `core.virtualfilesystem`-style
+   patch — out of scope; stock checkout still works but eagerly
+   materializes the diff.
 2. **Crash consistency / uncommitted-edit durability** — **SHIPPED**
    2026-07-18. *Committed* work persists (scratch dir reuse + shared-CAS
    objects) and *uncommitted* edits persist via the upper crash journal
@@ -295,8 +311,9 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    content store, and linking journal blobs directly into the odb so
    `commit` derives trees from them (Stage 6 perf).
 
-**Recommended order for the remaining follow-ups:** git-checkout
-integration → daemon-socket FSMonitor / writable sidecar.
+**Recommended order for the remaining follow-ups:** daemon-socket
+FSMonitor / writable sidecar; then the stock-checkout `SKIP_WORKTREE` /
+thin-patch investigation if a workload demands O(1) *stock* checkout.
 
 ## 3. Out of scope (this plan)
 

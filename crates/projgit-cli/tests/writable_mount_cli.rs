@@ -93,6 +93,20 @@ fn spawn_writable(src: &Path, mnt: &Path, cache: &Path) -> std::process::Child {
         .expect("spawn projgit mount --writable")
 }
 
+/// Poll `path` until its contents equal `expected` (or timeout).
+fn wait_for_content(path: &Path, expected: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(c) = std::fs::read_to_string(path) {
+            if c == expected {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 struct DirGuard(PathBuf);
 impl Drop for DirGuard {
     fn drop(&mut self) {
@@ -428,4 +442,118 @@ fn cli_writable_mount_persists_uncommitted_edits_across_remount() {
     let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
     let _ = child2.kill();
     let _ = child2.wait();
+}
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_checkout_reprojects_under_live_mount() {
+    // `projgit checkout` switches a live writable mount to another branch
+    // without rewriting the worktree: the mount's HEAD watcher swaps the
+    // LOWER baseline, so the worktree re-virtualizes to the new commit and
+    // local edits survive (path-keyed upper).
+    let base = std::env::temp_dir().join(format!("projgit-cli-co-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    // Two branches that differ: `main` and `feature`.
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    std::fs::write(src.join("dir/f.txt"), b"main-one\n").unwrap();
+    std::fs::write(src.join("main-only.txt"), b"m\n").unwrap();
+    std::fs::write(src.join("shared.txt"), b"shared\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "main"]);
+
+    git_ok(&src, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(src.join("dir/f.txt"), b"feature-two\n").unwrap();
+    std::fs::remove_file(src.join("main-only.txt")).unwrap();
+    std::fs::write(src.join("feat-only.txt"), b"f\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "feature"]);
+    git_ok(&src, &["checkout", "-q", "main"]);
+
+    // Mount writable on `main`.
+    let mut child = spawn_writable(&src, &mnt, &cache);
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(10)),
+        "writable mount never came up"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("dir/f.txt")).unwrap(),
+        "main-one\n"
+    );
+    assert!(mnt.join("main-only.txt").exists());
+    assert!(!mnt.join("feat-only.txt").exists());
+
+    // Materialize a local edit to a file that is identical in both
+    // branches — it must survive the checkout.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mnt.join("shared.txt"))
+            .unwrap();
+        f.write_all(b"EDIT\n").unwrap();
+    }
+
+    // Switch to `feature` via projgit (no worktree rewrite).
+    let out = Command::new(PROJGIT_BIN)
+        .args(["checkout", "-C"])
+        .arg(&mnt)
+        .arg("feature")
+        .output()
+        .expect("spawn projgit checkout");
+    assert!(
+        out.status.success(),
+        "projgit checkout failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The HEAD watcher re-projects the worktree to `feature`.
+    assert!(
+        wait_for_content(&mnt.join("dir/f.txt"), "feature-two\n", Duration::from_secs(10)),
+        "worktree never re-projected to feature"
+    );
+    assert!(
+        mnt.join("feat-only.txt").exists(),
+        "feature-only file must appear after checkout"
+    );
+    assert!(
+        !mnt.join("main-only.txt").exists(),
+        "main-only file must disappear after checkout"
+    );
+
+    // The local edit survived the checkout (shadows feature's shared.txt).
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("shared.txt")).unwrap(),
+        "shared\nEDIT\n",
+        "local edit must survive the checkout"
+    );
+
+    // git agrees: HEAD is on feature, and only shared.txt is modified.
+    assert_eq!(
+        git_ok(&mnt, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "feature"
+    );
+    let s = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(
+        s.contains("M shared.txt"),
+        "only the surviving edit should be dirty:\n{s}"
+    );
+    assert!(
+        !s.contains("dir/f.txt"),
+        "re-projected files must be clean:\n{s}"
+    );
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
 }
