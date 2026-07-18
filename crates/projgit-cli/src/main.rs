@@ -145,13 +145,15 @@ struct MountArgs {
     /// unmodified files stay virtual, but you can edit them, create new
     /// files, `git add`, and `git commit` — only touched files are
     /// materialized (EdenFS-style). projgit sets up a real, writable
-    /// git dir on disk (alternating to the shared object store) and
-    /// links the mount's `.git` to it, so stock git inside the mount
-    /// works with no fork.
+    /// git dir on disk (sharing the mount's object store) and links the
+    /// mount's `.git` to it, so stock git inside the mount works with no
+    /// fork. The git dir persists under `<cache>/worktrees/`, so
+    /// committed work is restored when you remount the same mountpoint.
     ///
-    /// First-cut limitations: in-memory upper (edits are lost on
-    /// unmount unless committed); not combinable with `--subtree`,
-    /// `--no-dotgit`, or `--daemon-socket`.
+    /// First-cut limitations: the upper is in-memory, so *uncommitted*
+    /// edits are lost on unmount (commit or push to keep them);
+    /// not combinable with `--subtree`, `--no-dotgit`, or
+    /// `--daemon-socket`.
     #[arg(long)]
     writable: bool,
 
@@ -483,7 +485,9 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
 
     // 3. Build the projection. Done after opening the store so we
     //    can peel `--ref` to a commit OID when combined with `--subtree`.
-    let projection = build_projection(&args, &store)?;
+    //    Mutable because a writable mount may re-pin it to a persisted
+    //    HEAD when reusing an existing worktree (see below).
+    let mut projection = build_projection(&args, &store)?;
 
     // 4. Pick a fetcher.
     //
@@ -504,30 +508,41 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     //    clone configured (typically `origin`).
     let _remote_hint = &args.remote;
     let (overlay, writable) = if args.writable {
-        let commit_oid = projection
+        let requested_oid = projection
             .resolve_commit(&store)
             .context("resolving projection commit for --writable")?;
         let branch = writable_branch_name(&args, &git_dir);
         let remote_url = read_clone_remote_url(&git_dir)
             .or_else(|| source_is_url.then(|| args.source.clone()));
-        let scratch = setup_writable_gitdir(
+        let worktrees_root = resolve_cache_dir(args.cache_dir.as_deref())?.join("worktrees");
+        let wt = setup_writable_gitdir(
             &git_dir,
             &store,
-            commit_oid,
+            requested_oid,
+            &worktrees_root,
             &args.mountpoint,
             branch.as_deref(),
             remote_url.as_deref(),
         )?;
+        // Pin the LOWER projection to the worktree's effective commit:
+        // the requested tip on a fresh worktree, or the persisted HEAD
+        // when reusing one whose branch advanced via committed work.
+        projection = projgit_core::Projection::Commit(wt.commit);
         let where_ = match (&branch, &remote_url) {
             (Some(b), Some(_)) => format!("on branch '{b}' (push → origin)"),
             (Some(b), None) => format!("on branch '{b}' (no remote configured)"),
             (None, _) => "detached HEAD".to_string(),
         };
+        let state = if wt.reused {
+            "reused — committed work restored; commit to persist new edits"
+        } else {
+            "fresh — commit to persist across unmount"
+        };
         eprintln!(
-            "projgit: writable mount — {where_} — git dir {} (edits in-memory; commit to persist)",
-            scratch.display()
+            "projgit: writable mount — {where_} — git dir {} ({state})",
+            wt.path.display()
         );
-        (build_writable_overlay(&scratch)?, true)
+        (build_writable_overlay(&wt.path)?, true)
     } else {
         (build_root_overlay(&args, &projection, &store, &git_dir)?, false)
     };
@@ -1149,12 +1164,25 @@ fn build_writable_overlay(scratch_gitdir: &Path) -> Result<projgit_core::RootOve
     Ok(overlay)
 }
 
-/// Create a real, writable git dir on disk for a writable worktree
-/// mount. It alternates to the shared clone's object store (so reads
-/// reach the partial-clone packs / on-demand-hydrated objects), carries
-/// a **writable** index (real per-entry stat, no `ASSUME_VALID`), and
-/// `core.worktree` pointing at the mountpoint + `core.checkStat =
-/// minimal`.
+/// A prepared writable scratch git dir.
+struct WritableGitDir {
+    /// Path to the scratch git dir (the `.git` link points here).
+    path: PathBuf,
+    /// The commit the LOWER projection should serve: the requested
+    /// projection tip on a fresh worktree, or the persisted `HEAD`
+    /// (advanced by committed work) when an existing worktree is reused.
+    commit: gix::ObjectId,
+    /// Whether an existing worktree with committed work was reused.
+    reused: bool,
+}
+
+/// Create — or reuse — a real, writable git dir on disk for a writable
+/// worktree mount. Its `objects` is a **symlink into the shared clone
+/// CAS**, so committed objects are durable and readable by the
+/// projection's `ObjectStore` (which opens the clone) rather than
+/// stranded in a throwaway odb. The dir carries a **writable** index
+/// (real per-entry stat, no `ASSUME_VALID`), `core.worktree` pointing at
+/// the mountpoint, and `core.checkStat = minimal`.
 ///
 /// When `branch` is `Some`, `HEAD` is symbolic (`refs/heads/<branch>`)
 /// so commits advance a named branch; otherwise `HEAD` is detached at
@@ -1162,17 +1190,21 @@ fn build_writable_overlay(scratch_gitdir: &Path) -> Result<projgit_core::RootOve
 /// remote is configured (with branch upstream) so `git push` works out
 /// of the box.
 ///
-/// Located under the system temp dir, keyed by the mountpoint, and
-/// recreated fresh each mount (first-cut: in-memory upper, so a fresh
-/// session per mount).
+/// Located under `<cache>/worktrees/`, keyed by the mountpoint. If a
+/// valid dir already exists there it is **reused** — its refs, index,
+/// and objects survive the unmount, so committed work is restored on
+/// remount and the projection is re-pinned to its `HEAD` (uncommitted
+/// in-memory edits are still lost until the upper is made durable).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn setup_writable_gitdir(
     clone_git_dir: &Path,
     store: &projgit_core::ObjectStore,
     commit_oid: gix::ObjectId,
+    worktrees_root: &Path,
     mountpoint: &Path,
     branch: Option<&str>,
     remote_url: Option<&str>,
-) -> Result<PathBuf> {
+) -> Result<WritableGitDir> {
     use std::collections::hash_map::DefaultHasher;
     use std::fmt::Write as _;
     use std::hash::{Hash, Hasher};
@@ -1181,11 +1213,38 @@ fn setup_writable_gitdir(
         .with_context(|| format!("canonicalizing mountpoint {}", mountpoint.display()))?;
     let mut hasher = DefaultHasher::new();
     mp_abs.hash(&mut hasher);
-    let gd = std::env::temp_dir().join(format!("projgit-wt-{:016x}.git", hasher.finish()));
-    let _ = std::fs::remove_dir_all(&gd);
-    std::fs::create_dir_all(gd.join("objects/info"))?;
+    std::fs::create_dir_all(worktrees_root)
+        .with_context(|| format!("creating worktrees root {}", worktrees_root.display()))?;
+    let gd = worktrees_root.join(format!("projgit-wt-{:016x}.git", hasher.finish()));
+
+    // Reuse an existing, valid worktree so committed work survives an
+    // unmount / remount. Only recreate when it is absent or unreadable.
+    if gd.join("HEAD").exists() {
+        if let Some(head) = read_git_dir_head_commit(&gd) {
+            return Ok(WritableGitDir {
+                path: gd,
+                commit: head,
+                reused: true,
+            });
+        }
+        // Present but unreadable — start clean.
+        let _ = std::fs::remove_dir_all(&gd);
+    }
+
     std::fs::create_dir_all(gd.join("refs/heads"))?;
     std::fs::create_dir_all(gd.join("refs/tags"))?;
+
+    // Objects: symlink to the shared clone CAS so commits land in the
+    // durable, shared store (readable by the projection, pushable).
+    let clone_objects = std::fs::canonicalize(clone_git_dir.join("objects"))
+        .with_context(|| format!("canonicalizing {}/objects", clone_git_dir.display()))?;
+    std::os::unix::fs::symlink(&clone_objects, gd.join("objects")).with_context(|| {
+        format!(
+            "linking shared object store {} into {}",
+            clone_objects.display(),
+            gd.display()
+        )
+    })?;
 
     // HEAD: symbolic on a branch, or detached at the commit.
     match branch {
@@ -1200,12 +1259,6 @@ fn setup_writable_gitdir(
         None => std::fs::write(gd.join("HEAD"), format!("{commit_oid}\n"))?,
     }
     std::fs::write(gd.join("packed-refs"), b"")?;
-    let clone_objects = std::fs::canonicalize(clone_git_dir.join("objects"))
-        .with_context(|| format!("canonicalizing {}/objects", clone_git_dir.display()))?;
-    std::fs::write(
-        gd.join("objects/info/alternates"),
-        format!("{}\n", clone_objects.display()),
-    )?;
 
     let mut config = format!(
         "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n\tcheckStat = minimal\n\tworktree = {}\n",
@@ -1227,7 +1280,29 @@ fn setup_writable_gitdir(
     let index = projgit_core::dotgit::build_writable_index_bytes(store, commit_oid)
         .context("building writable index")?;
     std::fs::write(gd.join("index"), index)?;
-    Ok(gd)
+    Ok(WritableGitDir {
+        path: gd,
+        commit: commit_oid,
+        reused: false,
+    })
+}
+
+/// The commit `HEAD` resolves to in an existing scratch git dir, or
+/// `None` if the dir is missing / has no valid `HEAD`. Uses `git
+/// rev-parse` so loose, symbolic, and packed refs all resolve.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_git_dir_head_commit(git_dir: &Path) -> Option<gix::ObjectId> {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let hex = String::from_utf8_lossy(&out.stdout);
+    gix::ObjectId::from_hex(hex.trim().as_bytes()).ok()
 }
 
 /// The branch a writable mount should commit onto, or `None` for a

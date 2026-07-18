@@ -6,10 +6,11 @@
 > [`../../spikes/writable-nofork/`](../../spikes/writable-nofork/),
 > verdict in its `RESULTS.md`).
 >
-> Last updated: 2026-06-19 (**Stages 1–6 shipped**; **Stage 7 swap +
-> edit-survival shipped** — path-keyed overlay, `swap_baseline` under a
-> live mount with EdenFS-style edit-survival across checkout; git-checkout
-> integration and the crash journal remain).
+> Last updated: 2026-07-18 (**Stages 1–7 shipped**; **CLI `--writable`
+> shipped** with branch + remote wiring **and committed-work persistence
+> across unmount** — the scratch git dir is reused, not recreated, and its
+> objects are shared into the CAS. Remaining: the *uncommitted* in-memory
+> upper, git-checkout integration, and the crash journal).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -148,8 +149,22 @@ branch; `--commit` stays detached) and inherits the source's
 add` / `switch -c`. Proved by
 `writable_mount_cli.rs::cli_writable_mount_commit_and_push_to_branch`
 (bare remote + source: mount on `main`, edit, commit, `git push`, and the
-bare remote receives the content). Remaining: persistence across unmount
-(on-disk upper — the scratch dir is still recreated fresh each mount).
+bare remote receives the content).
+
+**Committed-work persistence across unmount (SHIPPED 2026-07-18).** The
+scratch git dir now lives under `<cache>/worktrees/` (keyed by
+mountpoint) and is **reused, not recreated** — if a valid one exists, its
+refs + index are kept and the LOWER projection is re-pinned to its
+persisted `HEAD`. Crucially, the scratch `objects` is a **symlink into
+the shared clone CAS** (replacing the old read-only `alternates`), so
+commits land in the durable, shared store where the projection's
+`ObjectStore` can read them back on remount (and push still works).
+Proved by
+`writable_mount_cli.rs::cli_writable_mount_persists_commit_across_remount`
+(commit inside the mount, unmount, remount the same mountpoint → `HEAD`,
+clean `status`, and the edited + new files are all restored). Remaining:
+the *uncommitted* in-memory upper (edits not yet committed are still lost
+on unmount — the on-disk upper / journal below).
 
 ### Stage 3 — R4: FUSE invalidation on write  *(SHIPPED 2026-06-19)*
 
@@ -252,12 +267,14 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    (update HEAD/index + `swap_baseline`) instead of materializing the
    whole diff into the worktree — the daemon observing the HEAD change
    + sparse/skip-worktree is the likely seam.
-2. **Crash consistency**: move the upper to an on-disk overlay, then add
-   a minimal journal (§10.3). Small blast radius (immutable LOWER), but
-   nonzero.
+2. **Crash consistency / uncommitted-edit durability**: *committed* work
+   now persists (scratch dir reuse + shared-CAS objects, above), but the
+   upper is still in-memory, so *uncommitted* edits are lost on unmount.
+   Move the upper to an on-disk overlay, then add a minimal journal
+   (§10.3). Small blast radius (immutable LOWER), but nonzero.
 
-**Recommended order for the follow-ups:** on-disk upper → git-checkout
-integration → journal.
+**Recommended order for the follow-ups:** on-disk upper (uncommitted-edit
+durability) → git-checkout integration → journal.
 
 ## 3. Out of scope (this plan)
 
