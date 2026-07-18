@@ -1023,22 +1023,25 @@ where
         mountpoint.display(),
         if writable { "writable" } else { "read-only" },
     );
-    // A writable mount keeps its `WritableHandle` so a HEAD watcher can
-    // swap the LOWER baseline when the user checks out a different commit
-    // (checkout-under-live-mount). Read-only mounts don't need it.
+    // A writable mount keeps its `WritableHandle` so the HEAD watcher and
+    // the control socket can swap the LOWER baseline on checkout. Read-only
+    // mounts need neither.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut watcher: Option<std::thread::JoinHandle<()>> = None;
+    let mut control: Option<std::thread::JoinHandle<()>> = None;
     let session = if writable {
         let (session, handle) =
             projgit_fuse::mount_writable_background_with_handle(provider.clone(), mountpoint, config)
                 .with_context(|| format!("mounting (writable) at {}", mountpoint.display()))?;
-        if let Some(scratch) = writable_scratch {
-            watcher = Some(spawn_head_watcher(
-                provider.clone(),
-                handle,
-                scratch,
-                stop.clone(),
-            ));
+        match writable_scratch {
+            Some(scratch) => {
+                let swapper =
+                    std::sync::Arc::new(Swapper::new(provider.clone(), handle, scratch.clone()));
+                let socket = scratch.join(CONTROL_SOCKET_NAME);
+                control = Some(spawn_control_listener(swapper.clone(), socket, stop.clone()));
+                watcher = Some(spawn_head_watcher(swapper, scratch, stop.clone()));
+            }
+            None => drop(handle),
         }
         session
     } else {
@@ -1060,6 +1063,9 @@ where
     drop(session);
     if let Some(w) = watcher {
         let _ = w.join();
+    }
+    if let Some(c) = control {
+        let _ = c.join();
     }
 
     if print_stats {
@@ -1103,71 +1109,183 @@ where
     Ok(())
 }
 
-/// Watch a writable mount's scratch git dir `HEAD` and swap the LOWER
-/// baseline whenever it moves — so a `git checkout` / `switch` / `reset`
-/// / `pull` / `projgit checkout` inside the mount re-virtualizes the
-/// worktree to the new commit (checkout-under-live-mount) instead of
-/// leaving stale content. Local edits survive (the upper is path-keyed).
-///
-/// The watcher polls (no external notify dependency); it exits when
-/// `stop` is set on unmount. Building the new baseline reuses the same
-/// hydrating store + fetcher via [`ProjectionFsProvider::store_arc`].
+/// Filename of a writable mount's control socket, inside the scratch git
+/// dir. `projgit checkout` connects here to drive a synchronous baseline
+/// swap (so a checkout is consistent by the time the command returns).
+const CONTROL_SOCKET_NAME: &str = "projgit-control.sock";
+
+/// Shared baseline swapper for a writable mount: builds a new LOWER
+/// projection for a target commit (reusing the same hydrating store +
+/// fetcher via [`ProjectionFsProvider::store_arc`]) and swaps it under
+/// the live mount, deduplicating against the currently-projected commit.
+/// Shared (behind `Arc`) by the HEAD watcher (stock git ops) and the
+/// control-socket listener (`projgit checkout`).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn spawn_head_watcher<F>(
+struct Swapper<F: projgit_core::Fetcher + 'static> {
     provider: std::sync::Arc<projgit_core::ProjectionFsProvider<F>>,
     handle: projgit_fuse::WritableHandle<projgit_core::ProjectionFsProvider<F>>,
+    scratch: PathBuf,
+    next_id: std::sync::atomic::AtomicU64,
+    current: std::sync::Mutex<Option<gix::ObjectId>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<F: projgit_core::Fetcher + 'static> Swapper<F> {
+    fn new(
+        provider: std::sync::Arc<projgit_core::ProjectionFsProvider<F>>,
+        handle: projgit_fuse::WritableHandle<projgit_core::ProjectionFsProvider<F>>,
+        scratch: PathBuf,
+    ) -> Self {
+        // Seed `current` with the mounted commit so the watcher's first
+        // poll doesn't trigger a spurious swap.
+        let current = resolve_head_commit_fast(&scratch);
+        Self {
+            provider,
+            handle,
+            scratch,
+            next_id: std::sync::atomic::AtomicU64::new(2),
+            current: std::sync::Mutex::new(current),
+        }
+    }
+
+    /// Swap the LOWER baseline to `commit` unless it is already current.
+    /// Returns `Ok(true)` if a swap happened. Serialized (and dedup'd)
+    /// against concurrent callers — the watcher and the control socket.
+    fn swap_to(&self, commit: gix::ObjectId) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        let mut cur = self.current.lock().unwrap();
+        if *cur == Some(commit) {
+            return Ok(false);
+        }
+        let overlay = build_writable_overlay(&self.scratch)?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let new_lower = projgit_core::ProjectionFsProvider::new(
+            projgit_core::Projection::Commit(commit),
+            self.provider.store_arc(),
+            overlay,
+            id,
+        )
+        .with_context(|| format!("re-projecting worktree to {commit}"))?;
+        self.handle.swap_baseline(std::sync::Arc::new(new_lower));
+        *cur = Some(commit);
+        Ok(true)
+    }
+}
+
+/// Watch a writable mount's scratch git dir `HEAD` and swap the LOWER
+/// baseline whenever it moves — the safety net for STOCK `git checkout` /
+/// `switch` / `reset` / `pull` / `commit` (which we don't control).
+/// `projgit checkout` drives the swap synchronously over the control
+/// socket instead. Polls (reads the ref files directly, no subprocess);
+/// exits when `stop` is set on unmount.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_head_watcher<F>(
+    swapper: std::sync::Arc<Swapper<F>>,
     scratch: PathBuf,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()>
 where
     F: projgit_core::Fetcher + 'static,
 {
-    use projgit_core::Projection;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     std::thread::Builder::new()
         .name("projgit-head-watcher".to_string())
         .spawn(move || {
-            let mut current = resolve_head_commit_fast(&scratch);
-            // Fresh projection id per swap so inode namespaces don't clash.
-            let mut next_id = 2u64;
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(200));
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let head = resolve_head_commit_fast(&scratch);
-                let Some(oid) = head else { continue };
-                if head == current {
+                let Some(head) = resolve_head_commit_fast(&scratch) else {
                     continue;
-                }
-                let overlay = match build_writable_overlay(&scratch) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        eprintln!("projgit: checkout re-projection (overlay) failed: {e:#}");
-                        continue;
-                    }
                 };
-                match projgit_core::ProjectionFsProvider::new(
-                    Projection::Commit(oid),
-                    provider.store_arc(),
-                    overlay,
-                    next_id,
-                ) {
-                    Ok(new_lower) => {
-                        next_id += 1;
-                        handle.swap_baseline(std::sync::Arc::new(new_lower));
-                        current = head;
-                        eprintln!("projgit: checkout observed — re-projected worktree to {oid}");
+                match swapper.swap_to(head) {
+                    Ok(true) => {
+                        eprintln!("projgit: checkout observed — re-projected worktree to {head}")
                     }
-                    Err(e) => {
-                        eprintln!("projgit: checkout re-projection to {oid} failed: {e:#}");
-                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("projgit: re-projection to {head} failed: {e:#}"),
                 }
             }
         })
         .expect("spawning HEAD watcher thread")
+}
+
+/// Serve the writable mount's control socket: `projgit checkout` sends
+/// `SWAP <oid>\n` and the mount performs the baseline swap synchronously,
+/// replying `OK\n` (or `ERR <msg>\n`) once applied — so a checkout is
+/// consistent by the time the command returns (no poll lag). Falls back
+/// to a no-op keepalive thread if the socket can't be bound. Exits when
+/// `stop` is set on unmount.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_control_listener<F>(
+    swapper: std::sync::Arc<Swapper<F>>,
+    socket_path: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()>
+where
+    F: projgit_core::Fetcher + 'static,
+{
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    // Replace any stale socket from a previous (crashed) mount.
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "projgit: control socket unavailable ({e}); `projgit checkout` will fall back to the poll watcher"
+            );
+            return std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            });
+        }
+    };
+    let _ = listener.set_nonblocking(true);
+
+    std::thread::Builder::new()
+        .name("projgit-control".to_string())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let mut reader = match stream.try_clone() {
+                            Ok(s) => BufReader::new(s),
+                            Err(_) => continue,
+                        };
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            continue;
+                        }
+                        let reply = match line.trim().strip_prefix("SWAP ") {
+                            Some(hex) => match gix::ObjectId::from_hex(hex.as_bytes()) {
+                                Ok(oid) => match swapper.swap_to(oid) {
+                                    Ok(_) => "OK\n".to_string(),
+                                    Err(e) => format!("ERR {e:#}\n"),
+                                },
+                                Err(_) => "ERR bad oid\n".to_string(),
+                            },
+                            None => "ERR bad request\n".to_string(),
+                        };
+                        let mut stream = stream;
+                        let _ = stream.write_all(reply.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = std::fs::remove_file(&socket_path);
+        })
+        .expect("spawning control-socket thread")
 }
 
 /// `projgit checkout <ref>` — switch a live **writable** mount to another
@@ -1248,15 +1366,62 @@ fn cmd_checkout(args: CheckoutArgs) -> Result<()> {
     }
 
     let short = &commit[..commit.len().min(12)];
+    // Drive the swap synchronously over the mount's control socket so the
+    // worktree reflects the new commit by the time we return. Falls back
+    // to the mount's poll watcher if no socket is listening.
+    let synced = notify_mount_swap(&git_dir, &commit);
+    let tail = if synced {
+        "mount re-projected"
+    } else {
+        "mount will re-project"
+    };
     if is_branch {
         eprintln!(
-            "projgit: checked out branch '{}' ({short}) — the mount is re-projecting",
+            "projgit: checked out branch '{}' ({short}) — {tail}",
             args.refname
         );
     } else {
-        eprintln!("projgit: checked out {short} (detached HEAD) — the mount is re-projecting");
+        eprintln!("projgit: checked out {short} (detached HEAD) — {tail}");
     }
     Ok(())
+}
+
+/// Ask a running writable mount (via its control socket in `git_dir`) to
+/// swap the LOWER baseline to `commit` synchronously, returning `true`
+/// once the mount acknowledges. Returns `false` if no mount is listening
+/// (the caller then relies on the mount's poll watcher).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn notify_mount_swap(git_dir: &Path, commit: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let socket = git_dir.join(CONTROL_SOCKET_NAME);
+    let Ok(mut stream) = UnixStream::connect(&socket) else {
+        return false;
+    };
+    // A cold re-projection may hydrate objects, so allow generous time.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+    if stream
+        .write_all(format!("SWAP {commit}\n").as_bytes())
+        .is_err()
+    {
+        return false;
+    }
+    let mut reply = String::new();
+    let Ok(reader) = stream.try_clone() else {
+        return false;
+    };
+    if BufReader::new(reader).read_line(&mut reply).is_err() {
+        return false;
+    }
+    reply.trim() == "OK"
+}
+
+/// Non-unix stub: no control socket, always falls back to the poll watcher.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn notify_mount_swap(_git_dir: &Path, _commit: &str) -> bool {
+    false
 }
 
 /// Run a `git` command, returning its stdout on success or an error

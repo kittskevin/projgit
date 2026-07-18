@@ -307,7 +307,16 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    shadows a later checkout as a phantom edit
    (`cli_writable_reconcile_drops_edit_the_baseline_carries`). The watcher
    also resolves `HEAD` by reading the ref files directly instead of
-   forking `git rev-parse` each poll. *Boundary (documented):* making **stock** `git
+   forking `git rev-parse` each poll. **Control socket (2026-07-18):** the
+   writable mount serves a unix control socket
+   (`<scratch>/projgit-control.sock`); `projgit checkout` drives the swap
+   over it **synchronously** (`SWAP <oid>` → `OK`) and returns only once
+   the mount applied it — no poll lag, safe to script
+   (`cli_writable_checkout_synchronous_over_control_socket`; the command
+   reports "mount re-projected", the synchronous ack). The poll watcher
+   stays as the safety net for stock git ops; a `reference-transaction`
+   hook to push those over the socket and retire the poll is the next
+   step. *Boundary (documented):* making **stock** `git
    checkout` stay fully virtual for unmodified files needs `SKIP_WORKTREE`
    management (racy index writes) or a thin `core.virtualfilesystem`-style
    patch — out of scope; stock checkout still works but eagerly

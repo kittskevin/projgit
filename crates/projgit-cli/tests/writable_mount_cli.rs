@@ -654,3 +654,64 @@ fn cli_writable_reconcile_drops_edit_the_baseline_carries() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_checkout_synchronous_over_control_socket() {
+    // `projgit checkout` drives the swap over the mount's control socket
+    // and returns only once the mount has applied it — the command's own
+    // output reports "mount re-projected" (the synchronous ack), rather
+    // than "will re-project" (the async poll-watcher fallback).
+    let base = std::env::temp_dir().join(format!("projgit-cli-sync-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::write(src.join("x.txt"), b"main\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "main"]);
+    git_ok(&src, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(src.join("x.txt"), b"feature\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "feature"]);
+    git_ok(&src, &["checkout", "-q", "main"]);
+
+    let mut child = spawn_writable(&src, &mnt, &cache);
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(10)),
+        "mount never came up"
+    );
+    assert_eq!(std::fs::read_to_string(mnt.join("x.txt")).unwrap(), "main\n");
+
+    // `projgit checkout feature` — the mount must acknowledge synchronously.
+    let out = Command::new(PROJGIT_BIN)
+        .args(["checkout", "-C"])
+        .arg(&mnt)
+        .arg("feature")
+        .output()
+        .expect("spawn projgit checkout");
+    assert!(out.status.success(), "checkout failed");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("mount re-projected"),
+        "checkout must be acked synchronously over the control socket, got:\n{err}"
+    );
+
+    // And the worktree reflects feature.
+    assert!(
+        wait_for_content(&mnt.join("x.txt"), "feature\n", Duration::from_secs(5)),
+        "worktree must reflect feature after a synchronous checkout"
+    );
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
