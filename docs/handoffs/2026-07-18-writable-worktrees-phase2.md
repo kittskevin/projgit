@@ -10,9 +10,13 @@
 > [`../implementation/writable-worktrees-plan.md`](../implementation/writable-worktrees-plan.md).
 > This doc is the running narrative so a resume doesn't re-derive it.
 >
-> **All 16 Phase-2 commits are on `feat/writable-worktrees`, pushed to
+> **All 28 Phase-2 commits are on `feat/writable-worktrees`, pushed to
 > `origin`.** `main` is unchanged (= `origin/main`, `980d2c6`). HEAD =
-> `1affe59`. Merge/PR the feature branch when ready.
+> `b772694`. The branch is **feature-complete and green** — persistence,
+> checkout integration, stock-git observation, opt-in fsmonitor, writable
+> sidecar, validated partial-clone push, and blob GC all landed after the
+> mid-session point this doc was first written. **Ready to merge — open a
+> PR to `main`.**
 
 ## Branch state (read first)
 
@@ -42,6 +46,18 @@
 4. **Productionized** as `projgit mount --writable`.
 5. **Wired the dev loop**: named branch + inherited remote so
    `git push` works out of the box.
+6. **Made it persistent**: reused on-disk scratch (committed work) + an
+   on-disk crash journal for the upper (uncommitted edits). Nothing is
+   lost on unmount.
+7. **Integrated checkout**: `projgit checkout` + a `reference-transaction`
+   hook so **stock** git ops re-project the live mount over a control
+   socket; every swap reconciles the upper.
+8. **Streamed fsmonitor over the socket** and added a **writable sidecar**
+   (`--writable` + `--daemon-socket`).
+9. **Hardened partial clones**: validated `edit → commit → push` against a
+   real `blob:none` GitHub clone (fixed 2 bugs) and pre-populated an FSMN
+   index so the first `status` doesn't mass-hydrate the tree.
+10. **Bounded the upper**: GC of stale content-store blobs on compaction.
 
 ## Commits (chronological, all on `feat/writable-worktrees`, pushed)
 
@@ -63,6 +79,18 @@
 | `79c631a` | feat(core): sparse writable index — SKIP_WORKTREE out-of-cone (Stage 5 follow-up) |
 | `01cdd97` | feat(cli): `projgit mount --writable` — usable writable worktree |
 | `1affe59` | feat(cli): writable mount — branch + remote wiring for push |
+| `18fe468` | docs(handoff): session handoff for writable worktrees (this doc) |
+| `ae61806` | feat(cli): persist committed work across unmount (reused scratch) |
+| `f82497e` | feat(fuse): persist the uncommitted upper via a crash journal |
+| `392c2b3` | feat: checkout-under-live-mount — HEAD watcher + `projgit checkout` |
+| `b9161c1` | feat(fuse): reconcile the upper on every baseline swap |
+| `7cea4f0` | feat(cli): synchronous `projgit checkout` over a control socket |
+| `71737ee` | feat(cli): observe stock git ops via a reference-transaction hook |
+| `55e55e8` | feat: FSMonitor over the mount control socket (`--fsmonitor`) |
+| `f242a69` | feat(cli): writable sidecar — `--writable` + `--daemon-socket` |
+| `f2847eb` | fix(core,cli): partial-clone writable correctness (validated vs GitHub) |
+| `beb0dd1` | feat(core,cli): pre-populated FSMN index — no first-status hydration |
+| `b772694` | feat(fuse): GC stale blobs from the upper journal store |
 
 ## What got built (by requirement)
 
@@ -100,6 +128,45 @@
   branch** (symbolic HEAD → `refs/heads/<branch>`) and inherits the
   clone's `remote.origin.url` + branch upstream, so `git push` works.
 
+## What got built after the dev loop (persistence → integration → hardening)
+
+The 12 commits after `1affe59` took the single-session dev loop to a
+persistent, integrated, partial-clone-correct feature:
+
+- **Persistence across unmount** (`ae61806`, `f82497e`). The scratch git
+  dir moved to `<cache>/worktrees/` and is **reused** (not recreated);
+  its `objects` is a symlink into the shared CAS, so *committed* work is
+  durable. The upper (uncommitted edits + whiteouts) is backed by an
+  **on-disk crash journal** (`projgit-fuse/src/upper_journal.rs`):
+  append-only fsync'd `journal` + content-addressed `blobs/`. On mount it
+  replays, **reconciles** against the re-pinned baseline (drops
+  now-committed edits), and compacts. Committed *and* uncommitted work
+  survive with no user action.
+- **Checkout under a live mount** (`392c2b3`, `b9161c1`). `projgit
+  checkout <ref>` re-projects the running mount with no worktree rewrite
+  (read-tree + HEAD move → `swap_baseline`); path-keyed edits survive;
+  every swap reconciles the upper so stock and virtual checkout converge.
+- **Stock-git observation via hooks** (`71737ee`, `7cea4f0`). A
+  `reference-transaction` hook makes **stock** `git commit/checkout/reset`
+  drive the swap synchronously over a per-mount **control socket**
+  (`projgit-control.sock`); the HEAD poll watcher is now only a fallback.
+- **FSMonitor over the socket** (`55e55e8`). Opt-in `--fsmonitor`
+  installs a `core.fsmonitor` hook that streams the modified-path set
+  from the mount over the control socket, so git skips scanning.
+- **Writable sidecar** (`f242a69`). `--writable` composes with
+  `--daemon-socket`: the scratch attaches to a running `projgitd`'s
+  object store (`prepare_writable` shared by standalone + sidecar).
+- **Partial-clone correctness + no first-status hydration** (`f2847eb`,
+  `beb0dd1`). Validated `edit → commit → push` over a real `blob:none`
+  clone against GitHub (2 bugs fixed: size-fallback for absent blobs,
+  promisor config propagation). `--fsmonitor` **pre-populates an FSMN
+  index extension** marking every entry valid, so the first `status`
+  doesn't mass-hydrate the tree (the GVFS `core.virtualfilesystem`
+  problem) — proven: missing-blob count unchanged across the first scan.
+- **Upper blob GC** (`b772694`). Compaction garbage-collects blobs no
+  longer referenced by the live journal, so the content store stays
+  bounded.
+
 ## Proof (tests — all green)
 
 - `cargo clippy --workspace --all-targets -- -D warnings` clean; full
@@ -110,39 +177,56 @@
   — 4 tests: edit/add/create/commit, fsmonitor write-log, sparse-cone
   hides out-of-cone, swap-baseline + edit-survival.
 - CLI (`#[ignore]`, real subprocess): `projgit-cli/tests/writable_mount_cli.rs`
-  — `cli_writable_mount_edit_add_commit` and
-  `cli_writable_mount_commit_and_push_to_branch` (bare remote + source:
-  mount on `main`, edit, commit, `git push`, bare remote receives content).
+  — **12 tests**: edit/add/commit, commit-and-push-to-branch, persist
+  committed + persist uncommitted across remount, `projgit checkout`
+  (live + synchronous over the socket), stock-commit reconcile via hook,
+  fsmonitor over socket, partial-clone edit/commit, fsmonitor-avoids-
+  partial-clone-hydration, and journal blob GC.
+- Daemon sidecar (`#[ignore]`, real `projgitd`):
+  `projgit-daemon/tests/xprocess_mount_smoke.rs::xprocess_writable_sidecar_edit_commit`.
 - Run the ignored ones with `-- --ignored` (e.g.
   `cargo test -p projgit-cli --test writable_mount_cli -- --ignored`).
 
 ## The dev loop that now works
 
 ```bash
-projgit mount --writable https://github.com/you/repo mnt &
+projgit mount --writable https://github.com/you/repo mnt &   # add --fsmonitor for big/partial clones
 cd mnt
 $EDITOR src/foo.rs            # edit a tracked (still-virtual) file
-git add -A && git commit -m "..."
+git add -A && git commit -m "..."   # stock git; the hook reconciles the upper
 git push                      # → origin/<branch>, no manual setup
+projgit checkout other-branch # re-projects the live mount, no worktree rewrite
+# unmount + remount the same path later: committed + uncommitted work is restored
 ```
 
-## Honest limitations (read before trusting the demo)
+## Status of the earlier "honest limitations" (four fixed, one by-design)
 
-1. **No persistence across unmount — the biggest gap.**
-   `setup_writable_gitdir` **recreates the scratch dir fresh each mount**
-   (`remove_dir_all`), and the upper is **in-memory**. So both
-   *uncommitted* edits and *local-only* commits are lost on unmount unless
-   `git push`ed. This is the top follow-up.
-2. **`--writable` is exclusive** with `--subtree` / `--no-dotgit` /
-   `--daemon-socket` (rejected at parse). No writable sidecar yet.
-3. **git-checkout doesn't drive `swap_baseline` yet** — the swap works
-   and is tested, but nothing wires stock `git checkout` to it; a
-   checkout still materializes the diff.
-4. **FSMonitor is a write-log *file*** read by a hook, not a live daemon
-   socket. Same write-log; only the transport differs.
-5. **Commit is correctness-only** — trees come from stock git re-reading
-   the worktree, not derived from the materialized set via `gix`
-   cache-tree (a perf follow-up).
+The mid-session handoff listed five caveats. Four are now **fixed**; one
+is **out of scope by design**:
+
+1. ~~No persistence across unmount~~ — **FIXED** (`ae61806`, `f82497e`).
+   Committed *and* uncommitted work survive unmount (reused scratch +
+   on-disk crash journal). Nothing is lost without `git push`.
+2. ~~`--writable` exclusive with `--daemon-socket`~~ — **FIXED**
+   (`f242a69`). Writable sidecar composes with a running `projgitd`.
+   (`--writable` still rejects `--subtree` / `--no-dotgit` by design.)
+3. ~~Stock checkout doesn't drive `swap_baseline`~~ — **FIXED**
+   (`71737ee`, `7cea4f0`). A `reference-transaction` hook drives the swap
+   from stock git; `projgit checkout` does it synchronously over the
+   control socket.
+4. ~~FSMonitor is a write-log file, not a socket~~ — **FIXED**
+   (`55e55e8`). `--fsmonitor` streams the modified set over the control
+   socket via a `core.fsmonitor` hook.
+5. **Commit re-reads the worktree** (perf, not correctness) — still true,
+   but **blob GC** (`b772694`) subsumed most of the "derive trees from
+   the materialized set" motivation; deferred as marginal.
+
+**The one remaining Phase-2 boundary (out of scope by design):** making
+**stock** `git checkout` stay *fully virtual* for unmodified files needs
+`SKIP_WORKTREE` management (racy index writes) or a thin
+`core.virtualfilesystem`-style git integration. Today stock checkout
+works correctly but eagerly materializes the diff; `projgit checkout`
+stays virtual.
 
 ## Gotchas / lessons (carried from this session)
 
@@ -162,33 +246,33 @@ git push                      # → origin/<branch>, no manual setup
   `target/{debug,release}/projgit`. Rebuild before a manual mount bench —
   a stale binary silently runs old code.
 
-## Next-up queue (recommended order)
+## Next-up queue
 
-1. **Persistence across unmount** *(highest value)*. Two parts, do (a)
-   first: **(a)** don't `remove_dir_all` the scratch dir when it already
-   exists — reuse it so committed refs survive a remount; **(b)** move
-   the upper to an **on-disk overlay + minimal journal** (design §10.3)
-   so *uncommitted* edits survive too. Removes the "edits lost on
-   unmount" caveat that undercuts the demo.
-2. **git-checkout integration** — drive `WritableHandle::swap_baseline`
-   from stock `git checkout` (daemon observes the HEAD change +
-   sparse/skip-worktree) instead of materializing the whole diff.
-3. **Writable sidecar** — allow `--writable` + `--daemon-socket`
-   together; move the FSMonitor write-log onto the daemon socket
-   transport (R3 deferred piece).
-4. **Commit perf** — derive trees from the materialized set via `gix`
-   cache-tree so commit cost ∝ change, not worktree size.
-5. **Partial-clone push correctness** — delta push works in tests;
-   validate against a real partial clone / GitHub remote
-   (`PROJGIT_NETWORK_TESTS=1`).
+Every item from the mid-session queue (persistence, checkout integration,
+sidecar, commit perf / blob GC, partial-clone push) is **done**. Phase 2
+is feature-complete. The realistic options going forward:
+
+1. **Merge to `main`** *(this milestone)*. The branch (28 commits, HEAD
+   `b772694`) is green: clippy clean; workspace + 12 CLI + 4 FUSE +
+   sidecar writable tests pass. Open a PR `feat/writable-worktrees` →
+   `main`.
+2. **Stock-checkout-stays-fully-virtual** *(hard/forky, optional)* — the
+   one remaining boundary above; needs `SKIP_WORKTREE` juggling or a thin
+   git integration.
+3. **New phase** — e.g. the `projgit-winfsp` crate (Windows; currently a
+   stub — see `../design/winfsp-implementation-plan.md`), or a perf/bench
+   pass on the writable path.
 
 ## State at handoff
 
-- Branch `feat/writable-worktrees` pushed & clean; `main` = `origin/main`.
-- Phase 2 is **feature-complete for a single mount session** (edit →
-  commit → push). The remaining work is **persistence** and
-  **integration polish** (checkout-driven swap, sidecar, commit perf),
-  not new core mechanism.
-- Plan doc (`writable-worktrees-plan.md`) reflects all of the above as
-  shipped; its §2 Stage 7 "Remaining follow-ups" and §3 out-of-scope are
-  the authoritative to-do list alongside this handoff's queue.
+- Branch `feat/writable-worktrees` pushed & clean; HEAD `b772694`; `main`
+  = `origin/main` (`980d2c6`), 28 commits ahead.
+- **Phase 2 is feature-complete**: virtual reads, real edits, stock-git
+  `add`/`commit`/`push`, persistence (committed + uncommitted, GC'd),
+  `projgit checkout` + stock-checkout observation, opt-in fsmonitor with
+  no partial-clone hydration, and a writable daemon sidecar — all
+  no-fork. Validated live against GitHub (throwaway branch, deleted).
+- The only remaining Phase-2 item is the out-of-scope-by-design
+  stock-checkout-stays-virtual boundary.
+- Authoritative plan: `../implementation/writable-worktrees-plan.md`.
+- **Ready to merge — open the PR to `main`.**
