@@ -1129,7 +1129,7 @@ where
     std::thread::Builder::new()
         .name("projgit-head-watcher".to_string())
         .spawn(move || {
-            let mut current = read_git_dir_head_commit(&scratch);
+            let mut current = resolve_head_commit_fast(&scratch);
             // Fresh projection id per swap so inode namespaces don't clash.
             let mut next_id = 2u64;
             while !stop.load(Ordering::Relaxed) {
@@ -1137,7 +1137,7 @@ where
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let head = read_git_dir_head_commit(&scratch);
+                let head = resolve_head_commit_fast(&scratch);
                 let Some(oid) = head else { continue };
                 if head == current {
                     continue;
@@ -1523,6 +1523,41 @@ fn read_git_dir_head_commit(git_dir: &Path) -> Option<gix::ObjectId> {
     }
     let hex = String::from_utf8_lossy(&out.stdout);
     gix::ObjectId::from_hex(hex.trim().as_bytes()).ok()
+}
+
+/// Resolve a git dir's `HEAD` commit by reading files directly (no `git`
+/// subprocess) — for the hot HEAD-watcher poll loop. Handles a symbolic
+/// `HEAD` (loose ref, then `packed-refs`) and a detached `HEAD`. Returns
+/// `None` if it can't parse (the watcher treats that as "no change").
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_head_commit_fast(git_dir: &Path) -> Option<gix::ObjectId> {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let refname = match head.strip_prefix("ref: ") {
+        Some(r) => r.trim(),
+        // Detached HEAD: the file is the commit oid.
+        None => return gix::ObjectId::from_hex(head.as_bytes()).ok(),
+    };
+    // Loose ref file wins over packed-refs.
+    if let Ok(s) = std::fs::read_to_string(git_dir.join(refname)) {
+        if let Ok(oid) = gix::ObjectId::from_hex(s.trim().as_bytes()) {
+            return Some(oid);
+        }
+    }
+    // Fall back to packed-refs.
+    let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    for line in packed.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+        if let Some((oid, name)) = line.split_once(' ') {
+            if name.trim() == refname {
+                return gix::ObjectId::from_hex(oid.trim().as_bytes()).ok();
+            }
+        }
+    }
+    None
 }
 
 /// Build a `packed-refs` snapshot of the source's branches + tags so a

@@ -298,7 +298,16 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    `writable_mount_cli.rs::cli_writable_checkout_reprojects_under_live_mount`
    (switch `main`→`feature` under a live mount: worktree re-projects,
    main-only file disappears, feature-only appears, and a local edit to a
-   shared file survives). *Boundary (documented):* making **stock** `git
+   shared file survives). **Refinement (2026-07-18):** every
+   `swap_baseline` now **reconciles the upper against the new baseline**
+   (drops edits the new commit already carries, recomputes the dirty set,
+   compacts the journal), so stock `git checkout`/`commit` (eager
+   materialize) and `projgit checkout` (stays virtual) converge to the
+   same lean upper — and a change that became part of history no longer
+   shadows a later checkout as a phantom edit
+   (`cli_writable_reconcile_drops_edit_the_baseline_carries`). The watcher
+   also resolves `HEAD` by reading the ref files directly instead of
+   forking `git rev-parse` each poll. *Boundary (documented):* making **stock** `git
    checkout` stay fully virtual for unmodified files needs `SKIP_WORKTREE`
    management (racy index writes) or a thin `core.virtualfilesystem`-style
    patch — out of scope; stock checkout still works but eagerly

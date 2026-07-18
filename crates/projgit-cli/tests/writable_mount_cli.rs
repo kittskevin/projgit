@@ -107,6 +107,18 @@ fn wait_for_content(path: &Path, expected: &str, timeout: Duration) -> bool {
     false
 }
 
+/// Poll `cond` until it is true (or timeout).
+fn wait_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 struct DirGuard(PathBuf);
 impl Drop for DirGuard {
     fn drop(&mut self) {
@@ -551,6 +563,91 @@ fn cli_writable_checkout_reprojects_under_live_mount() {
         !s.contains("dir/f.txt"),
         "re-projected files must be clean:\n{s}"
     );
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_reconcile_drops_edit_the_baseline_carries() {
+    // reconcile-on-swap: an edit whose content matches the branch you
+    // check out is dropped from the upper, so it does NOT shadow a later
+    // checkout of a branch that lacks it. (A change that becomes part of
+    // the baseline must not behave like a phantom local edit.)
+    let base = std::env::temp_dir().join(format!("projgit-cli-reconcile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    // `main`: x.txt = "base"; `feature`: x.txt = "edited" + a marker file.
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::write(src.join("x.txt"), b"base\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "main"]);
+    git_ok(&src, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(src.join("x.txt"), b"edited\n").unwrap();
+    std::fs::write(src.join("marker.txt"), b"F\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "feature"]);
+    git_ok(&src, &["checkout", "-q", "main"]);
+
+    let mut child = spawn_writable(&src, &mnt, &cache);
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(10)),
+        "mount never came up"
+    );
+    assert_eq!(std::fs::read_to_string(mnt.join("x.txt")).unwrap(), "base\n");
+    assert!(!mnt.join("marker.txt").exists());
+
+    // Materialize an edit to x.txt that happens to equal feature's version.
+    std::fs::write(mnt.join("x.txt"), b"edited\n").unwrap();
+
+    // Check out feature; wait until the swap is observed (marker appears).
+    // reconcile then drops the x.txt edit because it equals feature's x.txt.
+    let out = Command::new(PROJGIT_BIN)
+        .args(["checkout", "-C"])
+        .arg(&mnt)
+        .arg("feature")
+        .output()
+        .expect("spawn projgit checkout feature");
+    assert!(out.status.success(), "checkout feature failed");
+    assert!(
+        wait_until(|| mnt.join("marker.txt").exists(), Duration::from_secs(10)),
+        "never re-projected to feature"
+    );
+
+    // Check out main again; wait until observed (marker gone).
+    let out = Command::new(PROJGIT_BIN)
+        .args(["checkout", "-C"])
+        .arg(&mnt)
+        .arg("main")
+        .output()
+        .expect("spawn projgit checkout main");
+    assert!(out.status.success(), "checkout main failed");
+    assert!(
+        wait_until(|| !mnt.join("marker.txt").exists(), Duration::from_secs(10)),
+        "never re-projected back to main"
+    );
+
+    // x.txt is main's content: the edit was reconciled away when it became
+    // part of the feature baseline, so it does NOT shadow main. (Without
+    // reconcile-on-swap it would still read "edited\n" and status dirty.)
+    assert!(
+        wait_for_content(&mnt.join("x.txt"), "base\n", Duration::from_secs(10)),
+        "committed/redundant edit must not shadow the checkout: {:?}",
+        std::fs::read_to_string(mnt.join("x.txt"))
+    );
+    let s = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(s.trim().is_empty(), "status must be clean after checkout:\n{s}");
 
     // Tear down.
     let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();

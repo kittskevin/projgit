@@ -186,7 +186,24 @@ fn replay_into_upper<F: FsProvider>(
         }
     }
 
-    // Reconcile edits against the baseline.
+    let snapshot = reconcile_upper(up, lower);
+    up.fsm_token = now_nanos();
+    snapshot
+}
+
+/// Reconcile the upper against the (current) lower baseline: an edit
+/// whose content + mode already match the baseline — i.e. the baseline
+/// (a re-pinned HEAD after a commit, or a checked-out commit) already
+/// carries it — is **dropped**; a surviving edit gets its `from_lower`
+/// from whether the path exists in the baseline; a whiteout of a path
+/// absent from the baseline is dropped. Recomputes the FSMonitor
+/// changed-set and returns the compacted snapshot of survivors.
+///
+/// Called both when replaying the journal at mount and after a
+/// `swap_baseline` (checkout), so stock `git checkout`/`commit` (which
+/// eagerly materialize) and `projgit checkout` (which keeps files
+/// virtual) converge to the same lean upper.
+fn reconcile_upper<F: FsProvider>(up: &mut Upper, lower: &Arc<F>) -> Vec<Record> {
     let mut drop_edits = Vec::new();
     for (path, edit) in up.edits.iter_mut() {
         match lower_resolve_path(lower, path) {
@@ -212,15 +229,14 @@ fn replay_into_upper<F: FsProvider>(
     up.whiteouts
         .retain(|p| lower_resolve_path(lower, p).is_some());
 
-    // Seed the FSMonitor changed-set + token from what survived, so git
-    // (with fsmonitor) rescans exactly the restored paths.
+    // Recompute the FSMonitor changed-set from what survived, so git
+    // (with fsmonitor) rescans exactly the still-dirty paths.
     up.modified_paths = up
         .edits
         .keys()
         .cloned()
         .chain(up.whiteouts.iter().cloned())
         .collect();
-    up.fsm_token = now_nanos();
 
     snapshot_records(up)
 }
@@ -397,6 +413,7 @@ impl<F: FsProvider> WritableFs<F> {
             up: self.up.clone(),
             inval: self.inval.clone(),
             fsmonitor_file: self.fsmonitor_file.clone(),
+            journal: self.journal.clone(),
         }
     }
 
@@ -1037,6 +1054,7 @@ pub struct WritableHandle<F: FsProvider> {
     up: Arc<Mutex<Upper>>,
     inval: Option<Sender<Inval>>,
     fsmonitor_file: Option<std::path::PathBuf>,
+    journal: Option<Arc<UpperJournal>>,
 }
 
 impl<F: FsProvider> WritableHandle<F> {
@@ -1047,10 +1065,16 @@ impl<F: FsProvider> WritableHandle<F> {
     /// cleared; the kernel's attr + entry caches for every previously
     /// looked-up inode are invalidated (off-thread) so unmodified files
     /// re-virtualize to `new_lower`.
+    ///
+    /// The upper is then **reconciled** against the new baseline: any
+    /// edit the new commit already carries is dropped, so a stock `git
+    /// checkout`/`commit` (which eagerly materializes) and a `projgit
+    /// checkout` (which keeps files virtual) converge to the same lean
+    /// upper, and the crash journal is compacted to match.
     pub fn swap_baseline(&self, new_lower: Arc<F>) {
         let mut up = self.up.lock().unwrap();
         // Point the overlay at the new baseline.
-        *self.lower.lock().unwrap() = new_lower;
+        *self.lower.lock().unwrap() = new_lower.clone();
         // Re-lookup everything: the kernel must drop dentries (a changed
         // file's inode differs in the new baseline) and re-read data.
         if let Some(tx) = &self.inval {
@@ -1059,15 +1083,24 @@ impl<F: FsProvider> WritableHandle<F> {
                 let _ = tx.send(Inval::Inode(*ino));
             }
         }
-        // Clear the per-baseline inode cache; `edits` / `whiteouts` /
-        // `modified_paths` survive (path-keyed).
+        // Clear the per-baseline inode cache; `edits` / `whiteouts`
+        // survive (path-keyed).
         up.inode_paths.clear();
         up.inode_parent_name.clear();
         up.path_inode.clear();
+        // Drop edits the new baseline already carries; recompute the
+        // dirty set. Returns the compacted survivor snapshot.
+        let live = reconcile_upper(&mut up, &new_lower);
         // Advance the FSMonitor token so a watcher sees state changed.
         up.fsm_token = now_nanos().max(up.fsm_token + 1);
         if let Some(p) = &self.fsmonitor_file {
             write_fsm(p, up.fsm_token, &up.modified_paths);
+        }
+        drop(up);
+        // Keep the on-disk journal in step so it doesn't accumulate
+        // now-committed edits across many checkouts in a long session.
+        if let Some(j) = &self.journal {
+            let _ = j.compact(&live);
         }
     }
 }
