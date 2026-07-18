@@ -507,6 +507,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     //    `git`'s promisor mechanism uses whatever remote the partial
     //    clone configured (typically `origin`).
     let _remote_hint = &args.remote;
+    let mut upper_dir: Option<PathBuf> = None;
     let (overlay, writable) = if args.writable {
         let requested_oid = projection
             .resolve_commit(&store)
@@ -534,14 +535,17 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
             (None, _) => "detached HEAD".to_string(),
         };
         let state = if wt.reused {
-            "reused — committed work restored; commit to persist new edits"
+            "reused — prior work restored (committed + uncommitted edits)"
         } else {
-            "fresh — commit to persist across unmount"
+            "fresh — changes persist across unmount"
         };
         eprintln!(
             "projgit: writable mount — {where_} — git dir {} ({state})",
             wt.path.display()
         );
+        // Persist the uncommitted upper (materialized edits + whiteouts)
+        // alongside the scratch git dir, so it survives an unmount.
+        upper_dir = Some(wt.path.join("projgit-upper"));
         (build_writable_overlay(&wt.path)?, true)
     } else {
         (build_root_overlay(&args, &projection, &store, &git_dir)?, false)
@@ -550,6 +554,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     if args.allow_other {
         cfg.acl = projgit_fuse::SessionACL::All;
     }
+    cfg.upper_dir = upper_dir;
     let mp = args.mountpoint.clone();
     let print_stats = args.stats;
 

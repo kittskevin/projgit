@@ -32,6 +32,7 @@
 //! mount), so there is no clash with dotgit synthetic inodes.
 
 use crate::adapter::{errno_for, to_fuser_attr, to_fuser_kind};
+use crate::upper_journal::{self, Record, UpperJournal};
 use fuser::{
     Config, FileHandle, Filesystem, FopenFlags, Generation, INodeNo, MountOption, OpenFlags,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
@@ -43,6 +44,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -111,6 +113,141 @@ fn basename(path: &str) -> &str {
         Some(i) => &path[i + 1..],
         None => path,
     }
+}
+
+/// Resolve a worktree-relative `path` against the lower baseline,
+/// returning `(inode, attr)` if it exists there (walks from the root).
+fn lower_resolve_path<F: FsProvider>(lower: &Arc<F>, path: &str) -> Option<(u64, Attr)> {
+    let mut ino = projgit_core::ROOT_INODE;
+    let mut attr = lower.getattr(ino).ok()?;
+    if path.is_empty() {
+        return Some((ino, attr));
+    }
+    for comp in path.split('/') {
+        attr = lower.lookup(ino, comp.as_bytes()).ok()?;
+        ino = attr.inode;
+    }
+    Some((ino, attr))
+}
+
+/// Read a lower file's full bytes (best effort; stops at first error).
+fn lower_read_all<F: FsProvider>(lower: &Arc<F>, ino: u64, size: u64) -> Vec<u8> {
+    let mut content = Vec::with_capacity(size as usize);
+    let mut off = 0u64;
+    while off < size {
+        match lower.read(ino, off, 64 * 1024) {
+            Ok(chunk) if !chunk.is_empty() => {
+                off += chunk.len() as u64;
+                content.extend_from_slice(&chunk);
+            }
+            _ => break,
+        }
+    }
+    content
+}
+
+/// Apply replayed journal [`Record`]s into `up`, then **reconcile**
+/// against the lower baseline: an edit whose content + mode already
+/// match the baseline (i.e. it was committed, so the re-pinned HEAD now
+/// carries it) is dropped; a surviving edit gets its `from_lower` set
+/// from whether the path exists in the baseline; a whiteout of a path
+/// absent from the baseline is dropped. Returns the compacted snapshot
+/// of what survived (for [`UpperJournal::compact`]).
+fn replay_into_upper<F: FsProvider>(
+    up: &mut Upper,
+    lower: &Arc<F>,
+    records: Vec<Record>,
+) -> Vec<Record> {
+    for r in records {
+        match r {
+            Record::Set { path, kind, mode, content } => {
+                up.whiteouts.remove(&path);
+                up.edits.insert(
+                    path,
+                    Edit { kind, mode, content, from_lower: false },
+                );
+            }
+            Record::Mkdir { path, mode } => {
+                up.whiteouts.remove(&path);
+                up.edits.insert(
+                    path,
+                    Edit {
+                        kind: FileType::Directory,
+                        mode,
+                        content: Vec::new(),
+                        from_lower: false,
+                    },
+                );
+            }
+            Record::Whiteout { path } => {
+                up.edits.remove(&path);
+                up.whiteouts.insert(path);
+            }
+        }
+    }
+
+    // Reconcile edits against the baseline.
+    let mut drop_edits = Vec::new();
+    for (path, edit) in up.edits.iter_mut() {
+        match lower_resolve_path(lower, path) {
+            Some((ino, attr)) => {
+                if matches!(edit.kind, FileType::RegularFile)
+                    && matches!(attr.kind, FileType::RegularFile)
+                    && (attr.mode & 0o777) == edit.mode
+                    && lower_read_all(lower, ino, attr.size) == edit.content
+                {
+                    // Identical to the baseline (committed / unchanged).
+                    drop_edits.push(path.clone());
+                } else {
+                    edit.from_lower = true;
+                }
+            }
+            None => edit.from_lower = false,
+        }
+    }
+    for p in &drop_edits {
+        up.edits.remove(p);
+    }
+    // A whiteout only means something if the path exists in the baseline.
+    up.whiteouts
+        .retain(|p| lower_resolve_path(lower, p).is_some());
+
+    // Seed the FSMonitor changed-set + token from what survived, so git
+    // (with fsmonitor) rescans exactly the restored paths.
+    up.modified_paths = up
+        .edits
+        .keys()
+        .cloned()
+        .chain(up.whiteouts.iter().cloned())
+        .collect();
+    up.fsm_token = now_nanos();
+
+    snapshot_records(up)
+}
+
+/// The current upper state as an ordered list of journal records (for
+/// compaction after a reconcile).
+fn snapshot_records(up: &Upper) -> Vec<Record> {
+    let mut recs = Vec::with_capacity(up.edits.len() + up.whiteouts.len());
+    for (path, edit) in &up.edits {
+        if matches!(edit.kind, FileType::Directory) {
+            recs.push(Record::Mkdir {
+                path: path.clone(),
+                mode: edit.mode,
+            });
+        } else {
+            recs.push(Record::Set {
+                path: path.clone(),
+                kind: edit.kind,
+                mode: edit.mode,
+                content: edit.content.clone(),
+            });
+        }
+    }
+    for path in &up.whiteouts {
+        recs.push(Record::Whiteout { path: path.clone() });
+    }
+    recs
 }
 
 /// Write the FSMonitor write-log file: `<token>\0 <path>\0 ...`. A
@@ -191,6 +328,9 @@ pub struct WritableFs<F: FsProvider> {
     /// Cone-mode sparse-checkout directories (Stage 5 / R2). Empty =>
     /// everything visible.
     cone: Vec<String>,
+    /// Optional crash journal persisting the upper across unmount
+    /// (Stage 7 / §10.3). `None` => in-memory only.
+    journal: Option<Arc<UpperJournal>>,
 }
 
 impl<F: FsProvider> WritableFs<F> {
@@ -204,28 +344,44 @@ impl<F: FsProvider> WritableFs<F> {
             ttl: Duration::ZERO,
             fsmonitor_file: None,
             cone: Vec::new(),
+            journal: None,
         }
     }
 
     /// Like [`Self::new`] but with an off-thread invalidator (enabling a
-    /// useful cache TTL), an optional FSMonitor write-log, and an
-    /// optional sparse cone.
+    /// useful cache TTL), an optional FSMonitor write-log, an optional
+    /// sparse cone, and an optional upper crash journal (replayed +
+    /// reconciled against the baseline before mount).
     fn with_invalidator(
         lower: Arc<F>,
         inval: Sender<Inval>,
-        fsmonitor_file: Option<std::path::PathBuf>,
+        fsmonitor_file: Option<PathBuf>,
         cone: Vec<String>,
+        upper_dir: Option<PathBuf>,
     ) -> Self {
+        let mut up = Upper::default();
+        let journal = upper_dir.and_then(|dir| match UpperJournal::open(&dir) {
+            Ok(j) => {
+                // Restore uncommitted edits: replay the journal, reconcile
+                // against the (re-pinned) baseline so committed/unchanged
+                // entries drop out, then compact to that snapshot.
+                let live = replay_into_upper(&mut up, &lower, upper_journal::replay(&dir));
+                let _ = j.compact(&live);
+                Some(Arc::new(j))
+            }
+            Err(_) => None,
+        });
         if let Some(p) = &fsmonitor_file {
-            write_fsm(p, now_nanos(), &BTreeSet::new());
+            write_fsm(p, up.fsm_token.max(now_nanos()), &up.modified_paths);
         }
         Self {
             lower: Arc::new(Mutex::new(lower)),
-            up: Arc::new(Mutex::new(Upper::default())),
+            up: Arc::new(Mutex::new(up)),
             inval: Some(inval),
             ttl: WRITABLE_TTL,
             fsmonitor_file,
             cone,
+            journal,
         }
     }
 
@@ -291,6 +447,28 @@ impl<F: FsProvider> WritableFs<F> {
         up.fsm_token = now_nanos().max(up.fsm_token + 1);
         if let Some(p) = &self.fsmonitor_file {
             write_fsm(p, up.fsm_token, &up.modified_paths);
+        }
+    }
+
+    /// Persist a set (create/modify of a file/symlink) to the crash
+    /// journal, if one is attached. No-op otherwise.
+    fn journal_set(&self, path: &str, kind: FileType, mode: u16, content: &[u8]) {
+        if let Some(j) = &self.journal {
+            j.record_set(path, kind, mode, content);
+        }
+    }
+
+    /// Persist a created directory to the crash journal, if attached.
+    fn journal_mkdir(&self, path: &str, mode: u16) {
+        if let Some(j) = &self.journal {
+            j.record_mkdir(path, mode);
+        }
+    }
+
+    /// Persist a whiteout (deletion) to the crash journal, if attached.
+    fn journal_whiteout(&self, path: &str) {
+        if let Some(j) = &self.journal {
+            j.record_whiteout(path);
         }
     }
 
@@ -576,6 +754,11 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             if let Some(edit) = up.edits.get_mut(&path) {
                 edit.content.resize(newsize as usize, 0);
             }
+            if let Some(j) = &self.journal {
+                if let Some(e) = up.edits.get(&path) {
+                    j.record_set(&path, e.kind, e.mode, &e.content);
+                }
+            }
             self.record_change(&mut up, path);
         }
         let attr = self.attr_for(&up, ino.0);
@@ -623,6 +806,10 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             }
             edit.content[start..end].copy_from_slice(data);
         }
+        if let Some(j) = &self.journal {
+            let e = up.edits.get(&path).unwrap();
+            j.record_set(&path, e.kind, e.mode, &e.content);
+        }
         self.record_change(&mut up, path);
         drop(up);
         self.invalidate_inode(ino.0);
@@ -656,6 +843,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         let ino = self.created_inode(&mut up, &path);
         up.inode_paths.insert(ino, path.clone());
         up.inode_parent_name.insert(ino, (parent.0, name.to_vec()));
+        self.journal_set(&path, FileType::RegularFile, (mode as u16) & 0o777, &[]);
         self.record_change(&mut up, path);
         let attr = self.attr_for(&up, ino);
         drop(up);
@@ -698,6 +886,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         let ino = self.created_inode(&mut up, &path);
         up.inode_paths.insert(ino, path.clone());
         up.inode_parent_name.insert(ino, (parent.0, name.to_vec()));
+        self.journal_mkdir(&path, (mode as u16) & 0o777);
         let attr = self.attr_for(&up, ino);
         drop(up);
         self.invalidate_entry(parent.0, name);
@@ -715,6 +904,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         up.edits.remove(&path);
         up.path_inode.remove(&path);
         up.whiteouts.insert(path.clone());
+        self.journal_whiteout(&path);
         self.record_change(&mut up, path);
         drop(up);
         self.invalidate_entry(parent.0, name);
@@ -787,6 +977,16 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         }
         up.whiteouts.remove(&dst_path);
         up.whiteouts.insert(src_path.clone());
+        if let Some(j) = &self.journal {
+            j.record_whiteout(&src_path);
+            if let Some(e) = up.edits.get(&dst_path) {
+                if matches!(e.kind, FileType::Directory) {
+                    j.record_mkdir(&dst_path, e.mode);
+                } else {
+                    j.record_set(&dst_path, e.kind, e.mode, &e.content);
+                }
+            }
+        }
         self.record_change(&mut up, src_path);
         self.record_change(&mut up, dst_path);
         drop(up);
@@ -898,6 +1098,7 @@ pub fn mount_writable_background_with_handle<F: FsProvider + 'static>(
         tx,
         config.fsmonitor_file.clone(),
         config.sparse_cone.clone(),
+        config.upper_dir.clone(),
     );
     let handle = fs.handle();
     let mut fc = Config::default();

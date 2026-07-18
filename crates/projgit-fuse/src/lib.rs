@@ -33,6 +33,8 @@ mod adapter;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod mount;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod upper_journal;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod writable;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

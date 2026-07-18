@@ -7,10 +7,11 @@
 > verdict in its `RESULTS.md`).
 >
 > Last updated: 2026-07-18 (**Stages 1–7 shipped**; **CLI `--writable`
-> shipped** with branch + remote wiring **and committed-work persistence
-> across unmount** — the scratch git dir is reused, not recreated, and its
-> objects are shared into the CAS. Remaining: the *uncommitted* in-memory
-> upper, git-checkout integration, and the crash journal).
+> shipped** with branch + remote wiring, committed-work persistence, **and
+> an uncommitted-upper crash journal** — materialized edits + whiteouts
+> now survive an unmount and replay reconciled against the baseline.
+> Remaining: git-checkout integration; the daemon-socket FSMonitor /
+> writable-sidecar track).
 >
 > Design in [`../design/writable-worktrees.md`](../design/writable-worktrees.md);
 > this is one level down — concrete stages, file changes, and what each
@@ -166,6 +167,25 @@ clean `status`, and the edited + new files are all restored). Remaining:
 the *uncommitted* in-memory upper (edits not yet committed are still lost
 on unmount — the on-disk upper / journal below).
 
+**Uncommitted-upper crash journal (SHIPPED 2026-07-18).** The upper
+(materialized/created files + whiteouts) is now persisted so *uncommitted*
+edits also survive an unmount (design §10.3). `projgit-fuse` gained an
+`upper_journal` module: each mutation appends a small record to an
+append-only, `fsync`ed `journal` and writes file bytes to a
+content-addressed `blobs/` store keyed by git blob oid
+(`projgit_core::blob_oid_hex`). On mount the journal is **replayed and
+reconciled against the (re-pinned) baseline**: an edit whose content +
+mode already match the baseline (i.e. it was committed, so `HEAD` now
+carries it) is dropped, surviving edits get their `from_lower` from the
+baseline, and whiteouts of absent paths are dropped; the journal is then
+compacted to that snapshot. Crash-safe: blobs are temp+rename, the
+journal is append-only with a torn tail skipped on replay, and the LOWER
+baseline is immutable. Wired via `MountConfig::upper_dir`, which the CLI
+points at `<scratch>/projgit-upper/`. Proved by
+`writable_mount_cli.rs::cli_writable_mount_persists_uncommitted_edits_across_remount`
+(edit + new file, **no commit**, unmount, remount → bytes restored,
+`status` still `M`/`??`, and the restored edits are committable).
+
 ### Stage 3 — R4: FUSE invalidation on write  *(SHIPPED 2026-06-19)*
 
 **What.** `WritableFs` now carries an optional off-thread invalidator:
@@ -267,14 +287,16 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    (update HEAD/index + `swap_baseline`) instead of materializing the
    whole diff into the worktree — the daemon observing the HEAD change
    + sparse/skip-worktree is the likely seam.
-2. **Crash consistency / uncommitted-edit durability**: *committed* work
-   now persists (scratch dir reuse + shared-CAS objects, above), but the
-   upper is still in-memory, so *uncommitted* edits are lost on unmount.
-   Move the upper to an on-disk overlay, then add a minimal journal
-   (§10.3). Small blast radius (immutable LOWER), but nonzero.
+2. **Crash consistency / uncommitted-edit durability** — **SHIPPED**
+   2026-07-18. *Committed* work persists (scratch dir reuse + shared-CAS
+   objects) and *uncommitted* edits persist via the upper crash journal
+   (append-only journal + content-addressed blobs, replayed + reconciled
+   against the baseline; §10.3). Possible follow-ups: blob GC of the
+   content store, and linking journal blobs directly into the odb so
+   `commit` derives trees from them (Stage 6 perf).
 
-**Recommended order for the follow-ups:** on-disk upper (uncommitted-edit
-durability) → git-checkout integration → journal.
+**Recommended order for the remaining follow-ups:** git-checkout
+integration → daemon-socket FSMonitor / writable sidecar.
 
 ## 3. Out of scope (this plan)
 

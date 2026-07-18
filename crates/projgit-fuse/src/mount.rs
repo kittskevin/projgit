@@ -36,6 +36,12 @@ pub struct MountConfig {
     /// (see `docs/implementation/writable-worktrees-plan.md` Stage 5 /
     /// R2). Empty => everything is visible.
     pub sparse_cone: Vec<String>,
+    /// Optional directory for the writable **upper** crash journal. When
+    /// set on a writable mount, materialized/created files + whiteouts
+    /// are persisted here (append-only journal + content-addressed
+    /// blobs) and replayed on the next mount, so *uncommitted* edits
+    /// survive an unmount (design §10.3). No effect on read-only mounts.
+    pub upper_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for MountConfig {
@@ -47,6 +53,7 @@ impl Default for MountConfig {
             n_threads: None,
             fsmonitor_file: None,
             sparse_cone: Vec::new(),
+            upper_dir: None,
         }
     }
 }

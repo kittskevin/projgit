@@ -331,3 +331,101 @@ fn cli_writable_mount_persists_commit_across_remount() {
     let _ = child2.kill();
     let _ = child2.wait();
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_mount_persists_uncommitted_edits_across_remount() {
+    // Uncommitted work survives an unmount too: edit + create WITHOUT
+    // committing, unmount, then remount and find the materialized upper
+    // (edited bytes + new file) restored and `status` still dirty — the
+    // upper crash journal is replayed and reconciled against the baseline.
+    let base = std::env::temp_dir().join(format!("projgit-cli-draft-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    // Source repo with one commit.
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    std::fs::write(src.join("dir/f.txt"), b"hello\nworld\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "init"]);
+
+    // --- First mount: edit + create, but DO NOT commit. ---
+    let mut child = spawn_writable(&src, &mnt, &cache);
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(10)),
+        "mount 1 never came up"
+    );
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mnt.join("dir/f.txt"))
+            .unwrap();
+        f.write_all(b"DRAFT\n").unwrap();
+    }
+    std::fs::write(mnt.join("dir/draft.txt"), b"wip\n").unwrap();
+    let head1 = git_ok(&mnt, &["rev-parse", "HEAD"]).trim().to_string();
+    let s1 = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(s1.contains("M dir/f.txt"), "pre-unmount edit must show:\n{s1}");
+    assert!(
+        s1.contains("?? dir/draft.txt"),
+        "pre-unmount new file must show:\n{s1}"
+    );
+
+    // Unmount without committing.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        wait_for_unmount(&mnt, Duration::from_secs(10)),
+        "mount 1 never unmounted"
+    );
+
+    // --- Second mount: uncommitted edits restored from the journal. ---
+    let mut child2 = spawn_writable(&src, &mnt, &cache);
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(10)),
+        "mount 2 never came up"
+    );
+
+    // No commit happened, so HEAD is unchanged.
+    let head2 = git_ok(&mnt, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(head2, head1, "HEAD must not have moved (no commit)");
+
+    // The materialized bytes are back in the worktree...
+    let f = std::fs::read_to_string(mnt.join("dir/f.txt")).unwrap();
+    assert_eq!(f, "hello\nworld\nDRAFT\n", "uncommitted edit must be restored");
+    let d = std::fs::read_to_string(mnt.join("dir/draft.txt")).unwrap();
+    assert_eq!(d, "wip\n", "uncommitted new file must be restored");
+
+    // ...and git still sees them as pending changes.
+    let s2 = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(
+        s2.contains("M dir/f.txt"),
+        "restored edit must still be modified:\n{s2}"
+    );
+    assert!(
+        s2.contains("?? dir/draft.txt"),
+        "restored new file must still be untracked:\n{s2}"
+    );
+
+    // And they can now be committed normally.
+    git_ok(&mnt, &["add", "-A"]);
+    let (ok, _) = git(&mnt, &["commit", "-m", "commit the restored draft"]);
+    assert!(ok, "restored edits must be committable");
+    let committed = git_ok(&mnt, &["cat-file", "-p", "HEAD:dir/f.txt"]);
+    assert_eq!(committed, "hello\nworld\nDRAFT\n");
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child2.kill();
+    let _ = child2.wait();
+}
