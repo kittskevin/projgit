@@ -29,6 +29,7 @@
 //! ```
 
 use projgit_core::FileType;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -130,16 +131,22 @@ impl UpperJournal {
 
     /// Rewrite the journal as a compact snapshot of the still-live
     /// `sets` (whiteouts included via [`Record::Whiteout`]) after a
-    /// reconcile dropped committed/absent entries. Crash-safe: writes a
-    /// sibling temp file, then renames over the journal.
+    /// reconcile dropped committed/absent entries, then **garbage-collect
+    /// stale blobs** — content-addressed blobs no longer referenced by
+    /// the compacted journal (e.g. earlier versions of a re-edited file).
+    /// Crash-safe: writes a sibling temp file, then renames over the
+    /// journal; GC runs only after the rename, so a crash leaves at most
+    /// unreferenced blobs (reclaimed on the next compaction).
     pub(crate) fn compact(&self, records: &[Record]) -> std::io::Result<()> {
         let tmp = self.journal_path.with_extension("compact");
+        let mut live: HashSet<String> = HashSet::new();
         {
             let mut f = File::create(&tmp)?;
             for r in records {
                 match r {
                     Record::Set { path, kind, mode, content } => {
                         let oid = self.write_blob(content)?;
+                        live.insert(oid.clone());
                         let k = if matches!(kind, FileType::Symlink) { 'l' } else { 'f' };
                         writeln!(f, "S {oid} {mode:o} {k} {}", hex_encode(path.as_bytes()))?;
                     }
@@ -154,6 +161,18 @@ impl UpperJournal {
             f.sync_data()?;
         }
         fs::rename(&tmp, &self.journal_path)?;
+        // GC: drop blobs not referenced by the compacted journal (skip
+        // in-flight temp files).
+        if let Ok(entries) = fs::read_dir(&self.blobs) {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(".tmp-") || live.contains(name.as_ref()) {
+                    continue;
+                }
+                let _ = fs::remove_file(e.path());
+            }
+        }
         // Reopen the appender on the freshly compacted file.
         if let Ok(mut guard) = self.log.lock() {
             *guard = OpenOptions::new()

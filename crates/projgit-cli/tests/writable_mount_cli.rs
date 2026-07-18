@@ -63,6 +63,29 @@ fn find_clone_dir(cache: &Path) -> PathBuf {
         .expect("clone dir under cache")
 }
 
+/// The upper journal's content-addressed `blobs/` directory (under the
+/// reused scratch git dir), if it exists.
+fn find_upper_blobs(cache: &Path) -> Option<PathBuf> {
+    for e in std::fs::read_dir(cache.join("worktrees")).ok()?.flatten() {
+        let blobs = e.path().join("projgit-upper").join("blobs");
+        if blobs.is_dir() {
+            return Some(blobs);
+        }
+    }
+    None
+}
+
+/// Count non-temp files in `dir`.
+fn count_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|it| {
+            it.flatten()
+                .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp-"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn wait_for_mount(mp: &Path, timeout: Duration) -> bool {
     let parent_dev = mp
         .parent()
@@ -1032,4 +1055,70 @@ fn cli_writable_fsmonitor_avoids_partial_clone_hydration() {
     let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn cli_writable_journal_gcs_stale_blobs() {
+    // The upper journal's content-addressed blob store accumulates a blob
+    // per distinct file version during editing; compaction (on remount or
+    // checkout) garbage-collects the ones no longer referenced, so the
+    // store doesn't grow unbounded.
+    let base = std::env::temp_dir().join(format!("projgit-cli-gc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let mnt = base.join("mnt");
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    std::fs::create_dir_all(&src).unwrap();
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    std::fs::write(src.join("dir/f.txt"), b"original\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "init"]);
+
+    // --- Mount 1: rewrite the same file with distinct contents. ---
+    let mut child = spawn_writable(&src, &mnt, &cache);
+    assert!(wait_for_mount(&mnt, Duration::from_secs(10)), "mount 1 up");
+    std::fs::write(mnt.join("dir/f.txt"), b"content-one\n").unwrap();
+    std::fs::write(mnt.join("dir/f.txt"), b"content-two\n").unwrap();
+    std::fs::write(mnt.join("dir/f.txt"), b"content-three\n").unwrap();
+
+    // The blob store accumulated multiple versions (no compaction mid-session).
+    let blobs = find_upper_blobs(&cache).expect("upper blobs dir");
+    let during = count_files(&blobs);
+    assert!(
+        during >= 2,
+        "blob store should accumulate file versions during editing, got {during}"
+    );
+
+    // Unmount + remount → replay + reconcile + compaction, which GCs stale blobs.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(wait_for_unmount(&mnt, Duration::from_secs(10)), "unmounted");
+
+    let mut child2 = spawn_writable(&src, &mnt, &cache);
+    assert!(wait_for_mount(&mnt, Duration::from_secs(10)), "mount 2 up");
+
+    // The latest edit survived...
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("dir/f.txt")).unwrap(),
+        "content-three\n"
+    );
+    // ...and only the one live blob remains (the stale versions are gone).
+    let after = count_files(&blobs);
+    assert_eq!(
+        after, 1,
+        "compaction must GC stale blobs, keeping only the live one (was {during}, now {after})"
+    );
+
+    // Tear down.
+    let _ = Command::new("fusermount").args(["-u"]).arg(&mnt).status();
+    let _ = child2.kill();
+    let _ = child2.wait();
 }

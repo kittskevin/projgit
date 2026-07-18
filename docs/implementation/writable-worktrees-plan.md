@@ -383,9 +383,21 @@ checkout (`dir/x.txt` = `two\nEDIT\n`, shadowing A's `one\n`).
    Proved by `cli_writable_fsmonitor_avoids_partial_clone_hydration` (real
    partial clone with `uploadpack.allowFilter`: missing-blob count is
    unchanged across the first `status`; without the seed it drops to 0).
+5. **Upper blob GC** — **SHIPPED** 2026-07-18. The journal's
+   content-addressed `blobs/` store gained a blob per distinct file
+   version; `UpperJournal::compact` (run on remount/checkout) now
+   garbage-collects blobs no longer referenced by the compacted journal,
+   so the store stays bounded. Committed edits' blobs are reclaimed too
+   (reconcile drops them from the live set). Proved by
+   `cli_writable_journal_gcs_stale_blobs` (3 rewrites accumulate blobs;
+   after a remount only the one live blob remains). *Note:* this largely
+   subsumes the "link journal blobs into the odb" idea \u2014 with GC the
+   journal store holds only *uncommitted* edits and is reclaimed after
+   commit, so the odb duplication is small and bounded; the remaining
+   win (skip git's odb write on `add`) is marginal and would couple
+   projgit-fuse to git object encoding, so it's deferred.
 
-**Recommended order for the remaining follow-ups:** blob GC of the upper
-content store / odb-linked commit perf; then the stock-checkout
+**Recommended order for the remaining follow-ups:** the stock-checkout
 `SKIP_WORKTREE` / thin-patch investigation if a workload demands O(1)
 *stock* checkout.
 
