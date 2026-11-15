@@ -9,7 +9,7 @@
 > OID-keyed on-disk blob cache on the host) load-bearing rather than a
 > tail optimization: it eliminates per-read decompression across VMs,
 > enables `O(range)` random reads, and unlocks **`virtio-fs` DAX** so
-> multiple microVMs map the **exact same physical host page-cache pages**.
+> multiple micr> .
 
 ## 0. Problem: Mounting `projgit` into a microVM sandbox
 
@@ -25,21 +25,21 @@ architectural choices exist:
 
 - **Option A — FUSE daemon inside the guest (`/dev/fuse`):**
   Run `projgit` (or the sidecar) inside every microVM.
-  - *Security boundary loss:* the untrusted agent shares a kernel and
+    - *Security boundary loss:* the untrusted agent shares a kernel and
     VM with the storage daemon; either git remote credentials or the
     shared CAS must be exposed inside the guest.
-  - *RAM multiplication:* every sandbox pays for its own daemon binary,
+    - *RAM multiplication:* every sandbox pays for its own daemon binary,
     in-memory LRUs, and guest page-cache copies of every read file.
 - **Option B — `virtio-fs` (FUSE over shared-memory virtqueues on the host):**
-  1. **Guest side (`mount -t virtiofs`):** The guest kernel speaks the
+    1. **Guest side (`mount -t virtiofs`):** The guest kernel speaks the
      standard FUSE wire protocol (`FUSE_LOOKUP`, `FUSE_READ`,
      `FUSE_GETATTR`), but places requests directly into a **`virtqueue`
      shared-memory ring** instead of `/dev/fuse`.
-  2. **Host side (`vhost-user-fs`):** The trusted `projgit` serving
+    2. **Host side (`vhost-user-fs`):** The trusted `projgit` serving
      process runs **on the host**, pops FUSE requests from the
      virtqueue over a `vhost-user` Unix socket connected to the VMM,
      and serves them against the host's shared store.
-  3. **Optional `DAX` window (`FUSE_SETUPMAPPING`):** `virtio-fs` can
+    3. **Optional `DAX` window (`FUSE_SETUPMAPPING`):** `virtio-fs` can
      expose a host memory window (`DAX`) to the guest. Instead of
      copying bytes through the virtqueue into the guest's page cache,
      the host daemon instructs the VMM to map a **host file descriptor +
@@ -101,26 +101,26 @@ canonical Git ODB:
    (and in-memory `TreeCache`/`HeaderCache`).
 2. **Inflate-once, write-atomic.** When a blob OID is hydrated (via
    on-demand `Fetch`, `FetchMany` prefetch, or `warm`) or first read:
-   - Check if `blobs/<oid[0..2]>/<oid>` already exists on disk.
-   - If absent, decode the blob once from the canonical ODB into
-     `blobs/tmp/<oid>.<tid>`, flush, mark read-only (`0444`), and
-     atomically `rename()` to `blobs/<oid[0..2]>/<oid>`.
-   - Because Git blobs are content-addressed and immutable, concurrent
-     writers produce identical bytes; atomic rename is lock-free and
-     never invalidates existing open file descriptors or `mmap`s.
+    - Check if `blobs/<oid[0..2]>/<oid>` already exists on disk.
+    - If absent, decode the blob once from the canonical ODB into
+         `blobs/tmp/<oid>.<tid>`, flush, mark read-only (`0444`), and
+         atomically `rename()` to `blobs/<oid[0..2]>/<oid>`.
+         writers produce identical bytes; atomic rename is lock-free and
+         never invalidates existing open file descriptors or `mmap`s.
+    - Because Git blobs are content-addressed and immutable, concurrent
 3. **Serving reads via host `fd` (`pread` / `mmap` / `DAX`).**
-   - **Standard FUSE / virtqueue `FUSE_READ`:** `ObjectStore` opens
+    - **Standard FUSE / virtqueue `FUSE_READ`:** `ObjectStore` opens
      `blobs/<xx>/<oid>` (or caches `Arc<File>` in an fd LRU) and
      executes `FileExt::read_at(buf, offset)` (`pread` on Unix).
      Reading 4 KiB at offset 10 MiB touches only that 4 KiB page in the
      host page cache—no heap allocation of the full blob, no zlib
      inflate on warm reads.
-   - **`virtio-fs` with `DAX` (`FUSE_SETUPMAPPING`):** On `open` /
      `lookup`, the host `vhost-user-fs` daemon ensures
      `blobs/<xx>/<oid>` is materialized, keeps its host `RawFd`, and
      hands `(fd, file_offset, len)` to the VMM's DAX window handler.
      Every microVM reading that blob OID maps the **same physical host
      pages**.
+    - **`virtio-fs` with `DAX` (`FUSE_SETUPMAPPING`):** On `open` /
 
 ## 3. End-to-end architecture with `projgitd` + `virtio-fs`
 
@@ -157,21 +157,21 @@ Host (trusted):
    Run `projgit mount --daemon-socket ...` on the host at
    `/run/projgit/<mnt-id>`, and point stock `virtiofsd
    --shared-dir=/run/projgit/<mnt-id>` at it for the microVM.
-   - *Pros:* Zero new transport code; benefits immediately from the
-     uncompressed `blobs/` cache (fast `pread`, no repeated zlib
-     inflate).
-   - *Cons:* Double FUSE hop on the host (`guest virtiofs` →
-     `virtiofsd` → `host /dev/fuse` → `projgit`), and `DAX` cannot pass
-     through a userspace FUSE mount without kernel FUSE-passthrough.
+    - *Pros:* Zero new transport code; benefits immediately from the
+         uncompressed `blobs/` cache (fast `pread`, no repeated zlib
+         inflate).
+         `virtiofsd` → `host /dev/fuse` → `projgit`), and `DAX` cannot pass
+         through a userspace FUSE mount without kernel FUSE-passthrough.
+    - *Cons:* Double FUSE hop on the host (`guest virtiofs` →
 2. **Path 2 — Native (`projgit-virtiofs` crate speaking `vhost-user-fs`):**
    Add a sibling crate to `projgit-fuse` that adapts
    [`projgit_core::FsProvider`](../../crates/projgit-core/src/fs_provider.rs)
    directly to the `vhost-user-fs` backend trait (listening on the
    VMM's `vhost-user` Unix socket).
-   - *Pros:* Single hop from guest virtqueue to `ProjectionFsProvider`;
-     no `/dev/fuse` or `CAP_SYS_ADMIN` needed on the host *or* guest;
-     can return the backing `blobs/<xx>/<oid>` file descriptor directly
-     for `FUSE_SETUPMAPPING` (`DAX`).
+    - *Pros:* Single hop from guest virtqueue to `ProjectionFsProvider`;
+         no `/dev/fuse` or `CAP_SYS_ADMIN` needed on the host *or* guest;
+         can return the backing `blobs/<xx>/<oid>` file descriptor directly
+         for `FUSE_SETUPMAPPING` (`DAX`).
 
 ## 4. Extending `FsProvider` for file-descriptor / `DAX` serving
 
@@ -181,18 +181,18 @@ cleanly requires only an additive method on `FsProvider` (and
 `ObjectStore`):
 
 1. **`ObjectStore::ensure_uncompressed_blob(&self, oid: ObjectId) -> Result<Arc<File>, ObjectStoreError>`**
-   - Opens `blobs/<xx>/<oid>` if present; otherwise decodes the blob
+    - Opens `blobs/<xx>/<oid>` if present; otherwise decodes the blob
      from `gix`, writes it atomically to `blobs/<xx>/<oid>`, and returns
      an open `Arc<File>`.
-   - `ObjectStore::read_blob_range(&self, oid: ObjectId, offset: u64, size: u32)`
      uses `pread` (`read_at`) on that `File`, replacing the whole-blob
      `read_blob` + slice in `ProjectionFsProvider::read`.
+    - `ObjectStore::read_blob_range(&self, oid: ObjectId, offset: u64, size: u32)`
 2. **`FsProvider::backing_file(&self, ino: u64) -> Result<Option<Arc<File>>, FsError>`** (optional hook, defaults to `Ok(None)`)
-   - For `AttrSnapshot::TreeFile { oid, .. }`, hydrates `oid` if needed
+    - For `AttrSnapshot::TreeFile { oid, .. }`, hydrates `oid` if needed
      and returns `Some(file)` pointing to `blobs/<xx>/<oid>`.
-   - For synthetic overlay files (`.git/HEAD`, `.git/index`), either
      returns `None` (falling back to normal virtqueue `read()`) or
      backs them with anonymous/temp files if DAX-everywhere is desired.
+    - For synthetic overlay files (`.git/HEAD`, `.git/index`), either
 
 ## 5. `.git/` synthesis caveat inside microVMs
 

@@ -253,7 +253,9 @@ fn worker_loop<F: Fetcher + 'static>(
                         .iter()
                         .filter(|p| !matches!(p, HeaderProbe::Error(_, _)))
                         .count();
-                    stats.blobs_warmed.fetch_add(warmed as u64, Ordering::Relaxed);
+                    stats
+                        .blobs_warmed
+                        .fetch_add(warmed as u64, Ordering::Relaxed);
                 }
             }
         }
@@ -349,8 +351,7 @@ mod tests {
 
     #[test]
     fn blobs_under_cap_filters_large() {
-        let tmp =
-            std::env::temp_dir().join(format!("projgit-prefetch-cap-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("projgit-prefetch-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         if std::process::Command::new("git")

@@ -89,7 +89,10 @@ impl CloneOptions {
     /// Builder: pull only `n` commits of history (`--depth=n`).
     /// `n` must be > 0 (git rejects `--depth=0`).
     pub fn with_depth(mut self, n: u32) -> Self {
-        assert!(n > 0, "CloneOptions::with_depth(0) is not supported; git rejects --depth=0");
+        assert!(
+            n > 0,
+            "CloneOptions::with_depth(0) is not supported; git rejects --depth=0"
+        );
         self.depth = Some(n);
         self
     }
@@ -185,8 +188,7 @@ mod tests {
 
     #[test]
     fn with_depth_emits_depth_flag() {
-        let opts =
-            CloneOptions::new("https://example.invalid/repo.git", "/tmp/x").with_depth(1);
+        let opts = CloneOptions::new("https://example.invalid/repo.git", "/tmp/x").with_depth(1);
         let cmd = build_clone_command(&opts);
         let args = argv(&cmd);
         assert!(
@@ -197,8 +199,7 @@ mod tests {
 
     #[test]
     fn with_depth_n_emits_corresponding_flag() {
-        let opts =
-            CloneOptions::new("https://example.invalid/repo.git", "/tmp/x").with_depth(42);
+        let opts = CloneOptions::new("https://example.invalid/repo.git", "/tmp/x").with_depth(42);
         let cmd = build_clone_command(&opts);
         let args = argv(&cmd);
         assert!(

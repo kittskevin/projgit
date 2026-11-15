@@ -227,9 +227,7 @@ fn parse_args() -> Args {
                     "full" => WorktreeStrategy::Full,
                     "depth1" => WorktreeStrategy::Depth1,
                     other => {
-                        eprintln!(
-                            "unknown --worktree-strategy: {other} (expected: full, depth1)"
-                        );
+                        eprintln!("unknown --worktree-strategy: {other} (expected: full, depth1)");
                         std::process::exit(2);
                     }
                 };
@@ -269,7 +267,9 @@ fn parse_args() -> Args {
                     std::process::exit(2)
                 });
                 if n == 0 {
-                    eprintln!("--daemon-pool-size 0 is not supported; pool must have at least one slot");
+                    eprintln!(
+                        "--daemon-pool-size 0 is not supported; pool must have at least one slot"
+                    );
                     std::process::exit(2);
                 }
                 daemon_pool_size = Some(n);
@@ -584,9 +584,8 @@ where
     F: projgit_core::Fetcher + Send + Sync + 'static,
     MakeHydrating: FnOnce(
         std::sync::Arc<projgit_core::ObjectStore>,
-    ) -> anyhow::Result<
-        std::sync::Arc<projgit_core::HydratingObjectStore<F>>,
-    >,
+    )
+        -> anyhow::Result<std::sync::Arc<projgit_core::HydratingObjectStore<F>>>,
 {
     use projgit_core::{
         clone::git_dir_for, ObjectStore, Projection, ProjectionFsProvider, RootOverlay,
@@ -849,10 +848,7 @@ fn print_report(args: &Args, projgit: &[ProjgitSample], git: &[GitSample]) {
     );
 
     if args.scenario == Scenario::Sequential {
-        let mount2: Vec<Duration> = projgit
-            .iter()
-            .filter_map(|s| s.mount2_cold_cat)
-            .collect();
+        let mount2: Vec<Duration> = projgit.iter().filter_map(|s| s.mount2_cold_cat).collect();
         if !mount2.is_empty() {
             let p_m2 = median(mount2);
             println!();
@@ -1030,8 +1026,7 @@ fn bench_projgit_daemon_concurrent(args: &Args) -> anyhow::Result<ConcurrentSamp
                         RootOverlay::new(),
                         (tid as u64) + 100,
                     )?);
-                    let session =
-                        mount_background(provider, &mp, &MountConfig::default())?;
+                    let session = mount_background(provider, &mp, &MountConfig::default())?;
                     wait_for_mount(&mp, Duration::from_secs(10))?;
                     for f in &files {
                         let _ = std::fs::read_to_string(mp.join(f))?;
@@ -1149,8 +1144,7 @@ fn bench_projgit_naive_concurrent(args: &Args) -> anyhow::Result<ConcurrentSampl
                         RootOverlay::new(),
                         (tid as u64) + 200,
                     )?);
-                    let session =
-                        mount_background(provider, &mp, &MountConfig::default())?;
+                    let session = mount_background(provider, &mp, &MountConfig::default())?;
                     wait_for_mount(&mp, Duration::from_secs(10))?;
                     for f in &files {
                         let _ = std::fs::read_to_string(mp.join(f))?;
@@ -1199,10 +1193,7 @@ fn bench_projgit_naive_concurrent(args: &Args) -> anyhow::Result<ConcurrentSampl
 fn print_concurrent_report(args: &Args, samples: &[ConcurrentSample]) {
     let setup_med = median(samples.iter().map(|s| s.setup).collect());
     let wall_med = median(samples.iter().map(|s| s.wall_clock).collect());
-    let per_thread_all: Vec<Duration> = samples
-        .iter()
-        .flat_map(|s| s.per_thread.clone())
-        .collect();
+    let per_thread_all: Vec<Duration> = samples.iter().flat_map(|s| s.per_thread.clone()).collect();
     let per_thread_p50 = if per_thread_all.is_empty() {
         Duration::ZERO
     } else {
@@ -1224,9 +1215,7 @@ fn print_concurrent_report(args: &Args, samples: &[ConcurrentSample]) {
     );
     println!();
     println!("## Measurement window\n");
-    println!(
-        "| Scenario | N | Wall clock | Per-thread p50 | Failures (sum across iters) |"
-    );
+    println!("| Scenario | N | Wall clock | Per-thread p50 | Failures (sum across iters) |");
     println!("|---|---:|---:|---:|---:|");
     println!(
         "| `{:?}` | {} | {} | {} | {} |",
@@ -1704,8 +1693,7 @@ fn sparse_shared_projgit(args: &Args) -> anyhow::Result<SparseSharedConfig> {
                         RootOverlay::new(),
                         (tid as u64) + 300,
                     )?);
-                    let session =
-                        mount_background(provider, &mp, &MountConfig::default())?;
+                    let session = mount_background(provider, &mp, &MountConfig::default())?;
                     wait_for_mount(&mp, Duration::from_secs(10))?;
                     // Sparse-access script: ls root + read each file.
                     let _ = read_dir_names(&mp)?;
@@ -1829,8 +1817,7 @@ fn sparse_shared_partial_cat_independent(args: &Args) -> anyhow::Result<SparseSh
                     {
                         use std::io::{BufRead, BufReader, Read, Write};
                         let mut stdin = child.stdin.take().expect("piped stdin");
-                        let mut stdout =
-                            BufReader::new(child.stdout.take().expect("piped stdout"));
+                        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
                         for f in &files {
                             writeln!(stdin, "{}:{}", ref_name, f)?;
                             stdin.flush()?;
@@ -2057,9 +2044,7 @@ fn bench_worktree_shared(args: &Args) -> anyhow::Result<SparseSharedConfig> {
 
     // Pre-compute worktree dir paths so both modes can refer to
     // them the same way.
-    let worktree_dirs: Vec<PathBuf> = (0..n)
-        .map(|_| make_temp("projgit-bench-wt-add"))
-        .collect();
+    let worktree_dirs: Vec<PathBuf> = (0..n).map(|_| make_temp("projgit-bench-wt-add")).collect();
     let _wt_guards: Vec<DirGuard> = worktree_dirs.iter().cloned().map(DirGuard).collect();
     // `make_temp` created each; remove so `worktree add` has a clean target.
     for d in &worktree_dirs {
@@ -2193,10 +2178,7 @@ fn print_worktree_shared_report(args: &Args, samples: &[SparseSharedConfig]) {
     let wall = med_dur(|s| s.wall_clock);
     let disk = med_bytes(|s| s.disk_bytes);
     let fail: usize = samples.iter().map(|s| s.failures).sum();
-    let per_thread_all: Vec<Duration> = samples
-        .iter()
-        .flat_map(|s| s.per_thread.clone())
-        .collect();
+    let per_thread_all: Vec<Duration> = samples.iter().flat_map(|s| s.per_thread.clone()).collect();
     let p50 = if per_thread_all.is_empty() {
         Duration::ZERO
     } else {

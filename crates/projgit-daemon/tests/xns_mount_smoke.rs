@@ -110,15 +110,16 @@ fn git(cwd: &Path, args: &[&str]) {
 }
 
 fn build_fixture(label: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "projgit-xns-{label}-{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("projgit-xns-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     git(&base, &["init", "-q", "-b", "main"]);
     git(&base, &["config", "core.autocrlf", "false"]);
-    std::fs::write(base.join("hello.txt"), b"hello from a private mount namespace\n").unwrap();
+    std::fs::write(
+        base.join("hello.txt"),
+        b"hello from a private mount namespace\n",
+    )
+    .unwrap();
     git(&base, &["add", "-A"]);
     git(&base, &["commit", "-q", "-m", "initial"]);
     base
@@ -258,7 +259,12 @@ cat "{mp_str}/hello.txt" >"{marker_str}"
     );
 
     let status = Command::new("unshare")
-        .args(["--user", "--map-root-user", "--mount", "--propagation=private"])
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--propagation=private",
+        ])
         .args(["bash", "-c", &script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

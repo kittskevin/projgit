@@ -675,9 +675,8 @@ fn cmd_mount_multi(args: MountMultiArgs) -> Result<()> {
                 spec.mountpoint.display()
             );
         }
-        let canon = std::fs::canonicalize(&spec.mountpoint).with_context(|| {
-            format!("canonicalizing mountpoint {}", spec.mountpoint.display())
-        })?;
+        let canon = std::fs::canonicalize(&spec.mountpoint)
+            .with_context(|| format!("canonicalizing mountpoint {}", spec.mountpoint.display()))?;
         if !seen.insert(canon.clone()) {
             bail!(
                 "mountpoint {} listed more than once",
@@ -799,10 +798,8 @@ where
         // future daemon address space.
         let projection_id = (idx + 1) as u64;
         let projection = Projection::Ref(spec.ref_name.clone());
-        let overlay =
-            build_overlay_no_subtree(args.no_dotgit, &projection, &store, git_dir).with_context(
-                || format!("building overlay for {}", spec.ref_name),
-            )?;
+        let overlay = build_overlay_no_subtree(args.no_dotgit, &projection, &store, git_dir)
+            .with_context(|| format!("building overlay for {}", spec.ref_name))?;
         let provider = Arc::new(
             ProjectionFsProvider::new(projection, hydrating.clone(), overlay, projection_id)
                 .with_context(|| {
@@ -911,12 +908,11 @@ fn build_overlay_no_subtree(
     let objects_dir = git_dir.join("objects");
     let objects_dir = std::fs::canonicalize(&objects_dir)
         .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    let mut overlay = dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
-        .context("building A1+ overlay")?;
+    let mut overlay =
+        dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")?;
     apply_a2_if_branch(&mut overlay, projection, store, commit_oid);
     Ok(overlay)
 }
-
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_mount<F>(
@@ -1078,8 +1074,8 @@ fn build_root_overlay(
     let objects_dir = git_dir.join("objects");
     let objects_dir = std::fs::canonicalize(&objects_dir)
         .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    let mut overlay = dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
-        .context("building A1+ overlay")?;
+    let mut overlay =
+        dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")?;
     apply_a2_if_branch(&mut overlay, projection, store, commit_oid);
     Ok(overlay)
 }
@@ -1372,18 +1368,12 @@ fn print_response(r: &projgit_daemon::protocol::Response) {
                 );
             }
             if let Some(c) = &s.cache {
-                println!(
-                    "tree cache  hits={} misses={}",
-                    c.tree_hits, c.tree_misses
-                );
+                println!("tree cache  hits={} misses={}", c.tree_hits, c.tree_misses);
                 println!(
                     "header cache hits={} misses={}",
                     c.header_hits, c.header_misses
                 );
-                println!(
-                    "blob cache   hits={} misses={}",
-                    c.blob_hits, c.blob_misses
-                );
+                println!("blob cache   hits={} misses={}", c.blob_hits, c.blob_misses);
             }
         }
         Response::Err { code, message } => {

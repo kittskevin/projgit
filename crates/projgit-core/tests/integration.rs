@@ -147,7 +147,9 @@ fn try_resolve_branch_full_name_classifies_refs() {
         Some("refs/heads/main"),
     );
     assert_eq!(
-        store.try_resolve_branch_full_name("refs/heads/main").as_deref(),
+        store
+            .try_resolve_branch_full_name("refs/heads/main")
+            .as_deref(),
         Some("refs/heads/main"),
     );
 

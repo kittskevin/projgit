@@ -19,10 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn temp_socket(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "projgitd-test-{label}-{}.sock",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("projgitd-test-{label}-{}.sock", std::process::id()))
 }
 
 /// Spawn the daemon in a background thread, return (socket_path,
@@ -100,7 +97,11 @@ fn ping_status_shutdown_roundtrip() {
         .expect("daemon returned Err");
 
     // Socket file should have been cleaned up.
-    assert!(!sock.exists(), "socket file lingering at {}", sock.display());
+    assert!(
+        !sock.exists(),
+        "socket file lingering at {}",
+        sock.display()
+    );
 }
 
 #[test]
@@ -119,7 +120,10 @@ fn mount_rejects_nonexistent_source() {
     };
     match rpc(&sock, &req) {
         Response::Err { code, .. } => {
-            assert_eq!(code, "mount_failed", "mountpoint canonicalize should fail first");
+            assert_eq!(
+                code, "mount_failed",
+                "mountpoint canonicalize should fail first"
+            );
         }
         other => panic!("got {other:?}"),
     }

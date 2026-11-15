@@ -107,8 +107,13 @@ fn main() -> anyhow::Result<()> {
 
     init_tracing(cli.verbose);
 
-    let socket_mode = u32::from_str_radix(cli.socket_mode.trim_start_matches('0'), 8)
-        .map_err(|e| anyhow::anyhow!("--socket-mode must be octal, got `{}`: {e}", cli.socket_mode))?;
+    let socket_mode =
+        u32::from_str_radix(cli.socket_mode.trim_start_matches('0'), 8).map_err(|e| {
+            anyhow::anyhow!(
+                "--socket-mode must be octal, got `{}`: {e}",
+                cli.socket_mode
+            )
+        })?;
 
     if matches!(cli.depth, Some(0)) {
         anyhow::bail!("--depth 0 is not supported; git rejects --depth=0");

@@ -53,10 +53,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 
 /// Build a small local repo with one commit on `main`.
 fn build_fixture(label: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "projgit-daemon-{label}-{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("projgit-daemon-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     git(&base, &["init", "-q", "-b", "main"]);
@@ -207,11 +204,21 @@ fn mount_status_umount_lifecycle_via_daemon() {
     }
 
     // Umount both, in arbitrary order.
-    match rpc(&sock, &Request::Umount { mountpoint: mp_b.clone() }) {
+    match rpc(
+        &sock,
+        &Request::Umount {
+            mountpoint: mp_b.clone(),
+        },
+    ) {
         Response::Ok => {}
         other => panic!("umount B: got {other:?}"),
     }
-    match rpc(&sock, &Request::Umount { mountpoint: mp_a.clone() }) {
+    match rpc(
+        &sock,
+        &Request::Umount {
+            mountpoint: mp_a.clone(),
+        },
+    ) {
         Response::Ok => {}
         other => panic!("umount A: got {other:?}"),
     }
@@ -314,7 +321,12 @@ fn second_mount_with_different_source_rejected_as_source_mismatch() {
     }
 
     // Cleanup.
-    let _ = rpc(&sock, &Request::Umount { mountpoint: mp.clone() });
+    let _ = rpc(
+        &sock,
+        &Request::Umount {
+            mountpoint: mp.clone(),
+        },
+    );
     let _ = rpc(&sock, &Request::Shutdown);
     handle.join().unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&mp);

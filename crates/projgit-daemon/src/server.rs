@@ -390,8 +390,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     if let Some(pid_path) = &config.pid_file {
         if let Err(e) = std::fs::write(pid_path, format!("{}\n", std::process::id())) {
             let _ = std::fs::remove_file(&config.socket_path);
-            return Err(e)
-                .with_context(|| format!("writing pid file {}", pid_path.display()));
+            return Err(e).with_context(|| format!("writing pid file {}", pid_path.display()));
         }
         tracing::info!("wrote pid file {}", pid_path.display());
     }
@@ -414,13 +413,13 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         .or_else(maintenance_interval_secs)
         .filter(|&n| n > 0)
         .map(|secs| {
-        let state = state.clone();
-        tracing::info!("background maintenance enabled (every {secs}s)");
-        std::thread::Builder::new()
-            .name("projgit-maint".to_owned())
-            .spawn(move || maintenance_loop(state, secs))
-            .expect("spawn maintenance thread")
-    });
+            let state = state.clone();
+            tracing::info!("background maintenance enabled (every {secs}s)");
+            std::thread::Builder::new()
+                .name("projgit-maint".to_owned())
+                .spawn(move || maintenance_loop(state, secs))
+                .expect("spawn maintenance thread")
+        });
 
     // Accept loop. Non-blocking would be cleaner but a self-connect
     // wakeup on shutdown is good enough for V1 and matches what most
@@ -1107,8 +1106,8 @@ fn build_overlay(
     let objects_dir = git_dir.join("objects");
     let objects_dir = std::fs::canonicalize(&objects_dir)
         .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    let mut overlay = dotgit::a1_plus_overlay(store, commit_oid, &objects_dir)
-        .context("building A1+ overlay")?;
+    let mut overlay =
+        dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")?;
     // Apply A2 ref visibility when the projection is a local branch.
     // No-op for Commit projections and for refs that resolve to tags
     // (those correctly stay on A1's detached HEAD; see

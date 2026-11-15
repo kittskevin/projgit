@@ -57,12 +57,20 @@ fn target_profile_dir() -> PathBuf {
 /// `target/<profile>/projgitd` (or `.exe` on Windows; not relevant
 /// here — the file is cfg-gated to unix).
 fn projgitd_binary() -> PathBuf {
-    target_profile_dir().join(if cfg!(windows) { "projgitd.exe" } else { "projgitd" })
+    target_profile_dir().join(if cfg!(windows) {
+        "projgitd.exe"
+    } else {
+        "projgitd"
+    })
 }
 
 /// `target/<profile>/projgit`.
 fn projgit_binary() -> PathBuf {
-    target_profile_dir().join(if cfg!(windows) { "projgit.exe" } else { "projgit" })
+    target_profile_dir().join(if cfg!(windows) {
+        "projgit.exe"
+    } else {
+        "projgit"
+    })
 }
 
 /// Ensure both binaries exist (rebuild on demand). `cargo test` only
@@ -126,10 +134,7 @@ fn git(cwd: &Path, args: &[&str]) {
 }
 
 fn build_fixture(label: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "projgit-xproc-{label}-{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("projgit-xproc-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     git(&base, &["init", "-q", "-b", "main"]);

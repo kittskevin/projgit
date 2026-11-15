@@ -285,8 +285,7 @@ impl BatchChildPool {
         // claim against the other K-1 slots; the next round-robin
         // caller will start one slot ahead, so starvation is
         // bounded by K.)
-        let guard = self
-            .slots[start]
+        let guard = self.slots[start]
             .lock()
             .expect("BatchChildPool slot mutex poisoned");
         PoolGuard {

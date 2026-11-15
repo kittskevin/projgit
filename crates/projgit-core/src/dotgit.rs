@@ -271,9 +271,15 @@ fn splice_dotgit_child(overlay: &mut RootOverlay, name: &str, content: Vec<u8>) 
 /// `.git/refs/heads/<branch>` while reusing the already-empty
 /// `refs/heads/` directory the A1 overlay creates.
 fn splice_nested_dotgit_file(overlay: &mut RootOverlay, path: &[&str], content: Vec<u8>) {
-    assert!(!path.is_empty(), "splice_nested_dotgit_file needs a non-empty path");
+    assert!(
+        !path.is_empty(),
+        "splice_nested_dotgit_file needs a non-empty path"
+    );
     let dotgit = overlay.get_mut(b".git").expect("overlay missing .git/");
-    let SyntheticEntry::Directory { children: dotgit_children } = dotgit else {
+    let SyntheticEntry::Directory {
+        children: dotgit_children,
+    } = dotgit
+    else {
         panic!(".git entry is not a directory");
     };
 
@@ -282,9 +288,7 @@ fn splice_nested_dotgit_file(overlay: &mut RootOverlay, path: &[&str], content: 
     let mut current: &mut std::collections::BTreeMap<BString, SyntheticEntry> = dotgit_children;
     for &component in &path[..path.len() - 1] {
         let key = BString::from(component);
-        let entry = current
-            .entry(key)
-            .or_insert_with(SyntheticEntry::directory);
+        let entry = current.entry(key).or_insert_with(SyntheticEntry::directory);
         match entry {
             SyntheticEntry::Directory { children } => {
                 current = children;
@@ -494,8 +498,7 @@ mod tests {
         apply_a2_ref_visibility(&mut o, "refs/heads/main", fixture_oid());
         let ref_file = file_content(walk(&o, ".git/refs/heads/main"));
         assert_eq!(
-            ref_file,
-            b"1234567890abcdef1234567890abcdef12345678\n",
+            ref_file, b"1234567890abcdef1234567890abcdef12345678\n",
             "loose ref file must contain `<oid>\\n`",
         );
     }
@@ -512,10 +515,7 @@ mod tests {
         assert_eq!(head, b"ref: refs/heads/feature/foo\n");
 
         let ref_file = file_content(walk(&o, ".git/refs/heads/feature/foo"));
-        assert_eq!(
-            ref_file,
-            b"1234567890abcdef1234567890abcdef12345678\n",
-        );
+        assert_eq!(ref_file, b"1234567890abcdef1234567890abcdef12345678\n",);
 
         // The intermediate `feature/` is a directory, not a file, and
         // the empty `tags/` is still around from A1.

@@ -50,7 +50,11 @@ fn build_nested_fixture() -> (PathBuf, gix::ObjectId) {
     std::fs::write(base.join("README.md"), b"# fixture\n").unwrap();
     let util_dir = base.join("src").join("util");
     std::fs::create_dir_all(&util_dir).unwrap();
-    std::fs::write(base.join("src").join("main.c"), b"int main(void){return 0;}\n").unwrap();
+    std::fs::write(
+        base.join("src").join("main.c"),
+        b"int main(void){return 0;}\n",
+    )
+    .unwrap();
     std::fs::write(util_dir.join("helper.c"), b"void helper(){}\n").unwrap();
 
     git(&base, &["add", "-A"]);

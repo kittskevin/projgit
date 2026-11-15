@@ -80,7 +80,10 @@ fn attach_ping_status_shutdown_via_cli() {
     let (sock, handle) = spawn_daemon("ping");
 
     let (_, stdout) = attach(&sock, &["ping"], false);
-    assert!(stdout.contains("pong"), "expected `pong` in stdout: {stdout}");
+    assert!(
+        stdout.contains("pong"),
+        "expected `pong` in stdout: {stdout}"
+    );
 
     let (_, stdout) = attach(&sock, &["status"], false);
     // No source attached → status text reflects that.
@@ -172,7 +175,10 @@ fn attach_full_mount_lifecycle_via_cli() {
 
     // status — should show 1 mount
     let (_, stdout) = attach(&sock, &["status"], false);
-    assert!(stdout.contains("mounts    : 1"), "expected one mount: {stdout}");
+    assert!(
+        stdout.contains("mounts    : 1"),
+        "expected one mount: {stdout}"
+    );
 
     // umount
     attach(
@@ -182,11 +188,7 @@ fn attach_full_mount_lifecycle_via_cli() {
     );
 
     // umount of a path that was never registered should exit non-zero.
-    let (status, _) = attach(
-        &sock,
-        &["umount", "--mountpoint", "/tmp"],
-        true,
-    );
+    let (status, _) = attach(&sock, &["umount", "--mountpoint", "/tmp"], true);
     assert!(
         !status.success(),
         "umount of unknown path should fail; got {status}",

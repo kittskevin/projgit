@@ -111,7 +111,9 @@ impl Fetcher for DaemonFetcher {
                 .collect(),
             Err(transport) => oids
                 .iter()
-                .map(|oid| HeaderProbe::Error(*oid, FetcherError::Transport(*oid, transport.clone())))
+                .map(|oid| {
+                    HeaderProbe::Error(*oid, FetcherError::Transport(*oid, transport.clone()))
+                })
                 .collect(),
         }
     }

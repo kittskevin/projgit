@@ -105,11 +105,7 @@ impl Drop for DirGuard {
 }
 
 fn make_mountpoint(name: &str) -> (PathBuf, DirGuard) {
-    let mp = std::env::temp_dir().join(format!(
-        "projgit-fuse-mp-{}-{}",
-        name,
-        std::process::id()
-    ));
+    let mp = std::env::temp_dir().join(format!("projgit-fuse-mp-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&mp);
     std::fs::create_dir_all(&mp).unwrap();
     let guard = DirGuard(mp.clone());
