@@ -734,6 +734,49 @@ done
   the same multiplier as cargo (~1.5–2× total time, ~50% more
   disk).
 
+---
+
+## L2 uncompressed blob cache (`<git-dir>/blobs/<xx>/<oid>`)
+
+Added to evaluate `virtio-fs` host-serving and positioned range reads
+([`docs/design/virtio-fs.md`](../design/virtio-fs.md)). Blobs larger than
+the in-memory L1 per-entry cap (`64 KiB`) cannot reside in `BlobCache`;
+without an on-disk uncompressed L2 tier, every FUSE `read(offset, size)`
+request on a large file had to re-inflate the entire packed blob from
+`.git/objects/pack/*.pack` (`O(blob_size)` CPU and heap per chunk, or
+`O(N²)` across a sequential multi-chunk FUSE read).
+
+With `<git-dir>/blobs/<xx>/<oid>` and `ObjectStore::read_blob_range`:
+
+1. The first read of a blob inflates it once from the packfile and
+   atomically materializes `<git-dir>/blobs/<xx>/<oid>` (`0444`).
+2. Subsequent range reads on the same or any freshly opened `ObjectStore`
+   perform a positioned read (`pread` / `seek_read`) of **only** the
+   requested `[offset .. offset + size)` slice directly from the OS page
+   cache (`O(range)`).
+3. `FsProvider::backing_file(inode)` returns an `Arc<std::fs::File>` to
+   the L2 file so `virtiofsd` (`DAX` `FUSE_SETUPMAPPING`) and FUSE
+   passthrough can map host page-cache pages directly into microVM guest
+   memory.
+
+### Results (`--scenario l2-range`, 4 MiB packed blob, median of 5 iterations)
+
+| Operation on 4 MiB packed blob (`> 64 KiB` L1 cap) | Median (ms) | Speedup vs cold | Speedup vs `git cat-file` |
+|---|---:|---:|---:|
+| Cold `read_blob_range` (4 KiB slice; pack inflate + atomic L2 write) | 3.49 | 1.0x | 5.64x |
+| Warm L2 `read_blob_range` (4 KiB `pread`/`seek_read`, same store) | **0.05** | **72.9x** | **410.8x** |
+| Cross-store L2 `read_blob_range` (4 KiB `pread`/`seek_read`, fresh `ObjectStore`) | **0.04** | **94.8x** | **534.7x** |
+| 32 × 128 KiB FUSE-chunk stream via L2 (vs 32× cold pack inflate = 111.7 ms) | **1.29** | **86.7x** | **15.3x** |
+| `git cat-file blob <oid>` baseline (full 4 MiB inflate) | 19.7 | 0.18x | 1.0x |
+
+### Reproducing
+
+Runs offline on Linux, macOS, and Windows (only requires `git` on `PATH`):
+
+```sh
+cargo run -p projgit-cli --example bench_mount --release -- --scenario l2-range --iterations 5
+```
+
 - **Network variance dominates on the rust cell.** Single
   iteration each (no median). Numbers should be read as
   order-of-magnitude, not three-digit precision.

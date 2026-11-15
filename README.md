@@ -19,7 +19,9 @@ success criteria are in [docs/problem-statement.md](docs/problem-statement.md).
 The container-deployment topology (projgit on the host, projgit in a sidecar,
 projgit per container) — what works today, what's blocked, and the
 empirical experiments behind each claim — is written up in
-[docs/design/container-deployment.md](docs/design/container-deployment.md).
+[docs/design/container-deployment.md](docs/design/container-deployment.md),
+and the microVM / `virtio-fs` (`vhost-user-fs` + `DAX` shared page cache)
+architecture is in [docs/design/virtio-fs.md](docs/design/virtio-fs.md).
 
 ## Architecture
 
@@ -27,29 +29,30 @@ empirical experiments behind each claim — is written up in
 ┌──────────────────────────────────────────────────────────┐
 │       ls, cat, language servers, agent tool calls        │
 └────────────────────────────┬─────────────────────────────┘
-                             │  POSIX syscalls
+                             │  POSIX syscalls / virtqueue
                              ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Kernel: FUSE (Linux/macOS)  •  WinFsp (Windows, planned)│
+│  Kernel: FUSE (Linux/macOS) • virtio-fs/DAX • WinFsp     │
 └────────────────────────────┬─────────────────────────────┘
                              ▼
 ┌──────────────────────────────────────────────────────────┐
 │  ProjectionFsProvider    inode allocator + attr cache    │
 │  Projection (Ref|Commit|Subtree) + RootOverlay           │
+│  backing_file(inode) ──► host fd for virtio-fs DAX       │
 └────────────────────────────┬─────────────────────────────┘
                              ▼
 ┌──────────────────────────────────────────────────────────┐
-│  HydratingObjectStore    single-flight coalescing        │
-│  ObjectStore             tree / header / small-blob LRUs │
+│  HydratingObjectStore    single-flight + batch coalescer │
+│  ObjectStore             tree / header / L1 blob LRUs    │
 └──────┬────────────────────────────────────┬──────────────┘
-       │ object hit                         │ object miss
+       │ L2 / ODB hit                       │ object miss
        ▼                                    ▼
-┌──────────────────┐                ┌──────────────────────┐
-│  shared on-disk  │ ◀── promisor ──│  Fetcher             │
-│  git odb (one    │     fetch      │  GitCli | GVFS |     │
-│  CAS, N mounts)  │                │  Gix    | Noop       │
-└──────────────────┘                └──────────┬───────────┘
-                                               ▼
+┌──────────────────────┐            ┌──────────────────────┐
+│  shared on-disk CAS  │◀─promisor──│  Fetcher (k-pool)    │
+│  • objects/pack/     │   fetch    │  GitCli | Daemon |   │
+│  • blobs/<xx>/<oid>  │            │  GVFS   | Gix | Noop │
+│    (uncompressed L2) │            └──────────┬───────────┘
+└──────────────────────┘                       ▼
                                     ┌──────────────────────┐
                                     │  upstream git remote │
                                     │  (GitHub, GitLab,    │
@@ -105,12 +108,20 @@ in [docs/bench/baseline.md](docs/bench/baseline.md).
   remains slower than `worktree-depth1 on-demand` on wall clock, while
   retaining the structural disk + containerization advantages. See
   [docs/bench/baseline.md](docs/bench/baseline.md) for the exact tables.
+- **L2 uncompressed blob cache (`<git-dir>/blobs/<xx>/<oid>`) eliminates
+  repeated pack inflation on large files (`> 64 KiB` L1 cap).** On a 4 MiB
+  packed blob (`--scenario l2-range`), a 4 KiB positioned `read_blob_range`
+  drops from **3.49 ms** cold (19.7 ms via `git cat-file blob`) to **0.04–0.05 ms**
+  warm (**~73–95×** faster than cold pack inflate, **~410–535×** faster than
+  `git cat-file`), and streaming 32 × 128 KiB FUSE-sized chunks takes **1.29 ms**
+  instead of **111.7 ms** (**86.7×** speedup).
 
-Reproduce on Linux/macOS:
+Reproduce on Linux/macOS (or `--scenario l2-range` offline on any OS):
 
 ```sh
 PROJGIT_NETWORK_TESTS=1 \
   cargo run -p projgit-cli --example bench_mount --release
+cargo run -p projgit-cli --example bench_mount --release -- --scenario l2-range
 ```
 
 ## Quick Start
@@ -153,6 +164,7 @@ projgit: unmounting…
 projgit: tree cache    hits=14 misses=2 inserts=2 evictions=0 len=2/256
 projgit: header cache  hits=4 misses=14 inserts=11 evictions=0 len=8/4096
 projgit: blob cache    hits=1 misses=2 inserts=2 evictions=0 bytes=68092/16777216
+projgit: disk blobs    hits=0 misses=2 inserts=2 write_errors=0
 projgit: prefetch (T1) posted=1 dropped=0 batches=1 resolved=7 headers=7 failed=0
 projgit: unmounted.
 ```
@@ -183,6 +195,11 @@ commit, a populated `index` with `ASSUME_VALID` set on every entry, and
 Tools that walk upward for `.git/` treat the mount as a normal repository.
 The FUSE adapter echoes the requesting process's `uid`/`gid` back as file
 ownership, so git's `safe.directory` check passes without any user setup.
+For isolated microVM / `virtio-fs` mounts (`a1_isolated_overlay` /
+`a1_plus_isolated_overlay`), `objects/info/alternates` is omitted so no host
+paths leak into the guest; instead, the host CAS's `objects/pack/*` and
+`objects/info/commit-graph` are projected directly under `.git/objects/` via
+`SyntheticEntry::HostFile` (`pread` + `backing_file` passthrough).
 
 **Works with no user setup:**
 
@@ -237,15 +254,35 @@ Pieces worth pointing at if you're skimming the code:
   is `Send + Sync` (via `gix::ThreadSafeRepository` + per-call thread-local
   handles) so a single in-process store can back arbitrarily many concurrent
   mounts without copying blobs.
-- **Layered caches with explicit budgets.** Hand-rolled bounded LRUs for
-  parsed trees ([`tree_cache.rs`](crates/projgit-core/src/tree_cache.rs)),
-  object headers ([`header_cache.rs`](crates/projgit-core/src/header_cache.rs)),
-  and small blobs ([`blob_cache.rs`](crates/projgit-core/src/blob_cache.rs),
-  byte-bounded with a per-entry cap so one big file can't evict the
-  working set). Counters exposed through `--stats`.
-- **Single-flight fetch coalescing.** [`Coalescer`](crates/projgit-core/src/fetcher/coalesce.rs)
-  ensures a thundering herd of kernel reads for the same OID dedupes to one
-  upstream request; the rest park on the in-flight future.
+- **Layered caches with explicit budgets + uncompressed L2 blob store.**
+  Hand-rolled bounded in-memory LRUs for parsed trees
+  ([`tree_cache.rs`](crates/projgit-core/src/tree_cache.rs)), object headers
+  ([`header_cache.rs`](crates/projgit-core/src/header_cache.rs)), and small
+  blobs ([`blob_cache.rs`](crates/projgit-core/src/blob_cache.rs),
+  byte-bounded with a 64 KiB per-entry cap so one big file can't evict the
+  working set), backed by an **L2 uncompressed on-disk blob cache**
+  (`<git-dir>/blobs/<xx>/<oid>`, atomically written + renamed in
+  [`object_store.rs`](crates/projgit-core/src/object_store.rs)). Range reads
+  (`read_blob_range`) use `pread` (`FileExt::read_at` / `seek_read`) for true
+  `O(range)` slices without re-inflating pack entries, and
+  [`FsProvider::backing_file`](crates/projgit-core/src/fs_provider.rs) hands
+  open host file descriptors to `virtio-fs` `DAX` (`FUSE_SETUPMAPPING`) so
+  multiple microVMs map the same host Page Cache pages directly into guest RAM
+  ([docs/design/virtio-fs.md](docs/design/virtio-fs.md)).
+- **`projgitd` multi-mount daemon & cross-namespace `/dev/fuse` fd passing.**
+  [`projgit-daemon`](crates/projgit-daemon) owns the shared CAS, per-OID
+  `Coalescer`, `k`-slot `git cat-file --batch-check` worker pool, and
+  periodic `git maintenance run` loop over a Unix domain socket. Lightweight
+  sidecars (`projgit mount --daemon-socket …` or `projgit attach`) can open
+  `/dev/fuse` inside an unprivileged container mount namespace and pass the
+  file descriptor over `SCM_RIGHTS` ([docs/design/projgitd.md](docs/design/projgitd.md)).
+- **Single-flight fetch & prefetch batch coalescing.**
+  [`Coalescer`](crates/projgit-core/src/fetcher/coalesce.rs) ensures a
+  thundering herd of kernel reads for the same OID dedupes to one upstream
+  request, while non-blocking prefetch claim sets in
+  [`git_cli.rs`](crates/projgit-core/src/fetcher/git_cli.rs) prevent N
+  sidecars from issuing duplicate `PrefetchHeaders` batches
+  ([docs/design/prefetch-coalescing.md](docs/design/prefetch-coalescing.md)).
 - **Pluggable fetchers behind one trait.**
   [`GitCliFetcher`](crates/projgit-core/src/fetcher/git_cli.rs) drives the
   partial-clone promisor path via a long-lived `git cat-file --batch-check`
@@ -320,15 +357,8 @@ projgit's design target is the missing middle ground:
 - **Lazy fetch:** disk and bandwidth proportional to touched objects.
 - **Total enumerability:** `os.walk`, `find`, language servers, and build tools
   see the whole tree.
-- **Sharen experimental research project and personal portfolio piece — not a
-production filesystem. The licenses below cover liability (the standard MIT and
-Apache-2.0 "AS IS" / "no warranty" clauses); beyond that:
-
-- **Not for production use.** Nothing here has been hardened, security-audited,
-  or tested at scale, and the on-disk cache format, CLI surface, and Rust API
-  may change without notice.
-- **No support is offered.** Issues and pull requests may not be reviewed. Bug
-  reports are welcome but the maintainer makes no commitment to act on thhe same Git object store.
+- **Shared across mounts:** N concurrent mounts on the same host share the same
+  Git object store and uncompressed on-disk blob cache.
 
 The longer motivation and prior-art comparison are in
 [docs/problem-statement.md](docs/problem-statement.md).
@@ -349,46 +379,58 @@ What works today:
 
 - Core object-store, projection, overlay, and path-resolution logic.
 - Lazy blob hydration through Git partial-clone/promisor behavior.
+- Two-tier blob caching: in-memory byte-bounded `BlobCache` (L1) +
+  uncompressed, OID-keyed on-disk blob cache (`<git-dir>/blobs/<xx>/<oid>`,
+  L2) with `O(range)` positioned reads (`pread` / `seek_read`) and
+  `FsProvider::backing_file(inode)` for `virtio-fs` `DAX` page-cache sharing.
+- `projgitd` (`crates/projgit-daemon`) long-running daemon + `projgit attach` /
+  `--daemon-socket` sidecar topology: Unix-socket control plane, `SCM_RIGHTS`
+  `/dev/fuse` fd-passing, `k`-slot `cat-file` worker pool, prefetch batch
+  coalescing, PID file management, and background `git maintenance run`.
 - Linux/macOS FUSE backend through `fuser`, with file ownership echoed
   per-request so `git`'s `safe.directory` check passes without setup.
-- `projgit mount` for refs, commits, and subtrees.
+- `projgit mount` and `projgit mount-multi` for refs, commits, and subtrees.
 - A1+ / A2-flavored `.git/` synthesized at the mount root by default
   for branch projections (symbolic HEAD pointing at the branch ref,
   a clean read-only `.git/index` matching HEAD, and
-  `objects/info/alternates` reaching the shared on-disk store), so
-  `git rev-parse HEAD`, `git status`, `git log`,
-  `git branch --show-current`, `git symbolic-ref HEAD`, `cargo build`'s
-  VCS detection, and IDE branch indicators all work out of the box.
+  `objects/info/alternates` reaching the shared on-disk store), plus
+  isolated `.git/` overlays (`a1_isolated_overlay` / `a1_plus_isolated_overlay`)
+  for microVM guests where host paths must not leak.
   Commit-OID and tag projections keep the detached HEAD (A1+).
   Opt out with `--no-dotgit`.
-- Tree, blob, and header caches, plus T1 readdir-time header prefetch.
+- Tree, blob, and header caches, plus T1 readdir-time header + small-blob prefetch.
 - Optional GVFS protocol fetcher (Azure DevOps Server / Azure Repos) behind the `gvfs-fetcher` Cargo feature.
-- Local test coverage for the core, CLI, projection filesystem, and FUSE smoke
-  path, plus a network-gated end-to-end mount test against a real remote
-  (and a sibling test that drives `git log` from inside the mount).
+- Local and CI test coverage for the core, CLI, projection filesystem, FUSE
+  multi-mount, and `projgitd` cross-process / cross-namespace smoke paths, plus
+  network-gated end-to-end mount tests and reproducible benchmarks.
 
 What is deliberately deferred:
 
 - Windows mounting. The `projgit-winfsp` crate is a stub; the implementation
   plan lives in [docs/design/winfsp-implementation-plan.md](docs/design/winfsp-implementation-plan.md).
-- A long-running daemon for many concurrent mounts sharing one upstream
-  connection.
-- Writes. The MVP is read-only.
+- Native `vhost-user-fs` (`virtio-fs`) transport crate (`projgit-virtiofs`).
+  The uncompressed `<git-dir>/blobs/` backing store, `FsProvider::backing_file`,
+  and isolated microVM `.git/` overlays are shipped in `projgit-core`; the
+  `vhost-user-backend` socket server is specified in
+  [docs/design/virtio-fs.md](docs/design/virtio-fs.md).
+- Writes. The MVP is read-only (copy-on-write overlay design in
+  [docs/design/writable-worktrees.md](docs/design/writable-worktrees.md)).
 
-Each of these three items maps to a criterion in
+Each of these items maps to a criterion in
 [problem-statement §7](docs/problem-statement.md#7-success-criteria); see
 that section for the per-criterion design-target-vs-shipped-scope status.
 
 ## Project Layout
 
 ```text
-crates/projgit-core/      projection engine, object store, fetchers, caches
-crates/projgit-cli/       `projgit mount` command
-crates/projgit-fuse/      Linux/macOS FUSE adapter
+crates/projgit-core/      projection engine, object store, L1/L2 caches, fetchers
+crates/projgit-cli/       `projgit mount`, `mount-multi`, `attach`, and `bench_mount`
+crates/projgit-daemon/    `projgitd` shared-CAS daemon, RPC protocol, DaemonFetcher
+crates/projgit-fuse/      Linux/macOS FUSE adapter (`fuser` + external `/dev/fuse` fd)
 crates/projgit-winfsp/    Windows backend stub; implementation deferred
-docs/                     problem statement, design notes, status handoff
-spikes/ondemand-fetch/    completed Git on-demand fetch spike
-.devcontainer/           Linux + FUSE development environment
+docs/                     problem statement, design docs, bench baseline, handoffs
+spikes/                   completed Phase 0 spikes (ondemand-fetch, fuse-fd-passing)
+.devcontainer/            Linux + FUSE development environment
 ```
 
 ## Verification
@@ -418,14 +460,26 @@ mount permissions. The `mount_real_remote` test partial-clones
 
 - [docs/problem-statement.md](docs/problem-statement.md) explains the concrete
   agent-evaluation use case.
-- [docs/initial-plan.md](docs/implementation/initial-plan.md) captures the phased architecture.
-- [docs/handoff.md](docs/implementation/handoff.md) is the current status document.
-- [docs/design/prefetch.md](docs/design/prefetch.md) covers the prefetch tier
-  ladder.
+- [docs/implementation/initial-plan.md](docs/implementation/initial-plan.md) captures the phased architecture.
+- [docs/implementation/handoff.md](docs/implementation/handoff.md) is the current status document.
+- [docs/design/projgitd.md](docs/design/projgitd.md) covers the `projgitd`
+  daemon + sidecar topology and `/dev/fuse` `SCM_RIGHTS` fd-passing.
+- [docs/design/container-deployment.md](docs/design/container-deployment.md)
+  covers host, sidecar, and per-container deployment topologies.
+- [docs/design/virtio-fs.md](docs/design/virtio-fs.md) covers `virtio-fs`
+  (`vhost-user-fs` + `DAX`) host serving into microVMs and the uncompressed
+  on-disk blob cache (`<git-dir>/blobs/<xx>/<oid>`).
+- [docs/design/cache-transform-tier.md](docs/design/cache-transform-tier.md)
+  covers the cache + transform tier (commit-graph, multi-pack-index, background
+  maintenance, and uncompressed blob store).
+- [docs/design/prefetch.md](docs/design/prefetch.md) and
+  [docs/design/prefetch-coalescing.md](docs/design/prefetch-coalescing.md)
+  cover the prefetch tier ladder and cross-sidecar batch coalescing.
 - [docs/design/fetchers.md](docs/design/fetchers.md) covers why URL mounts use
-  system `git` today and where `GixFetcher` still fits.
-- [docs/design/dotgit-synthesis.md](docs/design/dotgit-synthesis.md) covers
-  future `.git/` synthesis.
+  system `git` today (`k`-slot `cat-file` pool) and where `GixFetcher` / `GvfsFetcher` fit.
+- [docs/design/dotgit-synthesis.md](docs/design/dotgit-synthesis.md) and
+  [docs/design/dotgit-index.md](docs/design/dotgit-index.md) cover `.git/` and
+  `.git/index` synthesis.
 - [docs/design/windows-symlinks.md](docs/design/windows-symlinks.md) covers the
   Windows symlink policy.
 - [docs/design/winfsp-implementation-plan.md](docs/design/winfsp-implementation-plan.md)

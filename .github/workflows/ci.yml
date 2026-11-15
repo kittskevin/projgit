@@ -15,12 +15,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev pkg-config
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,3 +41,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets --features gvfs-fetcher
+
+      - name: FUSE and daemon mount smoke tests
+        run: |
+          cargo test -p projgit-fuse --test mount_smoke --test mount_multi -- --ignored --test-threads=1
+          cargo test -p projgit-daemon --test mount_smoke --test sidecar_mount_smoke --test xprocess_mount_smoke --test xns_mount_smoke -- --ignored --test-threads=1
+          cargo test -p projgit-cli --test attach_smoke -- --ignored --test-threads=1

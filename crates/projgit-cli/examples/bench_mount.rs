@@ -29,7 +29,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -82,6 +82,13 @@ enum Scenario {
     /// vary via `--worktree-strategy` and `--worktree-mode`.
     /// See `docs/design/worktree-comparator-bench.md`.
     WorktreeShared,
+    /// L2 uncompressed blob cache (`<git-dir>/blobs/<xx>/<oid>`)
+    /// range-read benchmark: compares a 4 KiB random range read on a
+    /// packed 4 MiB blob across (1) cold pack inflation + atomic L2
+    /// materialization, (2) warm L2 `pread`/`seek_read`, (3) a fresh
+    /// `ObjectStore` hitting warm L2 on disk, and (4) `git cat-file blob`
+    /// full-blob inflation. Runs offline on all platforms.
+    L2Range,
 }
 
 /// Clone strategy for the `worktree-shared` scenario. `Full`
@@ -104,6 +111,7 @@ enum WorktreeMode {
     OnDemand,
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 impl Scenario {
     fn is_concurrent(self) -> bool {
         matches!(self, Scenario::DaemonConcurrent | Scenario::NaiveConcurrent)
@@ -129,6 +137,7 @@ impl Scenario {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct Args {
     url: String,
     ref_name: String,
@@ -213,9 +222,10 @@ fn parse_args() -> Args {
                     "sparse-single" => Scenario::SparseSingle,
                     "sparse-shared" => Scenario::SparseShared,
                     "worktree-shared" => Scenario::WorktreeShared,
+                    "l2-range" => Scenario::L2Range,
                     other => {
                         eprintln!(
-                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single, sparse-shared, worktree-shared)"
+                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single, sparse-shared, worktree-shared, l2-range)"
                         );
                         std::process::exit(2);
                     }
@@ -314,12 +324,23 @@ fn parse_args() -> Args {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn main() {
-    eprintln!("bench_mount: only runs on Linux/macOS (FUSE)");
+fn main() -> anyhow::Result<()> {
+    let args = parse_args();
+    if args.scenario == Scenario::L2Range {
+        return run_l2_range_main(&args);
+    }
+    eprintln!(
+        "bench_mount: FUSE scenarios only run on Linux/macOS (use --scenario l2-range on Windows)"
+    );
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
+    let args = parse_args();
+    if args.scenario == Scenario::L2Range {
+        return run_l2_range_main(&args);
+    }
     if std::env::var("PROJGIT_NETWORK_TESTS").as_deref() != Ok("1") {
         eprintln!("SKIP: set PROJGIT_NETWORK_TESTS=1 to enable this bench");
         return Ok(());
@@ -327,7 +348,6 @@ fn main() -> anyhow::Result<()> {
     if !git_available() {
         anyhow::bail!("git not available on PATH");
     }
-    let args = parse_args();
 
     eprintln!(
         "bench_mount: {} @ {} ({} iterations, scenario={:?}, files={:?}{})\n",
@@ -394,7 +414,8 @@ fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
             | Scenario::Sequential
             | Scenario::SparseSingle
             | Scenario::SparseShared
-            | Scenario::WorktreeShared => unreachable!(),
+            | Scenario::WorktreeShared
+            | Scenario::L2Range => unreachable!(),
         };
         eprintln!(
             "ok (setup {} ms, wall {} ms, fail {})",
@@ -490,6 +511,7 @@ fn run_sparse_shared(args: &Args) -> anyhow::Result<()> {
 /// `ObjectStore` against the same on-disk cache dir (recorded in
 /// `mount2_cold_cat`).
 #[derive(Debug, Clone)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct ProjgitSample {
     /// `git clone --filter=blob:none --no-checkout` time.
     partial_clone: Duration,
@@ -513,6 +535,9 @@ struct ProjgitSample {
     /// approaches `cold_cat`, the on-disk store isn't amortising and
     /// there's a real finding.
     mount2_cold_cat: Option<Duration>,
+    /// `Sequential` only: L2 uncompressed on-disk blob cache hits
+    /// recorded on mount 2 during `mount2_cold_cat`.
+    mount2_disk_blob_hits: Option<u64>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -538,14 +563,18 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
         Ok(Arc::new(HydratingObjectStore::new(store, fetcher)))
     })?;
 
-    let mount2_cold_cat = match args.scenario {
-        Scenario::Single => None,
-        Scenario::Sequential => Some(projgit_remount_cold_cat(args, &cache_dir)?),
+    let (mount2_cold_cat, mount2_disk_blob_hits) = match args.scenario {
+        Scenario::Single => (None, None),
+        Scenario::Sequential => {
+            let (t, hits) = projgit_remount_cold_cat(args, &cache_dir)?;
+            (Some(t), Some(hits))
+        }
         Scenario::DaemonConcurrent
         | Scenario::NaiveConcurrent
         | Scenario::SparseSingle
         | Scenario::SparseShared
-        | Scenario::WorktreeShared => {
+        | Scenario::WorktreeShared
+        | Scenario::L2Range => {
             unreachable!("*-concurrent and sparse-* dispatch via their own run_*_main")
         }
     };
@@ -559,6 +588,7 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
         warm_walk: mount1.warm_walk,
         warm_cat: mount1.warm_cat,
         mount2_cold_cat,
+        mount2_disk_blob_hits,
     })
 }
 
@@ -656,7 +686,7 @@ where
 /// dir as the first mount, then measures only cold-cat of `args.files`.
 /// See `ProjgitSample::mount2_cold_cat` for the interpretation.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn projgit_remount_cold_cat(args: &Args, cache_dir: &Path) -> anyhow::Result<Duration> {
+fn projgit_remount_cold_cat(args: &Args, cache_dir: &Path) -> anyhow::Result<(Duration, u64)> {
     use projgit_core::{
         clone::git_dir_for, GitCliFetcher, HydratingObjectStore, ObjectStore, Projection,
         ProjectionFsProvider, RootOverlay,
@@ -669,7 +699,7 @@ fn projgit_remount_cold_cat(args: &Args, cache_dir: &Path) -> anyhow::Result<Dur
 
     let store = Arc::new(ObjectStore::open(git_dir_for(cache_dir))?);
     let fetcher = GitCliFetcher::open(store.clone())?;
-    let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+    let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
     let provider = Arc::new(ProjectionFsProvider::new(
         Projection::Ref(args.ref_name.clone()),
         hydrating,
@@ -686,9 +716,10 @@ fn projgit_remount_cold_cat(args: &Args, cache_dir: &Path) -> anyhow::Result<Dur
         }
         Ok::<_, anyhow::Error>(())
     })?;
+    let disk_hits = store.disk_blob_cache_stats().hits;
 
     drop(session);
-    Ok(cold_cat)
+    Ok((cold_cat, disk_hits))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -730,6 +761,7 @@ fn walk_count(root: &std::path::Path) -> anyhow::Result<usize> {
 /// fresh `git clone --filter=blob:none --no-checkout` of the same
 /// repo.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct GitSample {
     /// `git clone --filter=blob:none --no-checkout`.
     partial_clone: Duration,
@@ -741,6 +773,7 @@ struct GitSample {
     cat_blobs: Duration,
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn bench_git_baseline(args: &Args) -> anyhow::Result<GitSample> {
     let dir = make_temp("projgit-bench-git");
     let _guard = DirGuard(dir.clone());
@@ -798,6 +831,7 @@ fn run_git(cwd: Option<&std::path::Path>, args: &[&str]) -> anyhow::Result<()> {
 // Reporting
 // -----------------------------------------------------------------------------
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn print_report(args: &Args, projgit: &[ProjgitSample], git: &[GitSample]) {
     let p_clone = median(projgit.iter().map(|s| s.partial_clone).collect());
     let p_cold_ls = median(projgit.iter().map(|s| s.cold_readdir_root).collect());
@@ -849,23 +883,29 @@ fn print_report(args: &Args, projgit: &[ProjgitSample], git: &[GitSample]) {
 
     if args.scenario == Scenario::Sequential {
         let mount2: Vec<Duration> = projgit.iter().filter_map(|s| s.mount2_cold_cat).collect();
+        let disk_hits: Vec<u64> = projgit
+            .iter()
+            .filter_map(|s| s.mount2_disk_blob_hits)
+            .collect();
         if !mount2.is_empty() {
             let p_m2 = median(mount2);
+            let m2_hits = disk_hits.first().copied().unwrap_or(0);
             println!();
             println!("## Cross-process amortisation (workload-doc §1.6)\n");
             println!(
-                "A second mount in the same process, against the same on-disk\ncache dir, with a freshly-constructed `ObjectStore` (in-process\ncaches empty, on-disk CAS warm from mount 1). If `mount 2 cold`\napproaches `mount 1 warm`, §1.6 holds; if it approaches\n`mount 1 cold`, the on-disk store isn't amortising.\n"
+                "A second mount in the same process, against the same on-disk\ncache dir, with a freshly-constructed `ObjectStore` (in-process\ncaches empty, on-disk CAS + L2 uncompressed blob cache warm from\nmount 1). If `mount 2 cold` approaches `mount 1 warm`, §1.6 holds;\nif it approaches `mount 1 cold`, the on-disk store isn't amortising.\n"
             );
             println!(
-                "| Operation | mount 1 cold | mount 1 warm | **mount 2 cold (cross-process)** |"
+                "| Operation | mount 1 cold | mount 1 warm | **mount 2 cold (cross-process)** | mount 2 L2 disk blob hits |"
             );
-            println!("|---|---:|---:|---:|");
+            println!("|---|---:|---:|---:|---:|");
             println!(
-                "| cat {} files | {} | {} | **{}** |",
+                "| cat {} files | {} | {} | **{}** | {} |",
                 args.files.len(),
                 ms(p_cold_cat),
                 ms(p_warm_cat),
                 ms(p_m2),
+                m2_hits,
             );
         }
     }
@@ -1461,6 +1501,7 @@ fn sparse_single_depth1(args: &Args) -> anyhow::Result<SparseConfigSample> {
 /// symlinks (uses `symlink_metadata` semantics via the file_type
 /// check). Bench-grade — not a `du -s` replacement, but good
 /// enough for one-shot reporting.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn disk_bytes_of(root: &std::path::Path) -> anyhow::Result<u64> {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
@@ -2217,6 +2258,192 @@ fn print_worktree_shared_report(args: &Args, samples: &[SparseSharedConfig]) {
         ms(total),
         fail,
     );
+}
+
+// -----------------------------------------------------------------------------
+// L2 uncompressed blob cache (`<git-dir>/blobs/<xx>/<oid>`) range-read bench
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct L2RangeSample {
+    /// Cold 4 KiB range read on a 4 MiB packed blob: inflates from
+    /// `.git/objects/pack`, atomically writes `<git-dir>/blobs/<xx>/<oid>`,
+    /// and slices `[1 MiB .. 1 MiB + 4 KiB)`.
+    cold_materialize_4k: Duration,
+    /// Warm 4 KiB range read on the same `ObjectStore` (blob is > 64 KiB
+    /// L1 cap, so this hits the L2 uncompressed file on disk via
+    /// `pread` / `seek_read`).
+    warm_l2_pread_4k: Duration,
+    /// Cross-store 4 KiB range read on a freshly opened `ObjectStore`
+    /// against the same `<git-dir>` (cold in-memory caches, warm L2
+    /// uncompressed blob on disk).
+    mount2_l2_pread_4k: Duration,
+    /// Sequential 32 x 128 KiB FUSE-sized chunk reads across the 4 MiB
+    /// blob via warm L2 `pread` / `seek_read` (without L2, each of the
+    /// 32 chunks misses the 64 KiB L1 cap and re-inflates the full 4 MiB
+    /// pack entry).
+    stream_32x128k_l2: Duration,
+    /// `git cat-file blob <oid>` baseline (must inflate the entire
+    /// 4 MiB packed blob even when the caller only wants a 4 KiB slice).
+    git_cat_file_full: Duration,
+}
+
+fn run_l2_range_main(args: &Args) -> anyhow::Result<()> {
+    if !git_available() {
+        anyhow::bail!("git not available on PATH");
+    }
+    eprintln!(
+        "bench_mount: scenario=L2Range ({} iterations, 4 MiB packed blob, 4 KiB range + 32x128 KiB stream)\n",
+        args.iterations,
+    );
+    let mut samples = Vec::with_capacity(args.iterations);
+    for i in 1..=args.iterations {
+        eprint!("== iteration {i}/{} == ", args.iterations);
+        let s = bench_l2_range_once()?;
+        eprintln!(
+            "cold_4k={} ms, warm_l2_4k={} ms, cross_store_4k={} ms, stream_32x128k={} ms, git_cat_file={} ms",
+            ms(s.cold_materialize_4k),
+            ms(s.warm_l2_pread_4k),
+            ms(s.mount2_l2_pread_4k),
+            ms(s.stream_32x128k_l2),
+            ms(s.git_cat_file_full),
+        );
+        samples.push(s);
+    }
+    eprintln!();
+
+    let cold = median(samples.iter().map(|s| s.cold_materialize_4k).collect());
+    let warm_l2 = median(samples.iter().map(|s| s.warm_l2_pread_4k).collect());
+    let mount2_l2 = median(samples.iter().map(|s| s.mount2_l2_pread_4k).collect());
+    let stream_32 = median(samples.iter().map(|s| s.stream_32x128k_l2).collect());
+    let git_cat = median(samples.iter().map(|s| s.git_cat_file_full).collect());
+
+    println!("# bench_mount: L2 uncompressed blob cache (`--scenario l2-range`)\n");
+    println!(
+        "Median of {} iterations on a 4 MiB packed blob (`> 64 KiB` L1 cap). All times in milliseconds.\n",
+        args.iterations,
+    );
+    println!("| Operation on 4 MiB packed blob (`> 64 KiB` L1 cap) | Median (ms) | Speedup vs cold | Speedup vs `git cat-file` |");
+    println!("|---|---:|---:|---:|");
+    println!(
+        "| Cold `read_blob_range` (4 KiB slice; pack inflate + atomic L2 write) | {} | 1.0x | {:.2}x |",
+        ms(cold),
+        git_cat.as_secs_f64() / cold.as_secs_f64().max(1e-9),
+    );
+    println!(
+        "| Warm L2 `read_blob_range` (4 KiB `pread`/`seek_read`, same store) | **{}** | **{:.1}x** | **{:.1}x** |",
+        ms(warm_l2),
+        cold.as_secs_f64() / warm_l2.as_secs_f64().max(1e-9),
+        git_cat.as_secs_f64() / warm_l2.as_secs_f64().max(1e-9),
+    );
+    println!(
+        "| Cross-store L2 `read_blob_range` (4 KiB `pread`/`seek_read`, fresh `ObjectStore`) | **{}** | **{:.1}x** | **{:.1}x** |",
+        ms(mount2_l2),
+        cold.as_secs_f64() / mount2_l2.as_secs_f64().max(1e-9),
+        git_cat.as_secs_f64() / mount2_l2.as_secs_f64().max(1e-9),
+    );
+    println!(
+        "| 32 x 128 KiB FUSE-chunk stream via L2 (vs 32x cold pack inflate = {:.1} ms) | **{}** | **{:.1}x** | **{:.1}x** |",
+        cold.as_secs_f64() * 32.0 * 1000.0,
+        ms(stream_32),
+        (cold.as_secs_f64() * 32.0) / stream_32.as_secs_f64().max(1e-9),
+        git_cat.as_secs_f64() / stream_32.as_secs_f64().max(1e-9),
+    );
+    println!(
+        "| `git cat-file blob <oid>` baseline (full 4 MiB inflate) | {} | {:.2}x | 1.0x |",
+        ms(git_cat),
+        cold.as_secs_f64() / git_cat.as_secs_f64().max(1e-9),
+    );
+    Ok(())
+}
+
+fn bench_l2_range_once() -> anyhow::Result<L2RangeSample> {
+    use projgit_core::ObjectStore;
+
+    let repo = make_temp("projgit-bench-l2-range");
+    let _guard = DirGuard(repo.clone());
+
+    run_git(Some(&repo), &["init", "-q", "-b", "main"])?;
+    run_git(Some(&repo), &["config", "user.name", "projgit-bench"])?;
+    run_git(
+        Some(&repo),
+        &["config", "user.email", "bench@projgit.invalid"],
+    )?;
+    run_git(Some(&repo), &["config", "core.autocrlf", "false"])?;
+
+    // Deterministic pseudo-random 4 MiB payload so zlib actually works
+    // to compress/inflate it inside the git packfile.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let payload: Vec<u8> = (0..(4 * 1024 * 1024))
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect();
+    std::fs::write(repo.join("large.bin"), &payload)?;
+    run_git(Some(&repo), &["add", "large.bin"])?;
+    run_git(Some(&repo), &["commit", "-q", "-m", "add 4 MiB blob"])?;
+    run_git(Some(&repo), &["repack", "-a", "-d", "-q"])?;
+
+    let store_a = ObjectStore::open(&repo)?;
+    let head = store_a.resolve_ref("HEAD")?;
+    let tree = store_a.commit_tree(head)?;
+    let entries = store_a.read_tree(tree)?;
+    let blob_oid = entries
+        .iter()
+        .find(|e| e.name.as_slice() == b"large.bin")
+        .expect("large.bin entry")
+        .oid;
+
+    let offset: u64 = 1024 * 1024;
+    let len: u32 = 4096;
+
+    let cold_materialize_4k = time_it(|| {
+        let slice = store_a.read_blob_range(blob_oid, offset, len)?;
+        assert_eq!(slice.len(), len as usize);
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    // Touch the newly-renamed L2 file once so any OS-level first-open
+    // antivirus hook (e.g. Windows Defender on newly-created files) is
+    // amortized before measuring steady-state L2 `pread` / `seek_read`.
+    let _ = store_a.read_blob_range(blob_oid, 0, len)?;
+
+    let warm_l2_pread_4k = time_it(|| {
+        let slice = store_a.read_blob_range(blob_oid, offset, len)?;
+        assert_eq!(slice.len(), len as usize);
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    let store_b = ObjectStore::open(&repo)?;
+    let mount2_l2_pread_4k = time_it(|| {
+        let slice = store_b.read_blob_range(blob_oid, offset, len)?;
+        assert_eq!(slice.len(), len as usize);
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    let stream_32x128k_l2 = time_it(|| {
+        let chunk: u32 = 128 * 1024;
+        for idx in 0..32u64 {
+            let slice = store_b.read_blob_range(blob_oid, idx * u64::from(chunk), chunk)?;
+            assert_eq!(slice.len(), chunk as usize);
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    let oid_hex = blob_oid.to_string();
+    let git_cat_file_full =
+        time_it(|| run_git(Some(&repo), &["cat-file", "blob", oid_hex.as_str()]))?;
+
+    Ok(L2RangeSample {
+        cold_materialize_4k,
+        warm_l2_pread_4k,
+        mount2_l2_pread_4k,
+        stream_32x128k_l2,
+        git_cat_file_full,
+    })
 }
 
 // -----------------------------------------------------------------------------
