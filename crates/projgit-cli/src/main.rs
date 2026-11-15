@@ -851,6 +851,7 @@ where
         let t = s.tree_cache_stats();
         let h = s.header_cache_stats();
         let b = s.blob_cache_stats();
+        let d = s.disk_blob_cache_stats();
         eprintln!(
             "projgit: tree cache    hits={} misses={} inserts={} evictions={} len={}/{}",
             t.hits, t.misses, t.inserts, t.evictions, t.len, t.capacity,
@@ -863,6 +864,10 @@ where
             "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
             b.hits, b.misses, b.inserts, b.evictions, b.skipped_too_large,
             b.bytes_used, b.capacity_bytes,
+        );
+        eprintln!(
+            "projgit: disk blobs    hits={} misses={} inserts={} write_errors={}",
+            d.hits, d.misses, d.inserts, d.write_errors,
         );
         for (provider, spec) in providers.iter().zip(args.mounts.iter()) {
             let p = provider.prefetch_stats();
@@ -947,6 +952,7 @@ where
         let t = store.tree_cache_stats();
         let h = store.header_cache_stats();
         let b = store.blob_cache_stats();
+        let d = store.disk_blob_cache_stats();
         let p = provider.prefetch_stats();
         eprintln!(
             "projgit: tree cache    hits={} misses={} inserts={} evictions={} len={}/{}",
@@ -965,6 +971,10 @@ where
             b.skipped_too_large,
             b.bytes_used,
             b.capacity_bytes,
+        );
+        eprintln!(
+            "projgit: disk blobs    hits={} misses={} inserts={} write_errors={}",
+            d.hits, d.misses, d.inserts, d.write_errors,
         );
         eprintln!(
             "projgit: prefetch (T1) posted={} dropped={} batches={} resolved={} headers={} failed={} blobs_warmed={} blobs_skipped={}",

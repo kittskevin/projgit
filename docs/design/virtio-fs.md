@@ -82,10 +82,9 @@ cache, we materialize [`cache-transform-tier.md`](cache-transform-tier.md)
 canonical Git ODB:
 
 ```text
-<cache-dir>/<repo-key>/
-├── .git/
-│   └── objects/
-│       └── pack/              # Canonical Git ODB (commits, trees, fetched packs)
+<git-dir>/
+├── objects/
+│   └── pack/                  # Canonical Git ODB (commits, trees, fetched packs)
 └── blobs/                     # Organ 2: uncompressed, flat, OID-keyed blob files
     ├── 00/
     │   └── 00a1b2c3...        # Exact inflated bytes of blob OID 00a1b2c3...

@@ -699,3 +699,119 @@ fn overlay_synthetic_directory_walks() {
         }
     ));
 }
+
+#[test]
+fn uncompressed_blob_cache_materializes_and_serves_ranges_across_stores() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, _head_hex) = build_fixture("os_uncompressed_blob");
+
+    // Add a 128 KiB file so it exceeds the 64 KiB in-memory BlobCache
+    // per-entry cap and exercises the on-disk uncompressed blob cache
+    // directly for range reads.
+    let large_payload: Vec<u8> = (0..(128 * 1024)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(repo.join("large.bin"), &large_payload).unwrap();
+    git(&repo, &["add", "large.bin"]);
+    git(&repo, &["commit", "-q", "-m", "add large.bin"]);
+    let head = parse_oid(
+        String::from_utf8(git(&repo, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim(),
+    );
+
+    let store_a = ObjectStore::open(&repo).unwrap();
+    let tree = store_a.commit_tree(head).unwrap();
+    let entries = store_a.read_tree(tree).unwrap();
+    let large_entry = entries
+        .iter()
+        .find(|e| e.name == b"large.bin".as_bstr())
+        .expect("large.bin entry");
+
+    let blob_path = store_a.uncompressed_blob_path(large_entry.oid);
+    assert!(
+        !blob_path.exists(),
+        "blob should not be materialized before first access"
+    );
+
+    // Cold range read on Store A: inflates from git ODB and atomically
+    // materializes <git-dir>/blobs/<xx>/<oid>.
+    let slice_a = store_a.read_blob_range(large_entry.oid, 1000, 512).unwrap();
+    assert_eq!(&slice_a, &large_payload[1000..1512]);
+    assert!(
+        blob_path.is_file(),
+        "uncompressed blob file must be materialized on disk"
+    );
+    let d_a = store_a.disk_blob_cache_stats();
+    assert_eq!(d_a.misses, 1);
+    assert_eq!(d_a.inserts, 1);
+
+    // Because large.bin is 128 KiB (> 64 KiB cap), it was skipped by
+    // the in-memory BlobCache; a second range read on Store A hits the
+    // on-disk uncompressed blob cache via pread/seek_read.
+    let slice_a2 = store_a
+        .read_blob_range(large_entry.oid, 90_000, 256)
+        .unwrap();
+    assert_eq!(&slice_a2, &large_payload[90_000..90_256]);
+    assert_eq!(store_a.disk_blob_cache_stats().hits, 1);
+
+    // Open a second ObjectStore (simulating another sidecar / virtio-fs
+    // process sharing <git-dir>). Its in-memory caches are cold, so it
+    // serves directly from the materialized uncompressed blob on disk.
+    let store_b = ObjectStore::open(&repo).unwrap();
+    assert!(store_b.contains(large_entry.oid));
+    let (kind, size) = store_b.header(large_entry.oid).unwrap();
+    assert_eq!(kind, ObjectKind::Blob);
+    assert_eq!(size, large_payload.len() as u64);
+
+    let slice_b = store_b
+        .read_blob_range(large_entry.oid, 50_000, 1024)
+        .unwrap();
+    assert_eq!(&slice_b, &large_payload[50_000..51_024]);
+    let d_b = store_b.disk_blob_cache_stats();
+    assert_eq!(d_b.hits, 1);
+    assert_eq!(d_b.misses, 0);
+
+    // ensure_uncompressed_blob returns an open File handle with the
+    // exact uncompressed bytes, and validates kind / missing errors.
+    let file = store_b.ensure_uncompressed_blob(large_entry.oid).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), large_payload.len() as u64);
+    assert_eq!(store_b.disk_blob_cache_stats().hits, 2);
+
+    let kind_err = store_b.ensure_uncompressed_blob(head).unwrap_err();
+    assert!(matches!(
+        kind_err,
+        projgit_core::ObjectStoreError::UnexpectedKind {
+            expected: ObjectKind::Blob,
+            actual: ObjectKind::Commit,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn dotgit_isolated_overlay_omits_host_alternates() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head_hex) = build_fixture("os_isolated_dotgit");
+    let store = ObjectStore::open(&repo).unwrap();
+    let head = parse_oid(&head_hex);
+
+    let overlay = projgit_core::dotgit::a1_plus_isolated_overlay(&store, head).unwrap();
+    let proj = Projection::Commit(head);
+
+    // .git/HEAD and .git/index are present.
+    assert!(proj.lookup(&store, &overlay, ".git/HEAD").is_ok());
+    assert!(proj.lookup(&store, &overlay, ".git/index").is_ok());
+    assert!(proj.lookup(&store, &overlay, ".git/objects/info").is_ok());
+    assert!(proj.lookup(&store, &overlay, ".git/objects/pack").is_ok());
+
+    // .git/objects/info/alternates must NOT exist in the isolated
+    // microVM overlay so host paths never leak into the guest.
+    assert!(proj
+        .lookup(&store, &overlay, ".git/objects/info/alternates")
+        .is_err());
+}

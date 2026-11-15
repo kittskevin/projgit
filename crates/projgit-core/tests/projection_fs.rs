@@ -522,3 +522,62 @@ fn gitlink_renders_as_empty_directory() {
     let inner = p.readdir(sub.inode, 0).unwrap();
     assert!(inner.is_empty());
 }
+
+#[test]
+fn backing_file_returns_uncompressed_host_file_for_tree_files() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head) = build_fixture("backing_file");
+
+    let mut overlay = RootOverlay::new();
+    overlay.insert(
+        BString::from(".synth-file"),
+        SyntheticEntry::file(b"in-memory overlay\n".to_vec()),
+    );
+
+    let store = Arc::new(ObjectStore::open(&repo).unwrap());
+    let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), NoopFetcher));
+    let p = ProjectionFsProvider::new(Projection::Commit(head), hydrating, overlay, 1).unwrap();
+
+    // 1. Projected regular file -> returns Some(Arc<File>) backed by
+    //    <git-dir>/blobs/<xx>/<oid> for virtio-fs DAX / passthrough.
+    let readme = lookup(&p, ROOT_INODE, b"README.md");
+    let backing = p
+        .backing_file(readme.inode)
+        .unwrap()
+        .expect("tree file must return a host backing File");
+    let mut file_bytes = Vec::new();
+    {
+        use std::io::Read;
+        (&*backing).read_to_end(&mut file_bytes).unwrap();
+    }
+    assert_eq!(&file_bytes, b"# fixture repo\n");
+    assert!(store.disk_blob_cache_stats().inserts >= 1);
+
+    // Second backing_file call hits the already-materialized blob.
+    let hits_before = store.disk_blob_cache_stats().hits;
+    let _backing2 = p.backing_file(readme.inode).unwrap().unwrap();
+    assert!(store.disk_blob_cache_stats().hits > hits_before);
+
+    // 2. Synthetic overlay file -> returns Ok(None) (in-memory buffer).
+    let synth = lookup(&p, ROOT_INODE, b".synth-file");
+    assert!(p.backing_file(synth.inode).unwrap().is_none());
+
+    // 3. Directory and symlink inodes -> Err(FsError::NotAFile).
+    assert_eq!(p.backing_file(ROOT_INODE).unwrap_err(), FsError::NotAFile);
+    let src_dir = lookup(&p, ROOT_INODE, b"src");
+    assert_eq!(
+        p.backing_file(src_dir.inode).unwrap_err(),
+        FsError::NotAFile
+    );
+    let symlink = lookup(&p, ROOT_INODE, b"link-to-readme");
+    assert_eq!(
+        p.backing_file(symlink.inode).unwrap_err(),
+        FsError::NotAFile
+    );
+
+    // 4. Unknown inode -> Err(FsError::NotFound).
+    assert_eq!(p.backing_file(0xDEAD_BEEF).unwrap_err(), FsError::NotFound);
+}

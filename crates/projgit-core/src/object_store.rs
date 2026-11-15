@@ -21,6 +21,16 @@
 //!   ([`crate::blob_cache`]) so warm `cat` calls of source-sized
 //!   files don't re-decode through gix. Skips blobs above a
 //!   per-entry size threshold.
+//! - **Uncompressed on-disk blob cache (Organ 2).** Decoded blobs are
+//!   atomically materialized as flat, uncompressed, OID-keyed files
+//!   under `<git-dir>/blobs/<xx>/<oid>`. This enables:
+//!   - `virtio-fs` + `DAX` (`FUSE_SETUPMAPPING`) and `FUSE_PASSTHROUGH`
+//!     via [`ObjectStore::ensure_uncompressed_blob`] and
+//!     [`crate::FsProvider::backing_file`].
+//!   - True `O(range)` positioned reads via [`ObjectStore::read_blob_range`]
+//!     (`pread` / `read_at`) without re-inflating large blobs.
+//!   - Cross-process sharing of already-inflated blob bytes across
+//!     daemon and sidecar instances sharing the same `<git-dir>`.
 //! - **Header LRU.** `header` consults a small bounded LRU
 //!   ([`crate::header_cache`]) so warm `lookup`s and the
 //!   `readdir`-time prefetch worker don't repeatedly re-decode
@@ -36,9 +46,50 @@ use crate::header_cache::{
 use crate::tree_cache::{TreeCache, TreeCacheStats, DEFAULT_CAPACITY};
 use bstr::BString;
 use gix::ObjectId;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+/// Snapshot of on-disk uncompressed blob cache ("Organ 2") counters.
+///
+/// Tracks materialization and serving of flat, uncompressed, OID-keyed
+/// blob files under `<git-dir>/blobs/<xx>/<oid>`. See
+/// `docs/design/virtio-fs.md` §2 and `docs/design/cache-transform-tier.md` §9.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskBlobCacheStats {
+    /// Number of blob reads / handle lookups served from an
+    /// already-materialized file under `<git-dir>/blobs/`.
+    pub hits: u64,
+    /// Number of blob lookups that missed `<git-dir>/blobs/` and had
+    /// to inflate the object from the git ODB.
+    pub misses: u64,
+    /// Number of blobs newly materialized into `<git-dir>/blobs/`.
+    pub inserts: u64,
+    /// Number of best-effort materialization writes that failed (for
+    /// example when `<git-dir>` resides on a read-only mount).
+    pub write_errors: u64,
+}
+
+#[derive(Debug, Default)]
+struct DiskBlobCounters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    write_errors: AtomicU64,
+}
+
+impl DiskBlobCounters {
+    fn snapshot(&self) -> DiskBlobCacheStats {
+        DiskBlobCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            write_errors: self.write_errors.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// The kind of a git object, mirroring git's four object types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +126,11 @@ impl ObjectKind {
 pub struct ObjectStore {
     repo: gix::ThreadSafeRepository,
     git_dir: PathBuf,
+    blobs_dir: PathBuf,
     tree_cache: TreeCache,
     blob_cache: BlobCache,
     header_cache: HeaderCache,
+    disk_blob_stats: DiskBlobCounters,
 }
 
 impl ObjectStore {
@@ -92,12 +145,15 @@ impl ObjectStore {
             source: Box::new(source),
         })?;
         let git_dir = repo.git_dir().to_path_buf();
+        let blobs_dir = git_dir.join("blobs");
         Ok(Self {
             repo: repo.into_sync(),
             git_dir,
+            blobs_dir,
             tree_cache: TreeCache::with_capacity(DEFAULT_CAPACITY),
             blob_cache: BlobCache::new(DEFAULT_CAPACITY_BYTES, DEFAULT_PER_ENTRY_MAX_BYTES),
             header_cache: HeaderCache::with_capacity(DEFAULT_HEADER_CAPACITY),
+            disk_blob_stats: DiskBlobCounters::default(),
         })
     }
 
@@ -136,12 +192,33 @@ impl ObjectStore {
         &self.git_dir
     }
 
+    /// Root directory of the uncompressed on-disk blob cache
+    /// (`<git-dir>/blobs`).
+    pub fn blobs_dir(&self) -> &Path {
+        &self.blobs_dir
+    }
+
+    /// Path of the uncompressed on-disk blob file for `oid`
+    /// (`<git-dir>/blobs/<oid[0..2]>/<oid>`).
+    ///
+    /// Does not check whether the file has been materialized yet; use
+    /// [`Self::ensure_uncompressed_blob`] to materialize and open it.
+    pub fn uncompressed_blob_path(&self, oid: ObjectId) -> PathBuf {
+        let hex = oid.to_string();
+        let (prefix, _) = hex.split_at(2);
+        self.blobs_dir.join(prefix).join(&hex)
+    }
+
     /// Cheap presence check.
     ///
-    /// Returns `true` if the object is currently in the local store.
-    /// Does **not** trigger any network activity even if the store has
-    /// a promisor remote configured.
+    /// Returns `true` if the object is currently in the local store
+    /// (including the in-memory header cache or the on-disk
+    /// uncompressed blob cache). Does **not** trigger any network
+    /// activity even if the store has a promisor remote configured.
     pub fn contains(&self, oid: ObjectId) -> bool {
+        if self.header_cache.get(&oid).is_some() || self.uncompressed_blob_path(oid).is_file() {
+            return true;
+        }
         self.handle()
             .try_find_object(oid)
             .map(|o| o.is_some())
@@ -152,14 +229,24 @@ impl ObjectStore {
     /// `MissingObject` if absent.
     ///
     /// Backed by an internal LRU ([`crate::header_cache`]). Cold
-    /// reads decode the header via gix once and publish to the
-    /// cache; warm reads return the cached `(kind, size)` tuple
-    /// without touching gix.
+    /// reads consult the on-disk uncompressed blob cache first (a
+    /// single `stat` if the blob is already materialized) before
+    /// decoding the header via gix, and publish to the cache; warm
+    /// reads return the cached `(kind, size)` tuple without touching
+    /// disk or gix.
     pub fn header(&self, oid: ObjectId) -> Result<(ObjectKind, u64), ObjectStoreError> {
         if let Some((kind, size)) = self.header_cache.get(&oid) {
             return Ok((kind, size));
         }
         self.header_cache.record_miss();
+
+        if let Ok(meta) = std::fs::metadata(self.uncompressed_blob_path(oid)) {
+            if meta.is_file() {
+                let size = meta.len();
+                self.header_cache.put(oid, ObjectKind::Blob, size);
+                return Ok((ObjectKind::Blob, size));
+            }
+        }
 
         let h = self.handle();
         let header = h
@@ -184,21 +271,142 @@ impl ObjectStore {
         self.header_cache.put(oid, kind, size);
     }
 
+    /// Ensure the blob `oid` is materialized as a flat, uncompressed
+    /// file at `<git-dir>/blobs/<xx>/<oid>` and return an open
+    /// read-only [`std::fs::File`] handle to it.
+    ///
+    /// - **Warm path:** if `<git-dir>/blobs/<xx>/<oid>` already exists,
+    ///   opens and returns it immediately (`disk_blob_cache_stats().hits`
+    ///   increments).
+    /// - **Cold path:** inflates the blob from the underlying git ODB,
+    ///   writes it to `<git-dir>/blobs/tmp/<oid>.<pid>.<seq>.tmp`,
+    ///   marks it read-only (`0444` on Unix), and atomically renames it
+    ///   into place (`<git-dir>/blobs/<xx>/<oid>`) before returning the
+    ///   opened file handle.
+    ///
+    /// Used by `virtio-fs` (`vhost-user-fs` + `DAX` `FUSE_SETUPMAPPING`),
+    /// `FUSE_PASSTHROUGH`, and background blob warming.
+    pub fn ensure_uncompressed_blob(&self, oid: ObjectId) -> Result<Arc<File>, ObjectStoreError> {
+        let blob_path = self.uncompressed_blob_path(oid);
+        if let Ok(file) = File::open(&blob_path) {
+            self.disk_blob_stats.hits.fetch_add(1, Ordering::Relaxed);
+            if let Ok(meta) = file.metadata() {
+                self.header_cache.put(oid, ObjectKind::Blob, meta.len());
+            }
+            return Ok(Arc::new(file));
+        }
+
+        self.disk_blob_stats.misses.fetch_add(1, Ordering::Relaxed);
+        let bytes = self.decode_blob_from_odb(oid)?;
+        self.header_cache
+            .put(oid, ObjectKind::Blob, bytes.len() as u64);
+        let path = self
+            .materialize_uncompressed_blob(oid, &bytes)
+            .map_err(|e| ObjectStoreError::Backend(format!("materializing blob {oid}: {e}")))?;
+        let file = File::open(&path).map_err(|e| {
+            ObjectStoreError::Backend(format!("opening materialized blob {oid}: {e}"))
+        })?;
+        Ok(Arc::new(file))
+    }
+
+    /// Read a byte range `[offset .. offset + size)` of a blob.
+    ///
+    /// Returns `MissingObject` if absent or `UnexpectedKind` if `oid`
+    /// names a non-blob. Offsets at or past EOF return an empty `Vec`;
+    /// reads that extend past EOF are clamped to the remaining bytes.
+    ///
+    /// Resolution order:
+    /// 1. **In-memory L1 (`BlobCache`):** slices `[offset..end]` directly
+    ///    from the cached `Arc<Vec<u8>>` without cloning the full blob.
+    /// 2. **On-disk uncompressed L2 (`<git-dir>/blobs/<xx>/<oid>`):**
+    ///    performs a positioned read (`pread` / `read_at` on Unix,
+    ///    `seek_read` on Windows) of **only** `[offset..end]` directly
+    ///    from the OS page cache without touching `gix` or inflating
+    ///    packfiles. If the read covers the entire blob (`offset == 0`
+    ///    and `end == blob_len`), the bytes are also promoted into L1.
+    /// 3. **Cold ODB decode (`gix`):** inflates the blob from the pack /
+    ///    loose object store, atomically materializes it into L2
+    ///    (`<git-dir>/blobs/<xx>/<oid>`), inserts into L1 (if within the
+    ///    per-entry cap), and returns the requested `[offset..end]`
+    ///    slice.
+    pub fn read_blob_range(
+        &self,
+        oid: ObjectId,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, ObjectStoreError> {
+        if let Some(cached) = self.blob_cache.get(&oid) {
+            return Ok(slice_range(&cached, offset, size));
+        }
+        self.blob_cache.record_miss();
+
+        let blob_path = self.uncompressed_blob_path(oid);
+        if let Ok(file) = File::open(&blob_path) {
+            self.disk_blob_stats.hits.fetch_add(1, Ordering::Relaxed);
+            if let Ok(meta) = file.metadata() {
+                let blob_len = meta.len();
+                self.header_cache.put(oid, ObjectKind::Blob, blob_len);
+                if offset >= blob_len || size == 0 {
+                    return Ok(Vec::new());
+                }
+                let end = offset.saturating_add(u64::from(size)).min(blob_len);
+                let to_read = (end - offset) as usize;
+                if let Ok(buf) = read_file_range(&file, offset, to_read) {
+                    if offset == 0 && (buf.len() as u64) == blob_len {
+                        self.blob_cache.put(oid, Arc::new(buf.clone()));
+                    }
+                    return Ok(buf);
+                }
+            }
+        }
+
+        self.disk_blob_stats.misses.fetch_add(1, Ordering::Relaxed);
+        let bytes = self.decode_blob_from_odb(oid)?;
+        self.header_cache
+            .put(oid, ObjectKind::Blob, bytes.len() as u64);
+        let _ = self.materialize_uncompressed_blob(oid, &bytes);
+        let slice = slice_range(&bytes, offset, size);
+        self.blob_cache.put(oid, Arc::new(bytes));
+        Ok(slice)
+    }
+
     /// Read the raw bytes of a blob. Returns `MissingObject` if absent
     /// or `UnexpectedKind` if the OID names a non-blob.
     ///
-    /// Backed by an internal byte-bounded LRU
-    /// ([`crate::blob_cache`]). Cold reads decode the blob once and
-    /// publish a clone to the cache; warm reads return a clone of
-    /// the cached bytes without touching gix. Blobs over the cache's
-    /// per-entry size cap (default 64 KiB) are served straight from
-    /// gix on every read.
+    /// Backed by the two-tier blob cache:
+    /// 1. In-memory byte-bounded LRU ([`crate::blob_cache`]).
+    /// 2. On-disk uncompressed blob cache (`<git-dir>/blobs/<xx>/<oid>`).
+    /// 3. Cold decode via `gix` (which populates both tiers).
     pub fn read_blob(&self, oid: ObjectId) -> Result<Vec<u8>, ObjectStoreError> {
         if let Some(cached) = self.blob_cache.get(&oid) {
             return Ok((*cached).clone());
         }
         self.blob_cache.record_miss();
 
+        let blob_path = self.uncompressed_blob_path(oid);
+        if let Ok(bytes) = std::fs::read(&blob_path) {
+            self.disk_blob_stats.hits.fetch_add(1, Ordering::Relaxed);
+            self.header_cache
+                .put(oid, ObjectKind::Blob, bytes.len() as u64);
+            self.blob_cache.put(oid, Arc::new(bytes.clone()));
+            return Ok(bytes);
+        }
+
+        self.disk_blob_stats.misses.fetch_add(1, Ordering::Relaxed);
+        let bytes = self.decode_blob_from_odb(oid)?;
+        self.header_cache
+            .put(oid, ObjectKind::Blob, bytes.len() as u64);
+        let _ = self.materialize_uncompressed_blob(oid, &bytes);
+        // Publish to the cache after a successful read. The cache
+        // skips entries above its per-entry cap internally, so we
+        // don't need to gate the put here.
+        self.blob_cache.put(oid, Arc::new(bytes.clone()));
+        Ok(bytes)
+    }
+
+    /// Decode a blob directly from the underlying `gix` ODB, verifying
+    /// that the object exists and is of kind [`ObjectKind::Blob`].
+    fn decode_blob_from_odb(&self, oid: ObjectId) -> Result<Vec<u8>, ObjectStoreError> {
         let h = self.handle();
         let obj = h
             .try_find_object(oid)
@@ -212,12 +420,92 @@ impl ObjectStore {
                 actual,
             });
         }
-        let bytes = obj.data.clone();
-        // Publish to the cache after a successful read. The cache
-        // skips entries above its per-entry cap internally, so we
-        // don't need to gate the put here.
-        self.blob_cache.put(oid, Arc::new(bytes.clone()));
-        Ok(bytes)
+        Ok(obj.data.clone())
+    }
+
+    /// Atomically materialize `data` at `<git-dir>/blobs/<xx>/<oid>`
+    /// via a temporary file + `rename(2)`.
+    fn materialize_uncompressed_blob(
+        &self,
+        oid: ObjectId,
+        data: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+        let final_path = self.uncompressed_blob_path(oid);
+        if final_path.is_file() {
+            return Ok(final_path);
+        }
+
+        let parent = final_path.parent().expect("blob path has fanout parent");
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            self.disk_blob_stats
+                .write_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
+        let tmp_dir = self.blobs_dir.join("tmp");
+        if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+            self.disk_blob_stats
+                .write_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
+
+        let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = tmp_dir.join(format!("{oid}.{}.{seq:x}.tmp", std::process::id()));
+
+        {
+            use std::io::Write;
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    self.disk_blob_stats
+                        .write_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = file.write_all(data) {
+                let _ = std::fs::remove_file(&tmp_path);
+                self.disk_blob_stats
+                    .write_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&tmp_path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o444);
+                let _ = std::fs::set_permissions(&tmp_path, perms);
+            }
+        }
+
+        match std::fs::rename(&tmp_path, &final_path) {
+            Ok(()) => {
+                self.disk_blob_stats.inserts.fetch_add(1, Ordering::Relaxed);
+                Ok(final_path)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                if final_path.is_file() {
+                    Ok(final_path)
+                } else {
+                    self.disk_blob_stats
+                        .write_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Read and parse a tree's entries, returning them in the order
@@ -287,6 +575,12 @@ impl ObjectStore {
     /// [`Self::tree_cache_stats`] for caveats.
     pub fn header_cache_stats(&self) -> HeaderCacheStats {
         self.header_cache.stats()
+    }
+
+    /// Snapshot of the on-disk uncompressed blob cache ("Organ 2")
+    /// counters. See [`Self::tree_cache_stats`] for caveats.
+    pub fn disk_blob_cache_stats(&self) -> DiskBlobCacheStats {
+        self.disk_blob_stats.snapshot()
     }
 
     /// Return the committer timestamp of a commit as a [`SystemTime`].
@@ -422,4 +716,65 @@ pub struct RawTreeEntry {
     /// OID of the referenced object (blob OID for files / symlinks,
     /// tree OID for directories, commit OID for gitlinks).
     pub oid: ObjectId,
+}
+
+fn slice_range(bytes: &[u8], offset: u64, size: u32) -> Vec<u8> {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    if start >= bytes.len() || size == 0 {
+        return Vec::new();
+    }
+    let end = start.saturating_add(size as usize).min(bytes.len());
+    bytes[start..end].to_vec()
+}
+
+#[cfg(unix)]
+fn read_file_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; len];
+    let mut read_total = 0usize;
+    while read_total < len {
+        match file.read_at(&mut buf[read_total..], offset + read_total as u64) {
+            Ok(0) => break,
+            Ok(n) => read_total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(read_total);
+    Ok(buf)
+}
+
+#[cfg(windows)]
+fn read_file_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::windows::fs::FileExt;
+    let mut buf = vec![0u8; len];
+    let mut read_total = 0usize;
+    while read_total < len {
+        match file.seek_read(&mut buf[read_total..], offset + read_total as u64) {
+            Ok(0) => break,
+            Ok(n) => read_total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(read_total);
+    Ok(buf)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_file_range(mut file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
+    let mut read_total = 0usize;
+    while read_total < len {
+        match file.read(&mut buf[read_total..]) {
+            Ok(0) => break,
+            Ok(n) => read_total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(read_total);
+    Ok(buf)
 }

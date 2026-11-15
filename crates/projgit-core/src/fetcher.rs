@@ -219,6 +219,56 @@ impl<F: Fetcher> HydratingObjectStore<F> {
         }
     }
 
+    /// Read a byte range `[offset .. offset + size)` of a blob. On
+    /// `MissingObject`, call the fetcher and retry once.
+    pub fn read_blob_range(
+        &self,
+        oid: ObjectId,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, HydrateError> {
+        match self.store.read_blob_range(oid, offset, size) {
+            Ok(bytes) => Ok(bytes),
+            Err(ObjectStoreError::MissingObject(_)) => {
+                self.fetcher.fetch_object(oid)?;
+                self.store
+                    .read_blob_range(oid, offset, size)
+                    .map_err(|e| match e {
+                        ObjectStoreError::MissingObject(o) => {
+                            HydrateError::Fetcher(FetcherError::NotPresentAfterFetch(o))
+                        }
+                        other => HydrateError::Store(other),
+                    })
+            }
+            Err(e) => Err(HydrateError::Store(e)),
+        }
+    }
+
+    /// Ensure `oid` is materialized as an uncompressed file in
+    /// `<git-dir>/blobs/<xx>/<oid>` and return an open read-only
+    /// [`std::fs::File`] handle to it. On `MissingObject`, call the
+    /// fetcher and retry once.
+    pub fn ensure_uncompressed_blob(
+        &self,
+        oid: ObjectId,
+    ) -> Result<Arc<std::fs::File>, HydrateError> {
+        match self.store.ensure_uncompressed_blob(oid) {
+            Ok(file) => Ok(file),
+            Err(ObjectStoreError::MissingObject(_)) => {
+                self.fetcher.fetch_object(oid)?;
+                self.store
+                    .ensure_uncompressed_blob(oid)
+                    .map_err(|e| match e {
+                        ObjectStoreError::MissingObject(o) => {
+                            HydrateError::Fetcher(FetcherError::NotPresentAfterFetch(o))
+                        }
+                        other => HydrateError::Store(other),
+                    })
+            }
+            Err(e) => Err(HydrateError::Store(e)),
+        }
+    }
+
     /// Read and parse a tree. Same hydrate-on-miss policy as
     /// [`Self::read_blob`].
     pub fn read_tree(
@@ -357,9 +407,16 @@ impl<F: Fetcher> HydratingObjectStore<F> {
                 HeaderProbe::PresentWithHeader(oid, kind, size)
                 | HeaderProbe::HeaderOnly(oid, kind, size) => {
                     self.store.put_header_cache(*oid, *kind, *size);
+                    if *kind == ObjectKind::Blob {
+                        let _ = self.store.ensure_uncompressed_blob(*oid);
+                    }
                 }
                 HeaderProbe::Present(oid) => {
-                    let _ = self.store.header(*oid);
+                    if let Ok((kind, _)) = self.store.header(*oid) {
+                        if kind == ObjectKind::Blob {
+                            let _ = self.store.ensure_uncompressed_blob(*oid);
+                        }
+                    }
                 }
                 HeaderProbe::Error(_, _) => {}
             }

@@ -221,6 +221,29 @@ pub trait FsProvider: Send + Sync {
 
     /// Return a symlink's target as a byte string.
     fn readlink(&self, inode: u64) -> Result<BString, FsError>;
+
+    /// Return an open read-only host [`std::fs::File`] backing `inode`
+    /// if the entry is backed by a materialized uncompressed file on
+    /// disk (`<git-dir>/blobs/<xx>/<oid>`).
+    ///
+    /// Used by `virtio-fs` (`vhost-user-fs` + `DAX` `FUSE_SETUPMAPPING`)
+    /// to map host Page Cache pages directly into the guest `DAX`
+    /// memory window, and by FUSE passthrough backends to hand the
+    /// kernel a direct host file handle.
+    ///
+    /// Returns:
+    /// - `Ok(Some(file))` for projected regular/executable files backed
+    ///   by the uncompressed blob cache.
+    /// - `Ok(None)` for synthetic in-memory overlay files (e.g.
+    ///   `.git/HEAD`, `.git/index`) or providers that do not expose
+    ///   host backing files.
+    /// - `Err(FsError::NotAFile)` if `inode` names a directory or
+    ///   symlink.
+    /// - `Err(FsError::NotFound)` if `inode` is unknown.
+    fn backing_file(&self, inode: u64) -> Result<Option<std::sync::Arc<std::fs::File>>, FsError> {
+        let _ = inode;
+        Ok(None)
+    }
 }
 
 // ----------------------------------------------------------------------------

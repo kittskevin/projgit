@@ -207,10 +207,21 @@ impl ActiveBackend {
     /// on-disk CAS — see `docs/design/projgitd.md` §4.2). The fact
     /// that `header()` succeeded is the signal the sidecar needs.
     fn fetch_one(&self, oid: ObjectId) -> Result<(), String> {
-        match self {
-            ActiveBackend::Noop(h) => h.header(oid).map(|_| ()).map_err(|e| e.to_string()),
-            ActiveBackend::GitCli(h) => h.header(oid).map(|_| ()).map_err(|e| e.to_string()),
+        let (kind, _) = match self {
+            ActiveBackend::Noop(h) => h.header(oid).map_err(|e| e.to_string())?,
+            ActiveBackend::GitCli(h) => h.header(oid).map_err(|e| e.to_string())?,
+        };
+        if kind == projgit_core::ObjectKind::Blob {
+            match self {
+                ActiveBackend::Noop(h) => {
+                    let _ = h.store().ensure_uncompressed_blob(oid);
+                }
+                ActiveBackend::GitCli(h) => {
+                    let _ = h.store().ensure_uncompressed_blob(oid);
+                }
+            }
         }
+        Ok(())
     }
 
     fn prefetch_headers(&self, oids: &[ObjectId]) -> Vec<HeaderProbe> {

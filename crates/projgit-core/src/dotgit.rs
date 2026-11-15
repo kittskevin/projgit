@@ -106,6 +106,57 @@ pub fn a1_overlay(commit_oid: ObjectId, objects_dir: &Path) -> RootOverlay {
     overlay
 }
 
+/// Build an isolated A1 `.git/` overlay without `.git/objects/info/alternates`.
+///
+/// Designed for microVM guests mounted over `virtio-fs` (`docs/design/virtio-fs.md`
+/// §5 Option 1) where the host's object-store path is not visible inside the
+/// guest and host filesystem paths must not be leaked into the untrusted VM.
+///
+/// Synthesizes `.git/HEAD`, `.git/config`, `.git/packed-refs`, `.git/refs/{heads,tags}`,
+/// and empty `.git/objects/{info,pack}` directories so git recognizes the
+/// mount as a repository.
+pub fn a1_isolated_overlay(commit_oid: ObjectId) -> RootOverlay {
+    let head = SyntheticEntry::file(format!("{commit_oid}\n").into_bytes());
+    let config = SyntheticEntry::file(A1_CONFIG.as_bytes().to_vec());
+    let packed_refs = SyntheticEntry::file(Vec::<u8>::new());
+
+    let mut refs = SyntheticEntry::directory();
+    refs.insert_child("heads", SyntheticEntry::directory());
+    refs.insert_child("tags", SyntheticEntry::directory());
+
+    let mut objects = SyntheticEntry::directory();
+    objects.insert_child("info", SyntheticEntry::directory());
+    objects.insert_child("pack", SyntheticEntry::directory());
+
+    let mut dotgit = SyntheticEntry::directory();
+    dotgit.insert_child("HEAD", head);
+    dotgit.insert_child("config", config);
+    dotgit.insert_child("packed-refs", packed_refs);
+    dotgit.insert_child("refs", refs);
+    dotgit.insert_child("objects", objects);
+
+    let mut overlay = RootOverlay::new();
+    overlay.insert(".git", dotgit);
+    overlay
+}
+
+/// Build an isolated **A1+** `.git/` overlay (no host `alternates`, plus a
+/// synthetic read-only `.git/index` with `ASSUME_VALID` set on every entry).
+///
+/// Designed for microVM guests mounted over `virtio-fs` (`docs/design/virtio-fs.md`
+/// §5 Option 1): inside the guest, `git rev-parse HEAD`, `git status`,
+/// `git diff`, and `git ls-files` work directly from `.git/HEAD` and
+/// `.git/index` without needing direct guest access to host `.pack` files.
+pub fn a1_plus_isolated_overlay(
+    store: &ObjectStore,
+    commit_oid: ObjectId,
+) -> Result<RootOverlay, IndexBuildError> {
+    let mut overlay = a1_isolated_overlay(commit_oid);
+    let index_bytes = build_index_bytes(store, commit_oid)?;
+    splice_dotgit_child(&mut overlay, "index", index_bytes);
+    Ok(overlay)
+}
+
 /// Build an **A1+** `.git/` overlay for a projection.
 ///
 /// A1+ is A1 plus a synthetic, read-only `.git/index` matching HEAD's

@@ -543,10 +543,10 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
             attrs.get(&inode).cloned().ok_or(FsError::NotFound)?
         };
         match snap {
-            AttrSnapshot::TreeFile { oid, .. } => {
-                let bytes = self.store.read_blob(oid).map_err(hydrate_to_fs)?;
-                Ok(slice_blob(&bytes, offset, size))
-            }
+            AttrSnapshot::TreeFile { oid, .. } => self
+                .store
+                .read_blob_range(oid, offset, size)
+                .map_err(hydrate_to_fs),
             AttrSnapshot::SyntheticFile { content, .. } => Ok(slice_blob(&content, offset, size)),
             _ => Err(FsError::NotAFile),
         }
@@ -564,6 +564,22 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
             }
             AttrSnapshot::SyntheticSymlink { target } => Ok(target),
             _ => Err(FsError::NotASymlink),
+        }
+    }
+
+    fn backing_file(&self, inode: u64) -> Result<Option<Arc<std::fs::File>>, FsError> {
+        let snap = {
+            let attrs = self.attrs.read().unwrap();
+            attrs.get(&inode).cloned().ok_or(FsError::NotFound)?
+        };
+        match snap {
+            AttrSnapshot::TreeFile { oid, .. } => self
+                .store
+                .ensure_uncompressed_blob(oid)
+                .map(Some)
+                .map_err(hydrate_to_fs),
+            AttrSnapshot::SyntheticFile { .. } => Ok(None),
+            _ => Err(FsError::NotAFile),
         }
     }
 }

@@ -52,7 +52,6 @@ mod tree_cache;
 
 pub use blob_cache::BlobCacheStats;
 pub use error::{ObjectStoreError, ProjectionError};
-pub use maintenance::{run_maintenance, MaintenanceError};
 pub use fetcher::{
     Fetcher, FetcherError, GitCliFetcher, GitCliFetcherError, HeaderProbe, HydrateError,
     HydratingObjectStore, NoopFetcher, WarmTreeStats,
@@ -66,7 +65,8 @@ pub use fs_provider::{
     ROOT_INODE,
 };
 pub use header_cache::HeaderCacheStats;
-pub use object_store::{ObjectKind, ObjectStore};
+pub use maintenance::{run_maintenance, MaintenanceError};
+pub use object_store::{DiskBlobCacheStats, ObjectKind, ObjectStore};
 pub use overlay::{RootOverlay, SyntheticEntry};
 pub use prefetch::PrefetchStats;
 pub use projection::{Projection, ResolvedEntry};
