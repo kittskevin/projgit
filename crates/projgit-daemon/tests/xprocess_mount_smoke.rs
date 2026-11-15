@@ -42,26 +42,21 @@ use std::time::{Duration, Instant};
 // Locate sibling binaries
 // -----------------------------------------------------------------------------
 
-/// Resolve the `target/<profile>/` directory the current test binary
-/// was built into. Cargo places integration tests at
-/// `target/<profile>/deps/<name>-<hash>`, so the grandparent is the
-/// profile dir where sibling binaries live.
+/// Resolve the `target/<profile>/` directory where workspace binaries
+/// are placed. Derived from `CARGO_BIN_EXE_projgitd` so it works across
+/// both traditional `target/<profile>/deps/<test>` and newer Cargo
+/// `target/<profile>/build/<pkg>/<hash>/out/<test>` layouts.
 fn target_profile_dir() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    exe.parent()
-        .and_then(Path::parent)
-        .expect("test binary path has a profile dir grandparent")
+    projgitd_binary()
+        .parent()
+        .expect("CARGO_BIN_EXE_projgitd has a parent profile directory")
         .to_path_buf()
 }
 
-/// `target/<profile>/projgitd` (or `.exe` on Windows; not relevant
-/// here — the file is cfg-gated to unix).
+/// `target/<profile>/projgitd` provided directly by Cargo for this
+/// crate's integration tests.
 fn projgitd_binary() -> PathBuf {
-    target_profile_dir().join(if cfg!(windows) {
-        "projgitd.exe"
-    } else {
-        "projgitd"
-    })
+    PathBuf::from(env!("CARGO_BIN_EXE_projgitd"))
 }
 
 /// `target/<profile>/projgit`.
