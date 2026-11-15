@@ -22,6 +22,7 @@
 
 use bstr::{BStr, BString};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// A synthetic root-level entry that the projection layer surfaces
 /// **before** falling through to the underlying git tree.
@@ -34,6 +35,17 @@ pub enum SyntheticEntry {
         /// Git-style mode (typically `0o100644`). Stored as `u16` to
         /// match [`crate::tree::TreeEntry::mode_raw`].
         mode_raw: u16,
+    },
+    /// A read-only regular file (`0o444`) backed directly by an on-disk
+    /// host file of known byte length `size` (such as `.pack`, `.idx`,
+    /// or `commit-graph`), served via positioned reads (`pread` /
+    /// `seek_read`) and [`crate::FsProvider::backing_file`] (`DAX` /
+    /// FUSE passthrough) without loading the file into heap memory.
+    HostFile {
+        /// Host filesystem path to the read-only backing file.
+        path: PathBuf,
+        /// Byte length of the backing file captured at overlay build time.
+        size: u64,
     },
     /// A directory containing further synthetic entries.
     ///
@@ -57,6 +69,15 @@ impl SyntheticEntry {
         Self::File {
             content: content.into(),
             mode_raw: 0o100644,
+        }
+    }
+
+    /// Construct a read-only (`0o444`) synthetic file backed directly
+    /// by a host filesystem path of known byte length `size`.
+    pub fn host_file(path: impl Into<PathBuf>, size: u64) -> Self {
+        Self::HostFile {
+            path: path.into(),
+            size,
         }
     }
 

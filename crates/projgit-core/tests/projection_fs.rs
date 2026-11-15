@@ -581,3 +581,94 @@ fn backing_file_returns_uncompressed_host_file_for_tree_files() {
     // 4. Unknown inode -> Err(FsError::NotFound).
     assert_eq!(p.backing_file(0xDEAD_BEEF).unwrap_err(), FsError::NotFound);
 }
+
+#[test]
+fn isolated_overlay_host_files_support_positioned_reads_and_backing_file() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head) = build_fixture("isolated_host_files");
+    git(&repo, &["repack", "-a", "-d", "-q"]);
+    git(&repo, &["commit-graph", "write", "--reachable"]);
+
+    let store = Arc::new(ObjectStore::open(&repo).unwrap());
+    let overlay = projgit_core::dotgit::a1_plus_isolated_overlay(&store, head).unwrap();
+    let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), NoopFetcher));
+    let p = ProjectionFsProvider::new(Projection::Commit(head), hydrating, overlay, 7).unwrap();
+
+    let dotgit = lookup(&p, ROOT_INODE, b".git");
+    let objects = lookup(&p, dotgit.inode, b"objects");
+    let info = lookup(&p, objects.inode, b"info");
+    let pack_dir = lookup(&p, objects.inode, b"pack");
+
+    // 1. .git/objects/info/alternates is strictly absent.
+    assert_eq!(
+        p.lookup(info.inode, b"alternates").unwrap_err(),
+        FsError::NotFound
+    );
+
+    // 2. .git/objects/info/commit-graph is present with mode 0o444 and
+    //    exact host byte length.
+    let cg_attr = lookup(&p, info.inode, b"commit-graph");
+    let host_cg_bytes = std::fs::read(store.git_dir().join("objects/info/commit-graph")).unwrap();
+    assert_eq!(cg_attr.kind, FileType::RegularFile);
+    assert_eq!(cg_attr.mode, 0o444);
+    assert_eq!(cg_attr.size, host_cg_bytes.len() as u64);
+    assert_eq!(cg_attr.mtime, p.commit_time());
+
+    // 3. .git/objects/pack lists pack-*.pack and pack-*.idx as regular files.
+    let pack_entries = p.readdir(pack_dir.inode, 0).unwrap();
+    let pack_entry = pack_entries
+        .iter()
+        .find(|e| e.name.ends_with(b".pack"))
+        .expect("pack-*.pack entry in .git/objects/pack");
+    assert_eq!(pack_entry.kind, FileType::RegularFile);
+
+    let pack_attr = lookup(&p, pack_dir.inode, pack_entry.name.as_ref());
+    let host_pack_path = store
+        .git_dir()
+        .join("objects/pack")
+        .join(std::str::from_utf8(pack_entry.name.as_ref()).unwrap());
+    let host_pack_bytes = std::fs::read(&host_pack_path).unwrap();
+    assert_eq!(pack_attr.kind, FileType::RegularFile);
+    assert_eq!(pack_attr.mode, 0o444);
+    assert_eq!(pack_attr.size, host_pack_bytes.len() as u64);
+    assert_eq!(pack_attr.mtime, p.commit_time());
+
+    // 4. Positioned reads (`ProjectionFsProvider::read`) return exact slices
+    //    from the packfile and handle EOF clamping / past-EOF offsets.
+    let header_slice = p.read(pack_attr.inode, 0, 12).unwrap();
+    assert_eq!(&header_slice[..4], b"PACK");
+    assert_eq!(&header_slice, &host_pack_bytes[..12]);
+
+    let mid_offset = (host_pack_bytes.len() / 3) as u64;
+    let mid_slice = p.read(pack_attr.inode, mid_offset, 32).unwrap();
+    let expected_end = (mid_offset as usize + 32).min(host_pack_bytes.len());
+    assert_eq!(
+        &mid_slice,
+        &host_pack_bytes[mid_offset as usize..expected_end]
+    );
+
+    // Clamping across EOF and reading at/past EOF.
+    let tail_offset = host_pack_bytes.len().saturating_sub(10) as u64;
+    let tail_slice = p.read(pack_attr.inode, tail_offset, 64).unwrap();
+    assert_eq!(&tail_slice, &host_pack_bytes[tail_offset as usize..]);
+    assert!(p
+        .read(pack_attr.inode, host_pack_bytes.len() as u64 + 16, 32)
+        .unwrap()
+        .is_empty());
+
+    // 5. `backing_file` returns Ok(Some(Arc<File>)) for projected HostFile
+    //    inodes so virtio-fs DAX / FUSE passthrough can map packfiles directly.
+    let backing = p
+        .backing_file(pack_attr.inode)
+        .unwrap()
+        .expect("HostFile must return Some(Arc<File>)");
+    let mut backing_bytes = Vec::new();
+    {
+        use std::io::Read;
+        (&*backing).read_to_end(&mut backing_bytes).unwrap();
+    }
+    assert_eq!(backing_bytes, host_pack_bytes);
+}

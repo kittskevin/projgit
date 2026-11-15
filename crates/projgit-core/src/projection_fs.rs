@@ -38,6 +38,7 @@ use crate::tree::{EntryMode, TreeEntry, TreeNavigator};
 use bstr::BString;
 use gix::ObjectId;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -68,6 +69,9 @@ enum AttrSnapshot {
     Gitlink,
     /// A synthetic file from the [`RootOverlay`].
     SyntheticFile { content: Arc<Vec<u8>>, mode: u16 },
+    /// A read-only synthetic file backed directly by a host filesystem
+    /// path (e.g. projected `.pack`, `.idx`, or `commit-graph`).
+    SyntheticHostFile { path: PathBuf, size: u64 },
     /// A synthetic directory from the [`RootOverlay`]. Children are
     /// shared via [`Arc`] so cloning the snapshot is cheap.
     SyntheticDir {
@@ -240,7 +244,9 @@ impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
             ResolvedEntry::Synthetic { entry, .. } => {
                 let inode = self.allocator.for_synthetic(path_bytes);
                 let kind = match entry {
-                    SyntheticEntry::File { .. } => FileType::RegularFile,
+                    SyntheticEntry::File { .. } | SyntheticEntry::HostFile { .. } => {
+                        FileType::RegularFile
+                    }
                     SyntheticEntry::Directory { .. } => FileType::Directory,
                     SyntheticEntry::Symlink { .. } => FileType::Symlink,
                 };
@@ -342,6 +348,13 @@ impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
                     mode,
                 )
             }
+            SyntheticEntry::HostFile { path, size } => (
+                inode,
+                AttrSnapshot::SyntheticHostFile { path, size },
+                FileType::RegularFile,
+                size,
+                0o444,
+            ),
             SyntheticEntry::Directory { children } => (
                 inode,
                 AttrSnapshot::SyntheticDir {
@@ -412,6 +425,7 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
             AttrSnapshot::SyntheticFile { content, mode } => {
                 (FileType::RegularFile, content.len() as u64, *mode)
             }
+            AttrSnapshot::SyntheticHostFile { size, .. } => (FileType::RegularFile, *size, 0o444),
             AttrSnapshot::SyntheticDir { .. } => (FileType::Directory, 0, 0o755),
             AttrSnapshot::SyntheticSymlink { target } => {
                 (FileType::Symlink, target.len() as u64, 0o777)
@@ -548,6 +562,19 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
                 .read_blob_range(oid, offset, size)
                 .map_err(hydrate_to_fs),
             AttrSnapshot::SyntheticFile { content, .. } => Ok(slice_blob(&content, offset, size)),
+            AttrSnapshot::SyntheticHostFile {
+                path,
+                size: file_size,
+            } => {
+                let file = std::fs::File::open(&path).map_err(|e| FsError::Io(e.to_string()))?;
+                if offset >= file_size || size == 0 {
+                    return Ok(Vec::new());
+                }
+                let end = offset.saturating_add(u64::from(size)).min(file_size);
+                let to_read = (end - offset) as usize;
+                crate::object_store::read_file_range(&file, offset, to_read)
+                    .map_err(|e| FsError::Io(e.to_string()))
+            }
             _ => Err(FsError::NotAFile),
         }
     }
@@ -579,6 +606,10 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
                 .map(Some)
                 .map_err(hydrate_to_fs),
             AttrSnapshot::SyntheticFile { .. } => Ok(None),
+            AttrSnapshot::SyntheticHostFile { path, .. } => {
+                let file = std::fs::File::open(&path).map_err(|e| FsError::Io(e.to_string()))?;
+                Ok(Some(Arc::new(file)))
+            }
             _ => Err(FsError::NotAFile),
         }
     }

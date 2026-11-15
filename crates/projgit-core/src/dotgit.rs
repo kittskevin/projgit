@@ -109,13 +109,15 @@ pub fn a1_overlay(commit_oid: ObjectId, objects_dir: &Path) -> RootOverlay {
 /// Build an isolated A1 `.git/` overlay without `.git/objects/info/alternates`.
 ///
 /// Designed for microVM guests mounted over `virtio-fs` (`docs/design/virtio-fs.md`
-/// §5 Option 1) where the host's object-store path is not visible inside the
+/// §5 Option 2) where the host's object-store path is not visible inside the
 /// guest and host filesystem paths must not be leaked into the untrusted VM.
 ///
-/// Synthesizes `.git/HEAD`, `.git/config`, `.git/packed-refs`, `.git/refs/{heads,tags}`,
-/// and empty `.git/objects/{info,pack}` directories so git recognizes the
-/// mount as a repository.
-pub fn a1_isolated_overlay(commit_oid: ObjectId) -> RootOverlay {
+/// Synthesizes `.git/HEAD`, `.git/config`, `.git/packed-refs`, and
+/// `.git/refs/{heads,tags}`, and projects host packfiles (`objects/pack/*`)
+/// and commit-graph metadata (`objects/info/{commit-graph,packs,commit-graphs/*}`)
+/// as read-only [`SyntheticEntry::HostFile`] entries without exposing
+/// `.git/objects/info/alternates`.
+pub fn a1_isolated_overlay(commit_oid: ObjectId, objects_dir: &Path) -> RootOverlay {
     let head = SyntheticEntry::file(format!("{commit_oid}\n").into_bytes());
     let config = SyntheticEntry::file(A1_CONFIG.as_bytes().to_vec());
     let packed_refs = SyntheticEntry::file(Vec::<u8>::new());
@@ -124,9 +126,7 @@ pub fn a1_isolated_overlay(commit_oid: ObjectId) -> RootOverlay {
     refs.insert_child("heads", SyntheticEntry::directory());
     refs.insert_child("tags", SyntheticEntry::directory());
 
-    let mut objects = SyntheticEntry::directory();
-    objects.insert_child("info", SyntheticEntry::directory());
-    objects.insert_child("pack", SyntheticEntry::directory());
+    let objects = populate_isolated_objects_dir(objects_dir);
 
     let mut dotgit = SyntheticEntry::directory();
     dotgit.insert_child("HEAD", head);
@@ -140,21 +140,80 @@ pub fn a1_isolated_overlay(commit_oid: ObjectId) -> RootOverlay {
     overlay
 }
 
-/// Build an isolated **A1+** `.git/` overlay (no host `alternates`, plus a
-/// synthetic read-only `.git/index` with `ASSUME_VALID` set on every entry).
+/// Build an isolated **A1+** `.git/` overlay (no host `alternates`, projected
+/// `objects/pack/*` and `objects/info/commit-graph` as [`SyntheticEntry::HostFile`]
+/// entries, plus a synthetic read-only `.git/index` with `ASSUME_VALID` set on
+/// every entry).
 ///
 /// Designed for microVM guests mounted over `virtio-fs` (`docs/design/virtio-fs.md`
-/// §5 Option 1): inside the guest, `git rev-parse HEAD`, `git status`,
-/// `git diff`, and `git ls-files` work directly from `.git/HEAD` and
-/// `.git/index` without needing direct guest access to host `.pack` files.
+/// §5 Option 2): inside the guest, `git rev-parse HEAD`, `git status`,
+/// `git diff`, `git ls-files`, `git log`, and `git show` work self-contained
+/// over the single mount without leaking host paths via `alternates` or
+/// loading `.pack` files into heap memory.
 pub fn a1_plus_isolated_overlay(
     store: &ObjectStore,
     commit_oid: ObjectId,
 ) -> Result<RootOverlay, IndexBuildError> {
-    let mut overlay = a1_isolated_overlay(commit_oid);
+    let objects_dir = store.git_dir().join("objects");
+    let mut overlay = a1_isolated_overlay(commit_oid, &objects_dir);
     let index_bytes = build_index_bytes(store, commit_oid)?;
     splice_dotgit_child(&mut overlay, "index", index_bytes);
     Ok(overlay)
+}
+
+/// Populate the isolated `.git/objects/` synthetic directory with
+/// [`SyntheticEntry::HostFile`] entries for `<objects_dir>/pack/*` and safe
+/// metadata under `<objects_dir>/info/` (`commit-graph`, `packs`,
+/// `commit-graphs/*`), while strictly omitting `alternates`.
+fn populate_isolated_objects_dir(objects_dir: &Path) -> SyntheticEntry {
+    let mut info = SyntheticEntry::directory();
+    let info_dir = objects_dir.join("info");
+    for name in ["commit-graph", "packs"] {
+        let path = info_dir.join(name);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.is_file() {
+                info.insert_child(name, SyntheticEntry::host_file(path, meta.len()));
+            }
+        }
+    }
+    let commit_graphs_dir = info_dir.join("commit-graphs");
+    if let Ok(entries) = std::fs::read_dir(&commit_graphs_dir) {
+        let mut cg_dir = SyntheticEntry::directory();
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        cg_dir.insert_child(
+                            name,
+                            SyntheticEntry::host_file(entry.path(), meta.len()),
+                        );
+                    }
+                }
+            }
+        }
+        info.insert_child("commit-graphs", cg_dir);
+    }
+
+    let mut pack = SyntheticEntry::directory();
+    if let Ok(entries) = std::fs::read_dir(objects_dir.join("pack")) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        pack.insert_child(
+                            name,
+                            SyntheticEntry::host_file(entry.path(), meta.len()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mut objects = SyntheticEntry::directory();
+    objects.insert_child("info", info);
+    objects.insert_child("pack", pack);
+    objects
 }
 
 /// Build an **A1+** `.git/` overlay for a projection.
@@ -563,5 +622,70 @@ mod tests {
         // `refs/heads/main`.
         let mut o = a1_overlay(fixture_oid(), Path::new("/x/objects"));
         apply_a2_ref_visibility(&mut o, "main", fixture_oid());
+    }
+
+    #[test]
+    fn isolated_overlay_projects_pack_and_commit_graph_as_host_files_without_alternates() {
+        let base = std::env::temp_dir().join(format!(
+            "projgit-dotgit-isolated-unit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let pack_dir = base.join("pack");
+        let info_dir = base.join("info");
+        let cg_dir = info_dir.join("commit-graphs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::create_dir_all(&cg_dir).unwrap();
+
+        let pack_path = pack_dir.join("pack-deadbeef.pack");
+        let idx_path = pack_dir.join("pack-deadbeef.idx");
+        let cg_path = info_dir.join("commit-graph");
+        let packs_info_path = info_dir.join("packs");
+        let chain_path = cg_dir.join("commit-graph-chain");
+        let alternates_path = info_dir.join("alternates");
+
+        std::fs::write(&pack_path, b"PACK\x00\x00\x00\x02dummy-pack-bytes").unwrap();
+        std::fs::write(&idx_path, b"\xfftOc\x00\x00\x00\x02dummy-idx").unwrap();
+        std::fs::write(&cg_path, b"CGPHdummy-graph").unwrap();
+        std::fs::write(&packs_info_path, b"P pack-deadbeef.pack\n\n").unwrap();
+        std::fs::write(&chain_path, b"0123456789abcdef\n").unwrap();
+        // Even if alternates exists on disk in the host objects/info dir,
+        // the isolated overlay must NEVER expose it.
+        std::fs::write(&alternates_path, b"/secret/host/path/objects\n").unwrap();
+
+        let o = a1_isolated_overlay(fixture_oid(), &base);
+
+        assert_eq!(
+            walk(&o, ".git/objects/pack/pack-deadbeef.pack"),
+            &SyntheticEntry::host_file(&pack_path, 24),
+        );
+        assert_eq!(
+            walk(&o, ".git/objects/pack/pack-deadbeef.idx"),
+            &SyntheticEntry::host_file(&idx_path, 17),
+        );
+        assert_eq!(
+            walk(&o, ".git/objects/info/commit-graph"),
+            &SyntheticEntry::host_file(&cg_path, 15),
+        );
+        assert_eq!(
+            walk(&o, ".git/objects/info/packs"),
+            &SyntheticEntry::host_file(&packs_info_path, 22),
+        );
+        assert_eq!(
+            walk(&o, ".git/objects/info/commit-graphs/commit-graph-chain"),
+            &SyntheticEntry::host_file(&chain_path, 17),
+        );
+
+        match walk(&o, ".git/objects/info") {
+            SyntheticEntry::Directory { children } => {
+                assert!(
+                    !children.contains_key(BStr::new(b"alternates")),
+                    "isolated overlay must never expose objects/info/alternates"
+                );
+            }
+            other => panic!("expected directory at .git/objects/info, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

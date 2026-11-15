@@ -799,6 +799,11 @@ fn dotgit_isolated_overlay_omits_host_alternates() {
         return;
     }
     let (repo, head_hex) = build_fixture("os_isolated_dotgit");
+    // Pack loose objects and write a commit-graph so `<git-dir>/objects/pack/*`
+    // and `<git-dir>/objects/info/commit-graph` exist on disk.
+    git(&repo, &["repack", "-a", "-d", "-q"]);
+    git(&repo, &["commit-graph", "write", "--reachable"]);
+
     let store = ObjectStore::open(&repo).unwrap();
     let head = parse_oid(&head_hex);
 
@@ -816,4 +821,51 @@ fn dotgit_isolated_overlay_omits_host_alternates() {
     assert!(proj
         .lookup(&store, &overlay, ".git/objects/info/alternates")
         .is_err());
+
+    // .git/objects/info/commit-graph is projected as a SyntheticEntry::HostFile.
+    let cg_resolved = proj
+        .lookup(&store, &overlay, ".git/objects/info/commit-graph")
+        .expect("commit-graph should be projected in isolated overlay");
+    match cg_resolved {
+        ResolvedEntry::Synthetic {
+            entry: SyntheticEntry::HostFile { path, size },
+            ..
+        } => {
+            assert_eq!(path, store.git_dir().join("objects/info/commit-graph"));
+            assert_eq!(size, std::fs::metadata(&path).unwrap().len());
+            assert!(size > 0);
+        }
+        other => panic!("expected HostFile for commit-graph, got {other:?}"),
+    }
+
+    // Every pack-*.pack and pack-*.idx in `<git-dir>/objects/pack` is projected
+    // as a SyntheticEntry::HostFile with matching byte size.
+    let pack_dir = store.git_dir().join("objects/pack");
+    let mut found_pack = false;
+    let mut found_idx = false;
+    for entry in std::fs::read_dir(&pack_dir).unwrap().flatten() {
+        let name = entry.file_name().into_string().unwrap();
+        if name.ends_with(".pack") {
+            found_pack = true;
+        }
+        if name.ends_with(".idx") {
+            found_idx = true;
+        }
+        let vpath = format!(".git/objects/pack/{name}");
+        let resolved = proj
+            .lookup(&store, &overlay, &vpath)
+            .unwrap_or_else(|e| panic!("failed to lookup {vpath}: {e}"));
+        match resolved {
+            ResolvedEntry::Synthetic {
+                entry: SyntheticEntry::HostFile { path, size },
+                ..
+            } => {
+                assert_eq!(path, entry.path());
+                assert_eq!(size, entry.metadata().unwrap().len());
+            }
+            other => panic!("expected HostFile for {vpath}, got {other:?}"),
+        }
+    }
+    assert!(found_pack, "expected at least one .pack file after repack");
+    assert!(found_idx, "expected at least one .idx file after repack");
 }

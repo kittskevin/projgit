@@ -190,29 +190,47 @@ cleanly requires only an additive method on `FsProvider` (and
 2. **`FsProvider::backing_file(&self, ino: u64) -> Result<Option<Arc<File>>, FsError>`** (optional hook, defaults to `Ok(None)`)
     - For `AttrSnapshot::TreeFile { oid, .. }`, hydrates `oid` if needed
      and returns `Some(file)` pointing to `blobs/<xx>/<oid>`.
-     returns `None` (falling back to normal virtqueue `read()`) or
-     backs them with anonymous/temp files if DAX-everywhere is desired.
-    - For synthetic overlay files (`.git/HEAD`, `.git/index`), either
+    - For `AttrSnapshot::SyntheticHostFile { path, .. }` (such as projected
+     `.git/objects/pack/pack-*.{pack,idx}` and `.git/objects/info/commit-graph`),
+     opens `path` read-only and returns `Some(file)` so `DAX`
+     (`FUSE_SETUPMAPPING`) and FUSE passthrough can map packfiles and
+     indices directly from the host Page Cache.
+    - For in-memory synthetic overlay files (`.git/HEAD`, `.git/index`),
+     returns `None` (falling back to normal virtqueue `read()`).
 
 ## 5. `.git/` synthesis caveat inside microVMs
 
 [`crates/projgit-core/src/dotgit.rs`](../../crates/projgit-core/src/dotgit.rs)
-currently synthesizes `.git/objects/info/alternates` containing the
-**host filesystem path** to `<cache-dir>/<repo>/.git/objects`.
+synthesizes `.git/objects/info/alternates` in [`a1_overlay`] / [`a1_plus_overlay`]
+containing the **host filesystem path** to `<cache-dir>/<repo>/.git/objects`.
 
 - In a same-host container where the shared cache volume is mounted at
   the same path, `git log` / `git rev-parse` inside the mount follows
   `alternates` directly.
 - Inside a **microVM**, the host path in `alternates` does not exist
   unless the canonical `.git/objects` directory is also exposed inside
-  the guest.
-- **Fix for microVMs:** instead of writing an external host path into
-  `.git/objects/info/alternates`, project the shared CAS's
-  `objects/pack/` (and `objects/info/commit-graph` + `multi-pack-index`)
-  as read-only entries directly under the mount's synthesized
-  `.git/objects/` tree. Then `git log` and `git status` inside the
-  microVM work self-contained over the single `virtio-fs` mount with
-  zero extra mounts and no host-path leak.
+  the guest, and exposing host paths inside an untrusted guest is
+  undesirable.
+- **Implemented fix for microVMs (`a1_isolated_overlay` & `a1_plus_isolated_overlay`):**
+  1. **Option 1 (Index + HEAD isolation):** omits `.git/objects/info/alternates`
+     while synthesizing `.git/HEAD`, `.git/config`, `.git/packed-refs`,
+     `.git/refs/{heads,tags}`, and a read-only `.git/index` (`ASSUME_VALID`
+     on every entry) so `git rev-parse HEAD`, `git status`, `git diff`,
+     and `git ls-files` work with zero host-path leakage.
+  2. **Option 2 (Host-backed pack & commit-graph projection via `SyntheticEntry::HostFile`):**
+     `a1_isolated_overlay(commit_oid, objects_dir)` and
+     `a1_plus_isolated_overlay(store, commit_oid)` scan `<objects_dir>/pack/*`
+     (`*.pack`, `*.idx`, `*.rev`, `*.mtimes`, `multi-pack-index`) and safe
+     metadata under `<objects_dir>/info/` (`commit-graph`, `packs`,
+     `commit-graphs/*`) and project each regular file into `.git/objects/`
+     as a read-only `SyntheticEntry::HostFile { path, size }` (`0o444`).
+     `ProjectionFsProvider` serves byte slices from these entries via
+     positioned reads (`pread` / `read_at` on Unix, `seek_read` on Windows)
+     without loading `.pack` files into heap `Vec<u8>` buffers, and exposes
+     their open `Arc<File>` handles via `FsProvider::backing_file` for
+     `virtio-fs` `DAX` / FUSE passthrough. As a result, `git log`,
+     `git show`, and `git cat-file` work self-contained inside a single
+     `virtio-fs` microVM mount with no `alternates` file and no extra mounts.
 
 ## 6. Trade-offs & disk management
 

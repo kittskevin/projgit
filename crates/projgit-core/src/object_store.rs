@@ -728,7 +728,7 @@ fn slice_range(bytes: &[u8], offset: u64, size: u32) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn read_file_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_file_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
     let mut buf = vec![0u8; len];
     let mut read_total = 0usize;
@@ -745,7 +745,7 @@ fn read_file_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<
 }
 
 #[cfg(windows)]
-fn read_file_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_file_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
     use std::os::windows::fs::FileExt;
     let mut buf = vec![0u8; len];
     let mut read_total = 0usize;
@@ -762,7 +762,11 @@ fn read_file_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_file_range(mut file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_file_range(
+    mut file: &File,
+    offset: u64,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0u8; len];

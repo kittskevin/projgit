@@ -216,7 +216,7 @@ pub fn entry_mode(entry: &ResolvedEntry) -> EntryMode {
     match entry {
         ResolvedEntry::Tree(t) => t.mode,
         ResolvedEntry::Synthetic { entry, .. } => match entry {
-            SyntheticEntry::File { .. } => EntryMode::RegularFile,
+            SyntheticEntry::File { .. } | SyntheticEntry::HostFile { .. } => EntryMode::RegularFile,
             SyntheticEntry::Directory { .. } => EntryMode::Directory,
             SyntheticEntry::Symlink { .. } => EntryMode::Symlink,
         },
