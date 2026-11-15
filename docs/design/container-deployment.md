@@ -8,7 +8,10 @@
 >
 > Read this alongside [`workload.md`](workload.md) §1.6 (the
 > "many short-lived processes per host" claim that motivates
-> containerized deployment) and the
+> containerized deployment), [`projgitd.md`](projgitd.md) (the
+> daemon + sidecar architecture), [`virtio-fs.md`](virtio-fs.md)
+> (extending host-side serving to microVMs via `virtio-fs`, `DAX`,
+> and an uncompressed on-disk blob cache), and the
 > [audit](/memories/repo/audit.md) findings A1 (no daemon) and A3
 > (cross-process single-flight gap) which this doc deliberately does
 > not solve, just frames.

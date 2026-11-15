@@ -318,21 +318,30 @@ answer presence and headers; persist only when a profile names the
 cost (expect deltified-blob size resolution or content-hash demand, not
 plain headers).
 
-### Organ 2 — the decoded-content store (large, optional)
+### Organ 2 — the decoded-content store (uncompressed on-disk blob cache)
 
-Flat, inflated, seekable blobs so `read()` at an offset is O(bytes
-requested), not O(whole file) — the fix for impedance mismatch 4. This
-is a *content transform*, not an index, and it earns its keep only for
-**large files with partial / random access** (assets, databases; the
-EdenFS `CoverageSet` case). Source files (<64 KiB) are already
-flattened by the existing blob cache, so this is a tail optimisation,
-deferred until a workload proves it.
+Flat, inflated, seekable blobs on disk (`<cache-dir>/blobs/<xx>/<oid>`)
+so `read()` at an offset is `O(bytes requested)` via `pread`/`mmap`, not
+`O(whole file)` — the fix for impedance mismatch 4. This is a *content
+transform*, not an index, and has three justifications:
 
-It has a *second* justification beyond seekability (see §14):
-materialising an inflated blob **once** in the shared CAS lets every
-container's daemon mmap the *same decoded pages*, moving the
-cross-container dedup boundary from "compressed pack" to "decoded
-content" and sharing the inflate work itself.
+1. **Random-access reads without whole-blob inflate.** Large files with
+   partial / random access (assets, databases; the EdenFS `CoverageSet`
+   case) no longer decompress the entire git blob into a `Vec<u8>` on
+   every read.
+2. **Cross-container page-cache sharing of decoded bytes** (see §14).
+   Materialising an inflated blob **once** in the shared CAS lets every
+   container's daemon `mmap`/`pread` the *same decoded pages*, moving
+   the cross-container dedup boundary from "compressed pack" to "decoded
+   content" and sharing the inflate work itself.
+3. **MicroVM serving via `virtio-fs` + `DAX` (`FUSE_SETUPMAPPING`).**
+   When sandboxes run in microVMs with `projgit` on the host,
+   `virtio-fs` DAX maps a **host file descriptor + offset** directly
+   into guest physical memory so multiple microVMs share one host page
+   cache. Because `.pack` files are zlib-compressed and deltified, they
+   cannot be DAX-mapped directly; keeping hydrated blobs as flat
+   uncompressed files on disk provides the host `fd` that `virtio-fs` /
+   DAX requires. See [`virtio-fs.md`](virtio-fs.md) for the full design.
 
 The canonical git odb remains the source of truth for both organs; each
 is a rebuildable cache.
