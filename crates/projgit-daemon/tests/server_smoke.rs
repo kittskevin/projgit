@@ -116,6 +116,7 @@ fn mount_rejects_nonexistent_source() {
         ref_name: "main".into(),
         mountpoint: PathBuf::from("/tmp/this/path/never/exists"),
         no_dotgit: false,
+        isolated_dotgit: false,
         allow_other: false,
     };
     match rpc(&sock, &req) {

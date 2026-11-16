@@ -153,6 +153,7 @@ fn mount_status_umount_lifecycle_via_daemon() {
         ref_name: "main".into(),
         mountpoint: mp.clone(),
         no_dotgit: true, // skip dotgit; the test only checks file content
+        isolated_dotgit: false,
         allow_other: false,
     };
     match rpc(&sock, &mount_req(&mp_a)) {
@@ -297,6 +298,7 @@ fn second_mount_with_different_source_rejected_as_source_mismatch() {
         ref_name: "main".into(),
         mountpoint: mp.clone(),
         no_dotgit: true,
+        isolated_dotgit: false,
         allow_other: false,
     };
     match rpc(&sock, &req_a) {
@@ -313,6 +315,7 @@ fn second_mount_with_different_source_rejected_as_source_mismatch() {
         ref_name: "main".into(),
         mountpoint: mp_b.clone(),
         no_dotgit: true,
+        isolated_dotgit: false,
         allow_other: false,
     };
     match rpc(&sock, &req_b) {
@@ -331,4 +334,80 @@ fn second_mount_with_different_source_rejected_as_source_mismatch() {
     handle.join().unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&mp);
     let _ = std::fs::remove_dir_all(&mp_b);
+}
+
+#[test]
+#[ignore = "requires FUSE + git CLI; run inside the devcontainer"]
+fn mount_isolated_dotgit_omits_alternates_and_supports_git_status_and_log() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+
+    let repo = build_fixture("isolated-dotgit-fixture");
+    // Repack so objects live in .git/objects/pack/*.pack as a partial clone would.
+    git(&repo, &["repack", "-a", "-d", "-q"]);
+    let expected_head = String::from_utf8(git(&repo, &["rev-parse", "HEAD"])).unwrap();
+
+    let mp = temp_path("mp-isolated-dotgit", "");
+    let _ = std::fs::remove_dir_all(&mp);
+    std::fs::create_dir_all(&mp).unwrap();
+
+    let (sock, handle) = spawn_daemon("isolated-dotgit");
+
+    let req = Request::Mount {
+        source: repo.to_string_lossy().into_owned(),
+        ref_name: "main".into(),
+        mountpoint: mp.clone(),
+        no_dotgit: false,
+        isolated_dotgit: true,
+        allow_other: false,
+    };
+    match rpc(&sock, &req) {
+        Response::Ok => {}
+        other => panic!("mount isolated_dotgit: got {other:?}"),
+    }
+    assert!(
+        wait_for_mount(&mp, Duration::from_secs(5)),
+        "isolated_dotgit mount never came up"
+    );
+
+    // 1. .git/objects/info/alternates must not exist.
+    assert!(
+        !mp.join(".git/objects/info/alternates").exists(),
+        ".git/objects/info/alternates must be omitted when isolated_dotgit is true"
+    );
+
+    // 2. .git/objects/pack/*.pack must be projected inside the mount.
+    let pack_entries: Vec<_> = std::fs::read_dir(mp.join(".git/objects/pack"))
+        .expect("read .git/objects/pack")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        pack_entries
+            .iter()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".pack")),
+        "expected projected pack-*.pack under .git/objects/pack"
+    );
+
+    // 3. `git status --porcelain` and `git log -1 --format=%H` work inside the mount.
+    let status_out = String::from_utf8(git(&mp, &["status", "--porcelain"])).unwrap();
+    assert!(
+        status_out.trim().is_empty(),
+        "expected clean `git status --porcelain`, got `{status_out}`"
+    );
+    let log_out = String::from_utf8(git(&mp, &["log", "-1", "--format=%H"])).unwrap();
+    assert_eq!(log_out.trim(), expected_head.trim());
+
+    // Cleanup.
+    let _ = rpc(
+        &sock,
+        &Request::Umount {
+            mountpoint: mp.clone(),
+        },
+    );
+    let _ = rpc(&sock, &Request::Shutdown);
+    handle.join().unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&mp);
+    let _ = std::fs::remove_dir_all(&repo);
 }

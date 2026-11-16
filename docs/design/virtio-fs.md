@@ -1,6 +1,6 @@
 # Design: `virtio-fs` Host Serving & Uncompressed On-Disk Blob Cache
 
-> Status: **proposed 2026-11-14.** Extends [`container-deployment.md`](container-deployment.md),
+> Status: **implemented (L2 uncompressed blob cache, `--isolated-dotgit`, and `crates/projgit-virtiofs`).** Extends [`container-deployment.md`](container-deployment.md),
 > [`projgitd.md`](projgitd.md), and [`cache-transform-tier.md`](cache-transform-tier.md) §9
 > (Organ 2 — the decoded-content store) to sandboxes running inside
 > **microVMs** (QEMU, Cloud Hypervisor, Kata Containers, Firecracker-class VMMs).
@@ -9,7 +9,7 @@
 > OID-keyed on-disk blob cache on the host) load-bearing rather than a
 > tail optimization: it eliminates per-read decompression across VMs,
 > enables `O(range)` random reads, and unlocks **`virtio-fs` DAX** so
-> multiple micr> .
+> multiple microVMs share the same physical host Page Cache pages.
 
 ## 0. Problem: Mounting `projgit` into a microVM sandbox
 
@@ -163,15 +163,24 @@ Host (trusted):
          `virtiofsd` → `host /dev/fuse` → `projgit`), and `DAX` cannot pass
          through a userspace FUSE mount without kernel FUSE-passthrough.
     - *Cons:* Double FUSE hop on the host (`guest virtiofs` →
-2. **Path 2 — Native (`projgit-virtiofs` crate speaking `vhost-user-fs`):**
-   Add a sibling crate to `projgit-fuse` that adapts
+2. **Path 2 — Native (`crates/projgit-virtiofs` crate speaking FUSE + `DAX`):**
+   [`crates/projgit-virtiofs`](../../crates/projgit-virtiofs) is a sibling
+   crate to `projgit-fuse` that adapts
    [`projgit_core::FsProvider`](../../crates/projgit-core/src/fs_provider.rs)
-   directly to the `vhost-user-fs` backend trait (listening on the
-   VMM's `vhost-user` Unix socket).
-    - *Pros:* Single hop from guest virtqueue to `ProjectionFsProvider`;
-         no `/dev/fuse` or `CAP_SYS_ADMIN` needed on the host *or* guest;
-         can return the backing `blobs/<xx>/<oid>` file descriptor directly
-         for `FUSE_SETUPMAPPING` (`DAX`).
+   directly to the FUSE 7.38 + `virtio-fs` `DAX` wire protocol
+   (`ProjgitVirtioFs<F, M>`):
+    - Decodes and encodes standard little-endian FUSE frames (`FUSE_INIT`,
+      `FUSE_LOOKUP`, `FUSE_GETATTR`, `FUSE_READLINK`, `FUSE_OPEN`, `FUSE_READ`,
+      `FUSE_OPENDIR`, `FUSE_READDIR`, `FUSE_STATFS`, `FUSE_SETUPMAPPING` = 48,
+      `FUSE_REMOVEMAPPING` = 49) with `#![forbid(unsafe_code)]`.
+    - Dispatches `FUSE_SETUPMAPPING` through `FsProvider::backing_file(nodeid)`
+      and installs the open `Arc<File>` into a configurable `DaxMapper`
+      (`MemoryDaxWindow` / `RecordedDaxMapper`) at `(moffset, len, foffset)`.
+      In-memory synthetic files (`.git/HEAD`, `.git/index`) return `-ENOSYS`
+      so the guest kernel falls back to `FUSE_READ` over the virtqueue.
+    - Provides length-prefixed stream framing (`server::serve_stream`) and a
+      Unix domain socket server (`server::serve_unix_socket` /
+      `server::spawn_unix_socket_server`).
 
 ## 4. Extending `FsProvider` for file-descriptor / `DAX` serving
 
@@ -231,6 +240,12 @@ containing the **host filesystem path** to `<cache-dir>/<repo>/.git/objects`.
      `virtio-fs` `DAX` / FUSE passthrough. As a result, `git log`,
      `git show`, and `git cat-file` work self-contained inside a single
      `virtio-fs` microVM mount with no `alternates` file and no extra mounts.
+  3. **CLI & daemon `--isolated-dotgit` flag:**
+     `projgit mount --isolated-dotgit`, `projgit mount-multi --isolated-dotgit`,
+     and `projgit attach mount --isolated-dotgit` (plus `isolated_dotgit: true`
+     on `projgit-daemon`'s `Request::Mount`) select `a1_plus_isolated_overlay`
+     (combined with A2 branch ref visibility when the projection is a local
+     branch) instead of `a1_plus_overlay`.
 
 ## 6. Trade-offs & disk management
 

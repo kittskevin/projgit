@@ -629,8 +629,17 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
             ref_name,
             mountpoint,
             no_dotgit,
+            isolated_dotgit,
             allow_other,
-        } => handle_mount(state, source, ref_name, mountpoint, no_dotgit, allow_other),
+        } => handle_mount(
+            state,
+            source,
+            ref_name,
+            mountpoint,
+            no_dotgit,
+            isolated_dotgit,
+            allow_other,
+        ),
         Request::Umount { mountpoint } => handle_umount(state, mountpoint),
         Request::Attach { source } => handle_attach(state, source),
         Request::Fetch { oid } => handle_fetch(state, oid),
@@ -648,6 +657,7 @@ fn handle_mount(
     ref_name: String,
     mountpoint: PathBuf,
     no_dotgit: bool,
+    isolated_dotgit: bool,
     allow_other: bool,
 ) -> Response {
     let mountpoint = match std::fs::canonicalize(&mountpoint) {
@@ -695,7 +705,13 @@ fn handle_mount(
     }
 
     let projection = Projection::Ref(ref_name.clone());
-    let overlay = match build_overlay(no_dotgit, &projection, &repo.store, &repo.git_dir) {
+    let overlay = match build_overlay(
+        no_dotgit,
+        isolated_dotgit,
+        &projection,
+        &repo.store,
+        &repo.git_dir,
+    ) {
         Ok(o) => o,
         Err(e) => return err(codes::REF_RESOLVE_FAILED, format!("{e:#}")),
     };
@@ -1088,6 +1104,7 @@ fn canonicalize_url_for_hash(url: &str) -> String {
 
 fn build_overlay(
     no_dotgit: bool,
+    isolated_dotgit: bool,
     projection: &Projection,
     store: &Arc<ObjectStore>,
     git_dir: &Path,
@@ -1103,11 +1120,15 @@ fn build_overlay(
     let commit_oid = projection
         .resolve_commit(store)
         .with_context(|| "resolving projection commit for .git/ synthesis")?;
-    let objects_dir = git_dir.join("objects");
-    let objects_dir = std::fs::canonicalize(&objects_dir)
-        .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    let mut overlay =
-        dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")?;
+    let mut overlay = if isolated_dotgit {
+        dotgit::a1_plus_isolated_overlay(store, commit_oid)
+            .context("building isolated A1+ overlay")?
+    } else {
+        let objects_dir = git_dir.join("objects");
+        let objects_dir = std::fs::canonicalize(&objects_dir)
+            .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
+        dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")?
+    };
     // Apply A2 ref visibility when the projection is a local branch.
     // No-op for Commit projections and for refs that resolve to tags
     // (those correctly stay on A1's detached HEAD; see
@@ -1169,5 +1190,81 @@ mod tests {
             other => panic!("got {other:?}"),
         }
         assert!(state.should_shut_down());
+    }
+
+    #[test]
+    fn build_overlay_isolated_dotgit_omits_alternates_and_projects_packs_with_a2() {
+        use projgit_core::overlay::SyntheticEntry;
+        use std::process::Command;
+
+        let base = std::env::temp_dir().join(format!(
+            "projgit-daemon-isolated-overlay-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_AUTHOR_NAME", "projgit-test")
+                .env("GIT_AUTHOR_EMAIL", "test@projgit.invalid")
+                .env("GIT_COMMITTER_NAME", "projgit-test")
+                .env("GIT_COMMITTER_EMAIL", "test@projgit.invalid")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(base.join("hello.txt"), b"isolated\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        run_git(&["repack", "-a", "-d", "-q"]);
+
+        let git_dir = base.join(".git");
+        let store = Arc::new(ObjectStore::open(&git_dir).unwrap());
+        let projection = Projection::Ref("main".into());
+
+        let overlay = build_overlay(false, true, &projection, &store, &git_dir).unwrap();
+        let dotgit = match overlay.get(b".git").expect(".git entry") {
+            SyntheticEntry::Directory { children } => children,
+            other => panic!("expected .git dir, got {other:?}"),
+        };
+
+        // A2 ref visibility: HEAD is symbolic `ref: refs/heads/main\n`.
+        match dotgit.get(b"HEAD".as_slice()).expect("HEAD") {
+            SyntheticEntry::File { content, .. } => {
+                assert_eq!(content.as_slice(), b"ref: refs/heads/main\n");
+            }
+            other => panic!("expected HEAD file, got {other:?}"),
+        }
+
+        // .git/objects/info/alternates is omitted; .git/objects/pack/* has HostFile entries.
+        let objects = match dotgit.get(b"objects".as_slice()).expect("objects") {
+            SyntheticEntry::Directory { children } => children,
+            other => panic!("expected objects dir, got {other:?}"),
+        };
+        let info = match objects.get(b"info".as_slice()).expect("info") {
+            SyntheticEntry::Directory { children } => children,
+            other => panic!("expected info dir, got {other:?}"),
+        };
+        assert!(
+            !info.contains_key(b"alternates".as_slice()),
+            "isolated_dotgit must omit .git/objects/info/alternates"
+        );
+        let pack = match objects.get(b"pack".as_slice()).expect("pack") {
+            SyntheticEntry::Directory { children } => children,
+            other => panic!("expected pack dir, got {other:?}"),
+        };
+        assert!(
+            pack.values()
+                .any(|entry| matches!(entry, SyntheticEntry::HostFile { .. })),
+            "expected at least one HostFile pack entry under .git/objects/pack"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

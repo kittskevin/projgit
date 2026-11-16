@@ -24,6 +24,7 @@
 //! `tracing-subscriber` wiring for the existing `-v` flag) is tracked in
 //! `docs/implementation/handoff.md` and deferred.
 
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -141,6 +142,19 @@ struct MountArgs {
     #[arg(long)]
     no_dotgit: bool,
 
+    /// Synthesize an isolated `.git/` directory without
+    /// `objects/info/alternates`.
+    ///
+    /// Instead of writing a host filesystem path into
+    /// `.git/objects/info/alternates`, projects `<git-dir>/objects/pack/*`
+    /// and `<git-dir>/objects/info/{commit-graph,packs,commit-graphs/*}`
+    /// directly under `.git/objects/` as read-only host-backed files.
+    /// Designed for microVM / `virtio-fs` mounts where host paths do
+    /// not exist inside the guest and must not leak across the VM
+    /// boundary.
+    #[arg(long, conflicts_with = "no_dotgit")]
+    isolated_dotgit: bool,
+
     /// Pass the `allow_other` FUSE mount option, so users other than
     /// the one running `projgit mount` can read the mount.
     ///
@@ -253,6 +267,13 @@ struct MountMultiArgs {
     #[arg(long)]
     no_dotgit: bool,
 
+    /// Apply to every projection: synthesize an isolated `.git/`
+    /// directory (no `objects/info/alternates`; packfiles and
+    /// commit-graph metadata projected directly under `.git/objects/`).
+    /// See `mount --isolated-dotgit`.
+    #[arg(long, conflicts_with = "no_dotgit")]
+    isolated_dotgit: bool,
+
     /// Apply to every projection: pass the `allow_other` FUSE mount
     /// option. See `mount --allow-other` for the security note.
     #[arg(long)]
@@ -324,6 +345,9 @@ enum AttachOp {
         /// Skip the synthesised `.git/` overlay.
         #[arg(long)]
         no_dotgit: bool,
+        /// Synthesise an isolated `.git/` overlay without `objects/info/alternates`.
+        #[arg(long, conflicts_with = "no_dotgit")]
+        isolated_dotgit: bool,
         /// Set `allow_other` on the FUSE mount.
         #[arg(long)]
         allow_other: bool,
@@ -798,8 +822,14 @@ where
         // future daemon address space.
         let projection_id = (idx + 1) as u64;
         let projection = Projection::Ref(spec.ref_name.clone());
-        let overlay = build_overlay_no_subtree(args.no_dotgit, &projection, &store, git_dir)
-            .with_context(|| format!("building overlay for {}", spec.ref_name))?;
+        let overlay = build_overlay_no_subtree(
+            args.no_dotgit,
+            args.isolated_dotgit,
+            &projection,
+            &store,
+            git_dir,
+        )
+        .with_context(|| format!("building overlay for {}", spec.ref_name))?;
         let provider = Arc::new(
             ProjectionFsProvider::new(projection, hydrating.clone(), overlay, projection_id)
                 .with_context(|| {
@@ -883,13 +913,14 @@ where
 
 /// `build_root_overlay` sibling that takes individual flags rather
 /// than the single-mount `MountArgs`. Behaviour identical: A1+ overlay
-/// by default, plus A2 ref visibility when the projection is a
-/// branch; empty overlay if `no_dotgit` or `Projection::Subtree`
-/// (the latter unreachable today since `mount-multi` only accepts
-/// refs, but the guard stays for the future).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// by default (or isolated A1+ when `isolated_dotgit` is set), plus A2
+/// ref visibility when the projection is a branch; empty overlay if
+/// `no_dotgit` or `Projection::Subtree` (the latter unreachable today
+/// since `mount-multi` only accepts refs, but the guard stays for the
+/// future).
 fn build_overlay_no_subtree(
     no_dotgit: bool,
+    isolated_dotgit: bool,
     projection: &projgit_core::Projection,
     store: &std::sync::Arc<projgit_core::ObjectStore>,
     git_dir: &Path,
@@ -905,11 +936,15 @@ fn build_overlay_no_subtree(
     let commit_oid = projection
         .resolve_commit(store)
         .with_context(|| "resolving projection commit for .git/ synthesis")?;
-    let objects_dir = git_dir.join("objects");
-    let objects_dir = std::fs::canonicalize(&objects_dir)
-        .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    let mut overlay =
-        dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")?;
+    let mut overlay = if isolated_dotgit {
+        dotgit::a1_plus_isolated_overlay(store, commit_oid)
+            .context("building isolated A1+ overlay")?
+    } else {
+        let objects_dir = git_dir.join("objects");
+        let objects_dir = std::fs::canonicalize(&objects_dir)
+            .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
+        dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")?
+    };
     apply_a2_if_branch(&mut overlay, projection, store, commit_oid);
     Ok(overlay)
 }
@@ -1055,29 +1090,13 @@ fn build_root_overlay(
     store: &std::sync::Arc<projgit_core::ObjectStore>,
     git_dir: &Path,
 ) -> Result<projgit_core::RootOverlay> {
-    use projgit_core::{dotgit, Projection, RootOverlay};
-
-    if args.no_dotgit {
-        return Ok(RootOverlay::new());
-    }
-    // `.git/HEAD` would point at the full commit's tree, not the
-    // subtree the user is browsing — that produces surprising
-    // `git log <path>` semantics. Subtree mounts opt out by default;
-    // a future variant can revisit this if the use case calls for it.
-    if matches!(projection, Projection::Subtree { .. }) {
-        return Ok(RootOverlay::new());
-    }
-
-    let commit_oid = projection
-        .resolve_commit(store)
-        .with_context(|| "resolving projection commit for .git/ synthesis")?;
-    let objects_dir = git_dir.join("objects");
-    let objects_dir = std::fs::canonicalize(&objects_dir)
-        .with_context(|| format!("canonicalizing {}", objects_dir.display()))?;
-    let mut overlay =
-        dotgit::a1_plus_overlay(store, commit_oid, &objects_dir).context("building A1+ overlay")?;
-    apply_a2_if_branch(&mut overlay, projection, store, commit_oid);
-    Ok(overlay)
+    build_overlay_no_subtree(
+        args.no_dotgit,
+        args.isolated_dotgit,
+        projection,
+        store,
+        git_dir,
+    )
 }
 
 /// Apply A2 ref visibility to `overlay` when `projection` is a
@@ -1289,6 +1308,178 @@ mod tests {
         assert_ne!(https, ssh);
         assert_ne!(https, sshlong);
     }
+
+    #[test]
+    fn cli_isolated_dotgit_parses_and_conflicts_with_no_dotgit() {
+        let cli = Cli::try_parse_from(["projgit", "mount", "/src", "/mnt", "--isolated-dotgit"])
+            .expect("mount --isolated-dotgit should parse");
+        match cli.command {
+            Command::Mount(args) => {
+                assert!(args.isolated_dotgit);
+                assert!(!args.no_dotgit);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Conflict on `mount`
+        assert!(Cli::try_parse_from([
+            "projgit",
+            "mount",
+            "/src",
+            "/mnt",
+            "--isolated-dotgit",
+            "--no-dotgit",
+        ])
+        .is_err());
+
+        // `mount-multi --isolated-dotgit`
+        let cli = Cli::try_parse_from([
+            "projgit",
+            "mount-multi",
+            "/src",
+            "--mount",
+            "main=/mnt",
+            "--isolated-dotgit",
+        ])
+        .expect("mount-multi --isolated-dotgit should parse");
+        match cli.command {
+            Command::MountMulti(args) => {
+                assert!(args.isolated_dotgit);
+                assert!(!args.no_dotgit);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Conflict on `mount-multi`
+        assert!(Cli::try_parse_from([
+            "projgit",
+            "mount-multi",
+            "/src",
+            "--mount",
+            "main=/mnt",
+            "--isolated-dotgit",
+            "--no-dotgit",
+        ])
+        .is_err());
+
+        // `attach mount --isolated-dotgit`
+        let cli = Cli::try_parse_from([
+            "projgit",
+            "attach",
+            "mount",
+            "/src",
+            "--ref",
+            "main",
+            "--mountpoint",
+            "/mnt",
+            "--isolated-dotgit",
+        ])
+        .expect("attach mount --isolated-dotgit should parse");
+        match cli.command {
+            Command::Attach(AttachArgs {
+                op:
+                    AttachOp::Mount {
+                        isolated_dotgit,
+                        no_dotgit,
+                        ..
+                    },
+                ..
+            }) => {
+                assert!(isolated_dotgit);
+                assert!(!no_dotgit);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Conflict on `attach mount`
+        assert!(Cli::try_parse_from([
+            "projgit",
+            "attach",
+            "mount",
+            "/src",
+            "--ref",
+            "main",
+            "--mountpoint",
+            "/mnt",
+            "--isolated-dotgit",
+            "--no-dotgit",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn build_overlay_isolated_dotgit_omits_alternates_and_applies_a2() {
+        use projgit_core::{overlay::SyntheticEntry, ObjectStore, Projection};
+        use std::{process::Command, sync::Arc};
+
+        let base = std::env::temp_dir().join(format!(
+            "projgit-cli-isolated-overlay-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_AUTHOR_NAME", "projgit-test")
+                .env("GIT_AUTHOR_EMAIL", "test@projgit.invalid")
+                .env("GIT_COMMITTER_NAME", "projgit-test")
+                .env("GIT_COMMITTER_EMAIL", "test@projgit.invalid")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(base.join("hello.txt"), b"isolated\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        run_git(&["repack", "-a", "-d", "-q"]);
+
+        let git_dir = base.join(".git");
+        let store = Arc::new(ObjectStore::open(&git_dir).unwrap());
+        let projection = Projection::Ref("main".into());
+
+        let overlay = build_overlay_no_subtree(false, true, &projection, &store, &git_dir).unwrap();
+        let dotgit = match overlay.get(b".git").expect(".git entry") {
+            SyntheticEntry::Directory { children } => children,
+            other => panic!("expected .git dir, got {other:?}"),
+        };
+
+        // A2 ref visibility: HEAD is symbolic `ref: refs/heads/main\n`.
+        match dotgit.get(b"HEAD".as_slice()).expect("HEAD") {
+            SyntheticEntry::File { content, .. } => {
+                assert_eq!(content.as_slice(), b"ref: refs/heads/main\n");
+            }
+            other => panic!("expected HEAD file, got {other:?}"),
+        }
+
+        // .git/objects/info/alternates is omitted; .git/objects/pack/* has HostFile entries.
+        let objects = match dotgit.get(b"objects".as_slice()).expect("objects") {
+            SyntheticEntry::Directory { children } => children,
+            other => panic!("expected objects dir, got {other:?}"),
+        };
+        let info = match objects.get(b"info".as_slice()).expect("info") {
+            SyntheticEntry::Directory { children } => children,
+            other => panic!("expected info dir, got {other:?}"),
+        };
+        assert!(
+            !info.contains_key(b"alternates".as_slice()),
+            "isolated_dotgit must omit .git/objects/info/alternates"
+        );
+        let pack = match objects.get(b"pack".as_slice()).expect("pack") {
+            SyntheticEntry::Directory { children } => children,
+            other => panic!("expected pack dir, got {other:?}"),
+        };
+        assert!(
+            pack.values()
+                .any(|entry| matches!(entry, SyntheticEntry::HostFile { .. })),
+            "expected at least one HostFile pack entry under .git/objects/pack"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,12 +1501,14 @@ fn cmd_attach(args: AttachArgs) -> Result<()> {
             ref_name,
             mountpoint,
             no_dotgit,
+            isolated_dotgit,
             allow_other,
         } => Request::Mount {
             source,
             ref_name,
             mountpoint,
             no_dotgit,
+            isolated_dotgit,
             allow_other,
         },
         AttachOp::Umount { mountpoint } => Request::Umount { mountpoint },

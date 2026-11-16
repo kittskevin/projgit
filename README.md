@@ -228,9 +228,16 @@ paths leak into the guest; instead, the host CAS's `objects/pack/*` and
   symbolically point at); tag projections also stay detached because
   git refuses to set `HEAD` symbolically to a tag.
 
-**Opt-outs:**
+**Opt-outs & isolation modes:**
 
 - `projgit mount … --no-dotgit` — pure projected tree, no `.git/` at all.
+- `projgit mount … --isolated-dotgit` (also supported on `projgit mount-multi`
+  and `projgit attach mount`) — synthesizes an isolated `.git/` overlay
+  (`a1_plus_isolated_overlay` + A2 branch ref visibility) that omits
+  `.git/objects/info/alternates` and instead projects `<objects_dir>/pack/*`
+  and `<objects_dir>/info/{commit-graph,packs,commit-graphs/*}` directly into
+  `.git/objects/` as `SyntheticEntry::HostFile` entries. Ideal for microVMs
+  and containers that cannot resolve host filesystem paths.
 - `--subtree <path>` mounts skip `.git/` synthesis automatically; a `HEAD`
   describing the full commit while the user browses only a subtree would
   create surprising `git log <path>` semantics.
@@ -389,30 +396,29 @@ What works today:
   coalescing, PID file management, and background `git maintenance run`.
 - Linux/macOS FUSE backend through `fuser`, with file ownership echoed
   per-request so `git`'s `safe.directory` check passes without setup.
+- `projgit-virtiofs` (`crates/projgit-virtiofs`) zero-`unsafe` FUSE 7.38 +
+  `virtio-fs` `DAX` (`FUSE_SETUPMAPPING` / `FUSE_REMOVEMAPPING`) wire protocol
+  engine, `DaxMapper` (`MemoryDaxWindow`), and framed / Unix socket server.
 - `projgit mount` and `projgit mount-multi` for refs, commits, and subtrees.
 - A1+ / A2-flavored `.git/` synthesized at the mount root by default
   for branch projections (symbolic HEAD pointing at the branch ref,
   a clean read-only `.git/index` matching HEAD, and
   `objects/info/alternates` reaching the shared on-disk store), plus
-  isolated `.git/` overlays (`a1_isolated_overlay` / `a1_plus_isolated_overlay`)
+  `--isolated-dotgit` (`a1_isolated_overlay` / `a1_plus_isolated_overlay`)
   for microVM guests where host paths must not leak.
   Commit-OID and tag projections keep the detached HEAD (A1+).
   Opt out with `--no-dotgit`.
 - Tree, blob, and header caches, plus T1 readdir-time header + small-blob prefetch.
 - Optional GVFS protocol fetcher (Azure DevOps Server / Azure Repos) behind the `gvfs-fetcher` Cargo feature.
-- Local and CI test coverage for the core, CLI, projection filesystem, FUSE
-  multi-mount, and `projgitd` cross-process / cross-namespace smoke paths, plus
-  network-gated end-to-end mount tests and reproducible benchmarks.
+- Local and CI test coverage for the core, CLI, projection filesystem,
+  `projgit-virtiofs` FUSE/DAX wire engine, FUSE multi-mount, and `projgitd`
+  cross-process / cross-namespace smoke paths, plus network-gated end-to-end
+  mount tests and reproducible benchmarks.
 
 What is deliberately deferred:
 
 - Windows mounting. The `projgit-winfsp` crate is a stub; the implementation
   plan lives in [docs/design/winfsp-implementation-plan.md](docs/design/winfsp-implementation-plan.md).
-- Native `vhost-user-fs` (`virtio-fs`) transport crate (`projgit-virtiofs`).
-  The uncompressed `<git-dir>/blobs/` backing store, `FsProvider::backing_file`,
-  and isolated microVM `.git/` overlays are shipped in `projgit-core`; the
-  `vhost-user-backend` socket server is specified in
-  [docs/design/virtio-fs.md](docs/design/virtio-fs.md).
 - Writes. The MVP is read-only (copy-on-write overlay design in
   [docs/design/writable-worktrees.md](docs/design/writable-worktrees.md)).
 
@@ -427,6 +433,7 @@ crates/projgit-core/      projection engine, object store, L1/L2 caches, fetcher
 crates/projgit-cli/       `projgit mount`, `mount-multi`, `attach`, and `bench_mount`
 crates/projgit-daemon/    `projgitd` shared-CAS daemon, RPC protocol, DaemonFetcher
 crates/projgit-fuse/      Linux/macOS FUSE adapter (`fuser` + external `/dev/fuse` fd)
+crates/projgit-virtiofs/  FUSE 7.38 + `virtio-fs` `DAX` (`FUSE_SETUPMAPPING`) frontend
 crates/projgit-winfsp/    Windows backend stub; implementation deferred
 docs/                     problem statement, design docs, bench baseline, handoffs
 spikes/                   completed Phase 0 spikes (ondemand-fetch, fuse-fd-passing)

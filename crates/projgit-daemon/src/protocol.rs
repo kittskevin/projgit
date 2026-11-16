@@ -45,6 +45,10 @@ pub enum Request {
         /// `projgit mount --no-dotgit` for the semantics.
         #[serde(default)]
         no_dotgit: bool,
+        /// Synthesise an isolated `.git/` overlay without
+        /// `objects/info/alternates`. See `projgit mount --isolated-dotgit`.
+        #[serde(default)]
+        isolated_dotgit: bool,
         /// Set `allow_other` so non-mounter UIDs (e.g. containers)
         /// can read the mount. See `projgit mount --allow-other`.
         #[serde(default)]
@@ -340,6 +344,7 @@ mod tests {
             ref_name: "main".into(),
             mountpoint: PathBuf::from("/tmp/mp"),
             no_dotgit: true,
+            isolated_dotgit: false,
             allow_other: false,
         };
         match roundtrip::<Request>(&original) {
@@ -348,12 +353,63 @@ mod tests {
                 ref_name,
                 mountpoint,
                 no_dotgit,
+                isolated_dotgit,
                 allow_other,
             } => {
                 assert_eq!(source, "https://example/repo");
                 assert_eq!(ref_name, "main");
                 assert_eq!(mountpoint, PathBuf::from("/tmp/mp"));
                 assert!(no_dotgit);
+                assert!(!isolated_dotgit);
+                assert!(!allow_other);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_request_isolated_dotgit_roundtrip_and_default() {
+        let original = Request::Mount {
+            source: "/tmp/repo".into(),
+            ref_name: "main".into(),
+            mountpoint: PathBuf::from("/tmp/mp-isolated"),
+            no_dotgit: false,
+            isolated_dotgit: true,
+            allow_other: true,
+        };
+        match roundtrip::<Request>(&original) {
+            Request::Mount {
+                source,
+                ref_name,
+                mountpoint,
+                no_dotgit,
+                isolated_dotgit,
+                allow_other,
+            } => {
+                assert_eq!(source, "/tmp/repo");
+                assert_eq!(ref_name, "main");
+                assert_eq!(mountpoint, PathBuf::from("/tmp/mp-isolated"));
+                assert!(!no_dotgit);
+                assert!(isolated_dotgit);
+                assert!(allow_other);
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        // Backward compatibility: older clients omitting `isolated_dotgit`
+        // deserialize with `isolated_dotgit == false`.
+        let legacy_json =
+            r#"{"op":"mount","source":"/tmp/repo","ref":"main","mountpoint":"/tmp/mp"}"#;
+        let parsed: Request = serde_json::from_str(legacy_json).expect("deserialize legacy mount");
+        match parsed {
+            Request::Mount {
+                no_dotgit,
+                isolated_dotgit,
+                allow_other,
+                ..
+            } => {
+                assert!(!no_dotgit);
+                assert!(!isolated_dotgit);
                 assert!(!allow_other);
             }
             other => panic!("got {other:?}"),

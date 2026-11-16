@@ -1,0 +1,19 @@
+[package]
+name = "projgit-virtiofs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "vhost-user-fs and FUSE/DAX wire protocol frontend for projgit."
+
+[dependencies]
+projgit-core = { path = "../projgit-core", default-features = false }
+parking_lot = "0.12"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bstr = { workspace = true }
+gix = { workspace = true }
+tempfile = "3"

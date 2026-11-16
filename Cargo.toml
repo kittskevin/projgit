@@ -4,6 +4,7 @@ members = [
     "crates/projgit-core",
     "crates/projgit-cli",
     "crates/projgit-fuse",
+    "crates/projgit-virtiofs",
     "crates/projgit-winfsp",
     "crates/projgit-daemon",
 ]

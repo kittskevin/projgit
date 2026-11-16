@@ -2039,6 +2039,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "projgit-virtiofs"
+version = "0.0.0"
+dependencies = [
+ "bstr",
+ "gix",
+ "parking_lot",
+ "projgit-core",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "projgit-winfsp"
 version = "0.0.0"
 dependencies = [
