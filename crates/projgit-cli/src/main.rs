@@ -59,6 +59,10 @@ enum Command {
     /// Talk to a running `projgitd` (Stage 2c). Subcommands send
     /// individual control-plane RPCs over the daemon's unix socket.
     Attach(AttachArgs),
+    /// Serve a projection over a Linux `vhost-user-fs` Unix domain socket
+    /// for `qemu` / `cloud-hypervisor` (`virtio-fs` + `DAX`).
+    #[cfg(target_os = "linux")]
+    Virtiofs(VirtiofsArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -360,6 +364,76 @@ enum AttachOp {
     },
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, clap::Args)]
+struct VirtiofsArgs {
+    /// Source repository: a URL (https://, git://, ssh://, git@...) or
+    /// a path to a local checkout / bare repository.
+    source: String,
+
+    /// Path to the `vhost-user-fs` Unix domain socket to bind.
+    #[arg(long, value_name = "PATH")]
+    socket: PathBuf,
+
+    /// `virtio-fs` filesystem tag advertised in `virtio_fs_config`
+    /// (`mount -t virtiofs <TAG> <MOUNTPOINT>` inside the guest).
+    #[arg(long, default_value = projgit_virtiofs::vhost_user::DEFAULT_TAG)]
+    tag: String,
+
+    /// Project the tip of this ref (short or full name; `HEAD` works).
+    /// Mutually exclusive with `--commit`. Defaults to `HEAD`.
+    #[arg(long, conflicts_with = "commit")]
+    r#ref: Option<String>,
+
+    /// Project this specific commit (full hex OID).
+    #[arg(long)]
+    commit: Option<String>,
+
+    /// Project only this `/`-separated subdirectory of the projection.
+    #[arg(long)]
+    subtree: Option<String>,
+
+    /// Where to keep clones of remote repositories. Only used when
+    /// `source` is a URL.
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Pass `--depth=N` to `git clone` when partial-cloning a URL source.
+    #[arg(long, value_name = "N")]
+    depth: Option<u32>,
+
+    /// Remote name to fetch from (default `origin`).
+    #[arg(long, default_value = "origin")]
+    remote: String,
+
+    /// Skip on-demand fetching.
+    #[arg(long)]
+    offline: bool,
+
+    /// On shutdown, print cache and prefetch statistics.
+    #[arg(long)]
+    stats: bool,
+
+    /// Don't synthesize a `.git/` directory at the projection root.
+    #[arg(long)]
+    no_dotgit: bool,
+
+    /// Synthesize an isolated `.git/` directory without `objects/info/alternates`
+    /// (enabled by default for `projgit virtiofs` unless `--no-dotgit` is set).
+    #[arg(long, conflicts_with = "no_dotgit")]
+    isolated_dotgit: bool,
+
+    /// Fetch backend for URL-backed mounts.
+    #[arg(long, value_enum, default_value = "git")]
+    fetcher: FetcherChoice,
+
+    /// Base GVFS protocol URL, with or without a trailing `/gvfs`.
+    /// Required when `--fetcher gvfs` is selected.
+    #[cfg(feature = "gvfs-fetcher")]
+    #[arg(long, value_name = "URL")]
+    gvfs_url: Option<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -368,6 +442,8 @@ fn main() -> Result<()> {
         Command::Mount(args) => cmd_mount(args),
         Command::MountMulti(args) => cmd_mount_multi(args),
         Command::Attach(args) => cmd_attach(args),
+        #[cfg(target_os = "linux")]
+        Command::Virtiofs(args) => cmd_virtiofs(args),
     }
 }
 
@@ -1025,6 +1101,209 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// `virtiofs` (Linux `vhost-user-fs` + `DAX` backend)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn cmd_virtiofs(args: VirtiofsArgs) -> Result<()> {
+    #[cfg(feature = "gvfs-fetcher")]
+    use projgit_core::GvfsFetcher;
+    use projgit_core::{
+        clone::{git_dir_for, partial_clone, CloneOptions},
+        GitCliFetcher, HydratingObjectStore, NoopFetcher, ObjectStore, ProjectionFsProvider,
+    };
+    use std::sync::Arc;
+
+    let (git_dir, source_is_url) = if looks_like_url(&args.source) {
+        let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+        let dest = cache_dir.join(cache_subdir_for_url(&args.source));
+        if !dest.exists() {
+            let depth_note = match args.depth {
+                Some(n) => format!(" (--depth={n})"),
+                None => String::new(),
+            };
+            eprintln!(
+                "projgit: partial-cloning {} into {}{}",
+                args.source,
+                dest.display(),
+                depth_note,
+            );
+            std::fs::create_dir_all(&cache_dir)
+                .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+            let mut opts = CloneOptions::new(args.source.clone(), dest.clone());
+            if let Some(n) = args.depth {
+                if n == 0 {
+                    bail!("--depth 0 is not supported; git rejects --depth=0");
+                }
+                opts = opts.with_depth(n);
+            }
+            partial_clone(&opts).with_context(|| format!("cloning {}", args.source))?;
+        } else {
+            eprintln!("projgit: reusing cached clone at {}", dest.display());
+        }
+        (git_dir_for(&dest), true)
+    } else {
+        let p = PathBuf::from(&args.source);
+        if !p.exists() {
+            bail!("source path {} does not exist", p.display());
+        }
+        (git_dir_for(&p), false)
+    };
+
+    let store = Arc::new(
+        ObjectStore::open(&git_dir)
+            .with_context(|| format!("opening object store at {}", git_dir.display()))?,
+    );
+
+    let projection = build_projection_from_parts(
+        args.r#ref.as_deref(),
+        args.commit.as_deref(),
+        args.subtree.as_deref(),
+        &store,
+    )?;
+
+    // `projgit virtiofs` always uses the isolated `.git/` overlay (unless
+    // `--no-dotgit` is set) because a guest microVM cannot resolve host
+    // paths in `.git/objects/info/alternates`.
+    let _explicit_isolated = args.isolated_dotgit;
+    let _remote_hint = &args.remote;
+    let overlay = build_overlay_no_subtree(args.no_dotgit, true, &projection, &store, &git_dir)?;
+
+    if args.offline || !source_is_url {
+        if args.fetcher != FetcherChoice::Git {
+            bail!("--fetcher gvfs requires a URL source and cannot be combined with --offline");
+        }
+        let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
+        spawn_tree_warm(&hydrating, &projection);
+        let provider = Arc::new(
+            ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
+                .context("building ProjectionFsProvider")?,
+        );
+        run_virtiofs(provider, &args.socket, &args.tag, args.stats)
+    } else {
+        match args.fetcher {
+            FetcherChoice::Git => {
+                let fetcher = GitCliFetcher::open(store.clone())
+                    .context("opening GitCliFetcher (needs `git` on PATH)")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                spawn_tree_warm(&hydrating, &projection);
+                let provider = Arc::new(
+                    ProjectionFsProvider::new(
+                        projection, hydrating, overlay, /* projection_id */ 1,
+                    )
+                    .context("building ProjectionFsProvider")?,
+                );
+                run_virtiofs(provider, &args.socket, &args.tag, args.stats)
+            }
+            #[cfg(feature = "gvfs-fetcher")]
+            FetcherChoice::Gvfs => {
+                let gvfs_url = args
+                    .gvfs_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--fetcher gvfs requires --gvfs-url <URL>"))?;
+                let fetcher = match std::env::var("PROJGIT_GVFS_TOKEN") {
+                    Ok(token) if !token.is_empty() => {
+                        GvfsFetcher::with_bearer_token(store.clone(), gvfs_url, token)
+                    }
+                    _ => GvfsFetcher::open(store.clone(), gvfs_url),
+                }
+                .context("opening GvfsFetcher")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                spawn_tree_warm(&hydrating, &projection);
+                let provider = Arc::new(
+                    ProjectionFsProvider::new(
+                        projection, hydrating, overlay, /* projection_id */ 1,
+                    )
+                    .context("building ProjectionFsProvider")?,
+                );
+                run_virtiofs(provider, &args.socket, &args.tag, args.stats)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_virtiofs<F>(
+    provider: std::sync::Arc<projgit_core::ProjectionFsProvider<F>>,
+    socket: &Path,
+    tag: &str,
+    print_stats: bool,
+) -> Result<()>
+where
+    F: projgit_core::Fetcher + 'static,
+{
+    use projgit_virtiofs::dax::DEFAULT_DAX_WINDOW_SIZE;
+    use projgit_virtiofs::vhost_user::{
+        serve_vhost_user_socket, VhostUserFsBackend, DEFAULT_MAX_QUEUE_SIZE,
+    };
+    use std::sync::{Arc, RwLock};
+
+    eprintln!(
+        "projgit: serving vhost-user-fs at {} (tag={:?}, Ctrl-C or VMM disconnect to stop)",
+        socket.display(),
+        tag
+    );
+
+    let backend = Arc::new(RwLock::new(
+        VhostUserFsBackend::with_config(
+            provider.clone(),
+            tag,
+            DEFAULT_DAX_WINDOW_SIZE,
+            DEFAULT_MAX_QUEUE_SIZE,
+        )
+        .context("initializing VhostUserFsBackend")?,
+    ));
+
+    serve_vhost_user_socket(socket, backend)
+        .with_context(|| format!("serving vhost-user-fs socket {}", socket.display()))?;
+
+    if print_stats {
+        let store = provider.store().store();
+        let t = store.tree_cache_stats();
+        let h = store.header_cache_stats();
+        let b = store.blob_cache_stats();
+        let d = store.disk_blob_cache_stats();
+        let p = provider.prefetch_stats();
+        eprintln!(
+            "projgit: tree cache    hits={} misses={} inserts={} evictions={} len={}/{}",
+            t.hits, t.misses, t.inserts, t.evictions, t.len, t.capacity,
+        );
+        eprintln!(
+            "projgit: header cache  hits={} misses={} inserts={} evictions={} len={}/{}",
+            h.hits, h.misses, h.inserts, h.evictions, h.len, h.capacity,
+        );
+        eprintln!(
+            "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
+            b.hits,
+            b.misses,
+            b.inserts,
+            b.evictions,
+            b.skipped_too_large,
+            b.bytes_used,
+            b.capacity_bytes,
+        );
+        eprintln!(
+            "projgit: disk blobs    hits={} misses={} inserts={} write_errors={}",
+            d.hits, d.misses, d.inserts, d.write_errors,
+        );
+        eprintln!(
+            "projgit: prefetch (T1) posted={} dropped={} batches={} resolved={} headers={} failed={} blobs_warmed={} blobs_skipped={}",
+            p.posted,
+            p.dropped,
+            p.batches_sent,
+            p.oids_resolved,
+            p.headers_published,
+            p.oids_failed,
+            p.blobs_warmed,
+            p.blobs_skipped,
+        );
+    }
+
+    eprintln!("projgit: vhost-user-fs stopped.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1032,22 +1311,36 @@ fn build_projection(
     args: &MountArgs,
     store: &projgit_core::ObjectStore,
 ) -> Result<projgit_core::Projection> {
+    build_projection_from_parts(
+        args.r#ref.as_deref(),
+        args.commit.as_deref(),
+        args.subtree.as_deref(),
+        store,
+    )
+}
+
+fn build_projection_from_parts(
+    ref_name: Option<&str>,
+    commit_hex: Option<&str>,
+    subtree: Option<&str>,
+    store: &projgit_core::ObjectStore,
+) -> Result<projgit_core::Projection> {
     use projgit_core::Projection;
 
     // Pick the base projection from the mutually-exclusive --ref / --commit.
-    let base = match (&args.r#ref, &args.commit) {
+    let base = match (ref_name, commit_hex) {
         (Some(_), Some(_)) => unreachable!("clap rejects this combination"),
         (None, Some(hex)) => {
             let oid = gix::ObjectId::from_hex(hex.as_bytes())
                 .map_err(|e| anyhow!("invalid commit OID `{hex}`: {e}"))?;
             Projection::Commit(oid)
         }
-        (Some(name), None) => Projection::Ref(name.clone()),
+        (Some(name), None) => Projection::Ref(name.to_owned()),
         (None, None) => Projection::Ref("HEAD".to_owned()),
     };
 
     // Fold in --subtree if present.
-    let Some(path) = &args.subtree else {
+    let Some(path) = subtree else {
         return Ok(base);
     };
     let trimmed = path.trim_matches('/');
@@ -1405,6 +1698,46 @@ mod tests {
             "--no-dotgit",
         ])
         .is_err());
+
+        #[cfg(target_os = "linux")]
+        {
+            let cli = Cli::try_parse_from([
+                "projgit",
+                "virtiofs",
+                "/src",
+                "--socket",
+                "/tmp/projgit-vhost.sock",
+                "--tag",
+                "myrepo",
+                "--ref",
+                "main",
+                "--isolated-dotgit",
+                "--offline",
+            ])
+            .expect("virtiofs subcommand should parse");
+            match cli.command {
+                Command::Virtiofs(args) => {
+                    assert_eq!(args.source, "/src");
+                    assert_eq!(args.socket, PathBuf::from("/tmp/projgit-vhost.sock"));
+                    assert_eq!(args.tag, "myrepo");
+                    assert_eq!(args.r#ref.as_deref(), Some("main"));
+                    assert!(args.isolated_dotgit);
+                    assert!(args.offline);
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+
+            assert!(Cli::try_parse_from([
+                "projgit",
+                "virtiofs",
+                "/src",
+                "--socket",
+                "/tmp/projgit-vhost.sock",
+                "--isolated-dotgit",
+                "--no-dotgit",
+            ])
+            .is_err());
+        }
     }
 
     #[test]

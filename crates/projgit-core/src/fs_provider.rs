@@ -246,6 +246,32 @@ pub trait FsProvider: Send + Sync {
     }
 }
 
+impl<T: FsProvider + ?Sized> FsProvider for std::sync::Arc<T> {
+    fn lookup(&self, parent: u64, name: &[u8]) -> Result<Attr, FsError> {
+        (**self).lookup(parent, name)
+    }
+
+    fn getattr(&self, inode: u64) -> Result<Attr, FsError> {
+        (**self).getattr(inode)
+    }
+
+    fn readdir(&self, inode: u64, offset: u64) -> Result<Vec<DirEntry>, FsError> {
+        (**self).readdir(inode, offset)
+    }
+
+    fn read(&self, inode: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
+        (**self).read(inode, offset, size)
+    }
+
+    fn readlink(&self, inode: u64) -> Result<BString, FsError> {
+        (**self).readlink(inode)
+    }
+
+    fn backing_file(&self, inode: u64) -> Result<Option<std::sync::Arc<std::fs::File>>, FsError> {
+        (**self).backing_file(inode)
+    }
+}
+
 // ----------------------------------------------------------------------------
 // InodeAllocator
 // ----------------------------------------------------------------------------

@@ -38,6 +38,9 @@ projgit-fuse = { path = "../projgit-fuse" }
 projgit-daemon = { path = "../projgit-daemon" }
 nix = { version = "0.29", features = ["user"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+projgit-virtiofs = { path = "../projgit-virtiofs" }
+
 [features]
 default = []
 gvfs-fetcher = ["projgit-core/gvfs-fetcher"]

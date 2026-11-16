@@ -13,7 +13,18 @@ projgit-core = { path = "../projgit-core", default-features = false }
 parking_lot = "0.12"
 thiserror = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+vhost = { version = "0.18.1", features = ["vhost-user-backend", "vhost-user-frontend"] }
+vhost-user-backend = "0.24.1"
+virtio-bindings = "0.2.7"
+virtio-queue = "0.18.0"
+vm-memory = { version = "0.18.0", features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
+vmm-sys-util = "0.15.0"
+
 [dev-dependencies]
 bstr = { workspace = true }
 gix = { workspace = true }
 tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { version = "0.31", features = ["fs"] }

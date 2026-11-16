@@ -19,6 +19,8 @@
 
 pub mod dax;
 pub mod server;
+#[cfg(target_os = "linux")]
+pub mod vhost_user;
 pub mod wire;
 
 use std::sync::Arc;

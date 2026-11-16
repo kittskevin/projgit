@@ -398,8 +398,11 @@ What works today:
   per-request so `git`'s `safe.directory` check passes without setup.
 - `projgit-virtiofs` (`crates/projgit-virtiofs`) zero-`unsafe` FUSE 7.38 +
   `virtio-fs` `DAX` (`FUSE_SETUPMAPPING` / `FUSE_REMOVEMAPPING`) wire protocol
-  engine, `DaxMapper` (`MemoryDaxWindow`), and framed / Unix socket server.
-- `projgit mount` and `projgit mount-multi` for refs, commits, and subtrees.
+  engine, `DaxMapper` (`MemoryDaxWindow`), framed / Unix socket server, and
+  (on Linux) `rust-vmm` `vhost-user-fs` virtqueue + `SHMEM_MAP` (`SCM_RIGHTS`
+  fd-passing) DAX backend (`VhostUserFsBackend` / `VhostShmemDaxMapper`).
+- `projgit mount`, `projgit mount-multi`, and (on Linux) `projgit virtiofs`
+  for refs, commits, and subtrees.
 - A1+ / A2-flavored `.git/` synthesized at the mount root by default
   for branch projections (symbolic HEAD pointing at the branch ref,
   a clean read-only `.git/index` matching HEAD, and
@@ -430,10 +433,10 @@ that section for the per-criterion design-target-vs-shipped-scope status.
 
 ```text
 crates/projgit-core/      projection engine, object store, L1/L2 caches, fetchers
-crates/projgit-cli/       `projgit mount`, `mount-multi`, `attach`, and `bench_mount`
+crates/projgit-cli/       `projgit mount`, `mount-multi`, `virtiofs`, `attach`, and `bench_mount`
 crates/projgit-daemon/    `projgitd` shared-CAS daemon, RPC protocol, DaemonFetcher
 crates/projgit-fuse/      Linux/macOS FUSE adapter (`fuser` + external `/dev/fuse` fd)
-crates/projgit-virtiofs/  FUSE 7.38 + `virtio-fs` `DAX` (`FUSE_SETUPMAPPING`) frontend
+crates/projgit-virtiofs/  `vhost-user-fs` (`rust-vmm`) + FUSE 7.38 / `DAX` (`FUSE_SETUPMAPPING`) frontend
 crates/projgit-winfsp/    Windows backend stub; implementation deferred
 docs/                     problem statement, design docs, bench baseline, handoffs
 spikes/                   completed Phase 0 spikes (ondemand-fetch, fuse-fd-passing)

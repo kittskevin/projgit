@@ -181,6 +181,22 @@ Host (trusted):
     - Provides length-prefixed stream framing (`server::serve_stream`) and a
       Unix domain socket server (`server::serve_unix_socket` /
       `server::spawn_unix_socket_server`).
+    - On Linux (`#[cfg(target_os = "linux")]`), [`vhost_user.rs`](../../crates/projgit-virtiofs/src/vhost_user.rs)
+      wires `ProjgitVirtioFs` directly into the `rust-vmm` stack
+      (`vhost-user-backend`, `vhost`, `virtio-queue`, `vm-memory`):
+      - `VhostUserFsBackend<F, M>` implements `VhostUserBackendMut` with
+        2 queues (`queue 0` high-priority `FUSE_FORGET`/`FUSE_BATCH_FORGET`,
+        `queue 1` request queue), `VIRTIO_F_VERSION_1 | VIRTIO_RING_F_INDIRECT_DESC | VIRTIO_RING_F_EVENT_IDX`,
+        40-byte `virtio_fs_config` (`get_config`), and a single DAX window
+        (`get_shmem_config`).
+      - `VhostShmemDaxMapper` wraps `MemoryDaxWindow` and forwards
+        `FUSE_SETUPMAPPING` / `FUSE_REMOVEMAPPING` over the `vhost-user`
+        backend request channel (`VhostUserFrontendReqHandler::shmem_map`
+        passing the host `File` descriptor over `SCM_RIGHTS`, and
+        `shmem_unmap`).
+      - Exposed on the CLI as `projgit virtiofs <SOURCE> --socket <PATH> [--tag <TAG>]`
+        (defaults to the isolated `.git/` overlay so guest microVMs never see
+        host `alternates` paths).
 
 ## 4. Extending `FsProvider` for file-descriptor / `DAX` serving
 
