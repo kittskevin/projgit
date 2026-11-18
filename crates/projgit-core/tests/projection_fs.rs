@@ -672,3 +672,51 @@ fn isolated_overlay_host_files_support_positioned_reads_and_backing_file() {
     }
     assert_eq!(backing_bytes, host_pack_bytes);
 }
+
+#[test]
+fn readdirplus_returns_child_attrs_and_warms_attr_snapshots() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head) = build_fixture("pfs_readdirplus");
+    let store = Arc::new(ObjectStore::open(&repo).unwrap());
+    let overlay = projgit_core::dotgit::a1_plus_isolated_overlay(&store, head).unwrap();
+    let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
+    let p = ProjectionFsProvider::new(Projection::Commit(head), hydrating, overlay, 1).unwrap();
+
+    // Call `readdirplus` on ROOT_INODE *before* calling `lookup` on any child.
+    let entries = p.readdirplus(ROOT_INODE, 0).unwrap();
+    assert!(
+        entries.len() >= 4,
+        "expected .git, README.md, link-to-readme, run.sh, src"
+    );
+    let dotgit = entries
+        .iter()
+        .find(|e| e.name.as_slice() == b".git")
+        .expect(".git in readdirplus");
+    assert_eq!(dotgit.attr.kind, FileType::Directory);
+
+    let readme = entries
+        .iter()
+        .find(|e| e.name.as_slice() == b"README.md")
+        .expect("README.md in readdirplus");
+    assert_eq!(readme.attr.kind, FileType::RegularFile);
+    assert!(readme.attr.size > 0);
+    assert_eq!(readme.attr.inode, readme.inode);
+
+    // Because `readdirplus` published the child's AttrSnapshot in a single pass,
+    // `getattr(readme.inode)` and `read(readme.inode, ...)` succeed immediately
+    // even though `lookup(ROOT_INODE, "README.md")` was never called!
+    let direct_attr = p.getattr(readme.inode).expect("getattr after readdirplus");
+    assert_eq!(direct_attr, readme.attr);
+    let data = p
+        .read(readme.inode, 0, 1024)
+        .expect("read after readdirplus");
+    assert_eq!(data.len() as u64, readme.attr.size);
+
+    // Pagination via offset works identically to `readdir`.
+    let tail = p.readdirplus(ROOT_INODE, 2).unwrap();
+    assert_eq!(tail.len(), entries.len() - 2);
+    assert_eq!(tail[0], entries[2]);
+}

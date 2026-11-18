@@ -159,6 +159,23 @@ pub struct DirEntry {
     pub kind: FileType,
 }
 
+/// One entry in a `readdirplus` response, combining a directory entry's
+/// name and inode with its full [`Attr`] record.
+///
+/// Used by `FUSE_READDIRPLUS` (opcode 44) in `projgit-fuse` and
+/// `projgit-virtiofs` so `ls -la`, `find`, and `git status` populate
+/// the kernel `dcache` and `icache` in a single directory read without
+/// N follow-up `FUSE_LOOKUP` round trips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntryPlus {
+    /// Inode of the child entry.
+    pub inode: u64,
+    /// Single path component (no `/`, not `.` or `..`).
+    pub name: BString,
+    /// Full file attributes for the child entry.
+    pub attr: Attr,
+}
+
 /// Errors a backend may surface up to the OS.
 ///
 /// Backends translate these into their own platform errors:
@@ -215,6 +232,38 @@ pub trait FsProvider: Send + Sync {
     /// vector otherwise.
     fn readdir(&self, inode: u64, offset: u64) -> Result<Vec<DirEntry>, FsError>;
 
+    /// Read directory entries together with their full [`Attr`] records
+    /// (`FUSE_READDIRPLUS`).
+    ///
+    /// Same offset/pagination contract as [`Self::readdir`]: `offset == 0`
+    /// returns all entries, and `offset > 0` returns an empty `Vec`.
+    ///
+    /// The default implementation calls [`Self::readdir`] and resolves each
+    /// child's [`Attr`] via [`Self::getattr`] (falling back to
+    /// [`Self::lookup`] if the child inode has not been cached yet).
+    /// [`crate::ProjectionFsProvider`] overrides this to resolve and cache
+    /// all children in a single directory pass after batch-warming headers.
+    fn readdirplus(&self, inode: u64, offset: u64) -> Result<Vec<DirEntryPlus>, FsError> {
+        let entries = self.readdir(inode, 0)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start >= entries.len() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(entries.len() - start);
+        for entry in entries.into_iter().skip(start) {
+            let attr = match self.getattr(entry.inode) {
+                Ok(a) => a,
+                Err(_) => self.lookup(inode, entry.name.as_slice())?,
+            };
+            out.push(DirEntryPlus {
+                inode: attr.inode,
+                name: entry.name,
+                attr,
+            });
+        }
+        Ok(out)
+    }
+
     /// Read up to `size` bytes from `inode` starting at `offset`.
     /// Returns fewer bytes than requested at end-of-file.
     fn read(&self, inode: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError>;
@@ -257,6 +306,10 @@ impl<T: FsProvider + ?Sized> FsProvider for std::sync::Arc<T> {
 
     fn readdir(&self, inode: u64, offset: u64) -> Result<Vec<DirEntry>, FsError> {
         (**self).readdir(inode, offset)
+    }
+
+    fn readdirplus(&self, inode: u64, offset: u64) -> Result<Vec<DirEntryPlus>, FsError> {
+        (**self).readdirplus(inode, offset)
     }
 
     fn read(&self, inode: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {

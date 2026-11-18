@@ -53,6 +53,11 @@ pub enum Request {
         /// can read the mount. See `projgit mount --allow-other`.
         #[serde(default)]
         allow_other: bool,
+        /// Optional writable scratch directory for stacking a Linux
+        /// `overlayfs` upper layer (`upperdir=<DIR>/upper,workdir=<DIR>/work,metacopy=on`)
+        /// over the read-only FUSE projection (`<DIR>/lower`).
+        #[serde(default)]
+        writable_scratch: Option<PathBuf>,
     },
     /// Unmount a previously-mounted projection. `mountpoint` must
     /// match what was passed to a prior [`Request::Mount`].
@@ -346,6 +351,7 @@ mod tests {
             no_dotgit: true,
             isolated_dotgit: false,
             allow_other: false,
+            writable_scratch: None,
         };
         match roundtrip::<Request>(&original) {
             Request::Mount {
@@ -355,6 +361,7 @@ mod tests {
                 no_dotgit,
                 isolated_dotgit,
                 allow_other,
+                writable_scratch,
             } => {
                 assert_eq!(source, "https://example/repo");
                 assert_eq!(ref_name, "main");
@@ -362,6 +369,7 @@ mod tests {
                 assert!(no_dotgit);
                 assert!(!isolated_dotgit);
                 assert!(!allow_other);
+                assert!(writable_scratch.is_none());
             }
             other => panic!("got {other:?}"),
         }
@@ -376,6 +384,7 @@ mod tests {
             no_dotgit: false,
             isolated_dotgit: true,
             allow_other: true,
+            writable_scratch: Some(PathBuf::from("/tmp/scratch")),
         };
         match roundtrip::<Request>(&original) {
             Request::Mount {
@@ -385,6 +394,7 @@ mod tests {
                 no_dotgit,
                 isolated_dotgit,
                 allow_other,
+                writable_scratch,
             } => {
                 assert_eq!(source, "/tmp/repo");
                 assert_eq!(ref_name, "main");
@@ -392,12 +402,13 @@ mod tests {
                 assert!(!no_dotgit);
                 assert!(isolated_dotgit);
                 assert!(allow_other);
+                assert_eq!(writable_scratch, Some(PathBuf::from("/tmp/scratch")));
             }
             other => panic!("got {other:?}"),
         }
 
-        // Backward compatibility: older clients omitting `isolated_dotgit`
-        // deserialize with `isolated_dotgit == false`.
+        // Backward compatibility: older clients omitting `isolated_dotgit` and `writable_scratch`
+        // deserialize with `isolated_dotgit == false` and `writable_scratch == None`.
         let legacy_json =
             r#"{"op":"mount","source":"/tmp/repo","ref":"main","mountpoint":"/tmp/mp"}"#;
         let parsed: Request = serde_json::from_str(legacy_json).expect("deserialize legacy mount");
@@ -406,11 +417,13 @@ mod tests {
                 no_dotgit,
                 isolated_dotgit,
                 allow_other,
+                writable_scratch,
                 ..
             } => {
                 assert!(!no_dotgit);
                 assert!(!isolated_dotgit);
                 assert!(!allow_other);
+                assert!(writable_scratch.is_none());
             }
             other => panic!("got {other:?}"),
         }

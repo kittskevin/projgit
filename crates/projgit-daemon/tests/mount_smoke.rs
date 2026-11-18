@@ -155,6 +155,7 @@ fn mount_status_umount_lifecycle_via_daemon() {
         no_dotgit: true, // skip dotgit; the test only checks file content
         isolated_dotgit: false,
         allow_other: false,
+        writable_scratch: None,
     };
     match rpc(&sock, &mount_req(&mp_a)) {
         Response::Ok => {}
@@ -300,6 +301,7 @@ fn second_mount_with_different_source_rejected_as_source_mismatch() {
         no_dotgit: true,
         isolated_dotgit: false,
         allow_other: false,
+        writable_scratch: None,
     };
     match rpc(&sock, &req_a) {
         Response::Ok => {}
@@ -317,6 +319,7 @@ fn second_mount_with_different_source_rejected_as_source_mismatch() {
         no_dotgit: true,
         isolated_dotgit: false,
         allow_other: false,
+        writable_scratch: None,
     };
     match rpc(&sock, &req_b) {
         Response::Err { code, .. } => assert_eq!(code, "source_mismatch"),
@@ -362,6 +365,7 @@ fn mount_isolated_dotgit_omits_alternates_and_supports_git_status_and_log() {
         no_dotgit: false,
         isolated_dotgit: true,
         allow_other: false,
+        writable_scratch: None,
     };
     match rpc(&sock, &req) {
         Response::Ok => {}

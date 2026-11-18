@@ -66,14 +66,29 @@ pub const FUSE_STATFS_OUT_LEN: usize = 80;
 /// `FUSE_INIT` flag: asynchronous read requests permitted.
 pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 
+/// `FUSE_INIT` flag: kernel supports `FUSE_READDIRPLUS` (`FUSE_DO_READDIRPLUS`).
+pub const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
+
+/// `FUSE_INIT` flag: adaptive `readdir` vs `readdirplus` selection (`FUSE_READDIRPLUS_AUTO`).
+pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
+
+/// `FUSE_INIT` flag: concurrent directory operations permitted (`FUSE_PARALLEL_DIROPS`).
+pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
+
 /// `FUSE_INIT` flag: kernel caches symlink targets (`FUSE_CACHE_SYMLINKS`).
 pub const FUSE_CACHE_SYMLINKS: u32 = 1 << 23;
+
+/// `FUSE_INIT` flag: only invalidate cached data on explicit request (`FUSE_EXPLICIT_INVAL_DATA`).
+pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
 
 /// `FUSE_INIT` flag: `map_alignment` field in `FuseInitOut` is valid (`FUSE_MAP_ALIGNMENT`).
 pub const FUSE_MAP_ALIGNMENT: u32 = 1 << 26;
 
 /// `FuseOpenOut` flag: keep page cache across `open(2)` calls (`FOPEN_KEEP_CACHE`).
 pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+
+/// `FuseOpenOut` flag: allow caching directory entries across `opendir(3)` calls (`FOPEN_CACHE_DIR`).
+pub const FOPEN_CACHE_DIR: u32 = 1 << 3;
 
 /// `FuseSetupMappingIn` flag: map range with write permissions.
 pub const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 1 << 0;
@@ -177,6 +192,8 @@ pub enum FuseOpcode {
     Destroy = 38,
     /// Forget multiple inodes in one batch (`FUSE_BATCH_FORGET = 42`).
     BatchForget = 42,
+    /// Read directory entries together with full entry attributes (`FUSE_READDIRPLUS = 44`).
+    Readdirplus = 44,
     /// Map a host backing file range into the `virtio-fs` DAX window (`FUSE_SETUPMAPPING = 48`).
     SetupMapping = 48,
     /// Unmap one or more ranges from the `virtio-fs` DAX window (`FUSE_REMOVEMAPPING = 49`).
@@ -211,6 +228,7 @@ impl FuseOpcode {
             35 => Some(Self::Create),
             38 => Some(Self::Destroy),
             42 => Some(Self::BatchForget),
+            44 => Some(Self::Readdirplus),
             48 => Some(Self::SetupMapping),
             49 => Some(Self::RemoveMapping),
             _ => None,
@@ -891,6 +909,69 @@ impl FuseDirent {
                 name,
             });
             bytes = &bytes[total..];
+        }
+        Some(entries)
+    }
+}
+
+/// 8-byte-aligned directory entry + attribute record (`struct fuse_direntplus`)
+/// returned by `FUSE_READDIRPLUS` (opcode 44).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuseDirentplus {
+    /// Looked-up child entry and attribute record (`128` bytes).
+    pub entry_out: FuseEntryOut,
+    /// Directory entry record (`24` bytes + name, 8-byte aligned).
+    pub dirent: FuseDirent,
+}
+
+impl FuseDirentplus {
+    /// Total 8-byte-aligned wire size of this `fuse_direntplus` record.
+    pub const fn encoded_len(name_len: usize) -> usize {
+        FUSE_ENTRY_OUT_LEN + FuseDirent::encoded_len(name_len)
+    }
+
+    /// Append this record (including 8-byte zero padding) to `out`.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.entry_out.encode());
+        self.dirent.encode_into(out);
+    }
+
+    /// Encode this `fuse_direntplus` record into a standalone byte vector.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::encoded_len(self.dirent.name.len()));
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Decode a sequence of 8-byte-aligned `fuse_direntplus` records from a `FUSE_READDIRPLUS` payload.
+    pub fn decode_all(mut bytes: &[u8]) -> Option<Vec<Self>> {
+        let mut entries = Vec::new();
+        while !bytes.is_empty() {
+            if bytes.len() < FUSE_ENTRY_OUT_LEN + FUSE_DIRENT_HEADER_LEN {
+                return None;
+            }
+            let entry_out = FuseEntryOut::decode(&bytes[..FUSE_ENTRY_OUT_LEN])?;
+            let dirent_bytes = &bytes[FUSE_ENTRY_OUT_LEN..];
+            let ino = read_u64(dirent_bytes, 0)?;
+            let off = read_u64(dirent_bytes, 8)?;
+            let namelen = read_u32(dirent_bytes, 16)? as usize;
+            let typ = read_u32(dirent_bytes, 20)?;
+            let dirent_total = FuseDirent::encoded_len(namelen);
+            if dirent_bytes.len() < dirent_total {
+                return None;
+            }
+            let name =
+                dirent_bytes[FUSE_DIRENT_HEADER_LEN..FUSE_DIRENT_HEADER_LEN + namelen].to_vec();
+            entries.push(Self {
+                entry_out,
+                dirent: FuseDirent {
+                    ino,
+                    off,
+                    typ,
+                    name,
+                },
+            });
+            bytes = &dirent_bytes[dirent_total..];
         }
         Some(entries)
     }

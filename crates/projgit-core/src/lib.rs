@@ -61,12 +61,12 @@ pub use fetcher::{GixFetcher, GixFetcherError};
 #[cfg(feature = "gvfs-fetcher")]
 pub use fetcher::{GvfsFetcher, GvfsFetcherError};
 pub use fs_provider::{
-    Attr, DirEntry, FileType, FsError, FsProvider, InMemoryFsProvider, InodeAllocator, InodeKind,
-    ROOT_INODE,
+    Attr, DirEntry, DirEntryPlus, FileType, FsError, FsProvider, InMemoryFsProvider,
+    InodeAllocator, InodeKind, ROOT_INODE,
 };
 pub use header_cache::HeaderCacheStats;
 pub use maintenance::{run_maintenance, MaintenanceError};
-pub use object_store::{DiskBlobCacheStats, ObjectKind, ObjectStore};
+pub use object_store::{DiskBlobCacheStats, DiskHeaderCacheStats, ObjectKind, ObjectStore};
 pub use overlay::{RootOverlay, SyntheticEntry};
 pub use prefetch::PrefetchStats;
 pub use projection::{Projection, ResolvedEntry};

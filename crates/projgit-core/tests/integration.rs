@@ -869,3 +869,59 @@ fn dotgit_isolated_overlay_omits_host_alternates() {
     assert!(found_pack, "expected at least one .pack file after repack");
     assert!(found_idx, "expected at least one .idx file after repack");
 }
+
+#[test]
+fn persistent_header_memo_survives_across_object_store_instances() {
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, head_hex) = build_fixture("os_header_memo");
+    let head = parse_oid(&head_hex);
+
+    let store_a = ObjectStore::open(&repo).unwrap();
+    let memo_path = store_a.header_memo_path();
+
+    let tree_oid = store_a.commit_tree(head).unwrap();
+    let entries = store_a.read_tree(tree_oid).unwrap();
+    let readme_entry = entries
+        .iter()
+        .find(|e| e.name == b"README.md".as_bstr())
+        .expect("README.md entry");
+
+    // First header lookup on store_a misses L1 and L2 disk memo, resolves via gix,
+    // and appends a 29-byte record into `<git-dir>/blobs/headers.bin`.
+    let (kind_a, size_a) = store_a.header(readme_entry.oid).unwrap();
+    assert_eq!(kind_a, ObjectKind::Blob);
+    assert!(size_a > 0);
+    assert!(
+        memo_path.is_file(),
+        "headers.bin should be created at {}",
+        memo_path.display()
+    );
+    let dh_a = store_a.disk_header_cache_stats();
+    assert!(
+        dh_a.inserts >= 1,
+        "expected at least 1 insert into headers.bin, got {dh_a:?}"
+    );
+    assert_eq!(dh_a.write_errors, 0);
+
+    // Open a brand-new ObjectStore on the same repo (simulating a second process or
+    // sidecar restart where L1 RAM cache is cold, and the uncompressed blob has NOT
+    // been materialized on disk).
+    assert!(!store_a.uncompressed_blob_path(readme_entry.oid).exists());
+    let store_b = ObjectStore::open(&repo).unwrap();
+    let dh_b_initial = store_b.disk_header_cache_stats();
+    assert!(
+        dh_b_initial.entries >= 1,
+        "store_b should load persisted records from headers.bin on open: {dh_b_initial:?}"
+    );
+
+    // `store_b.header(readme_entry.oid)` is an L1 miss, but hits the persistent L2
+    // `headers.bin` memo without touching gix or packfiles!
+    let (kind_b, size_b) = store_b.header(readme_entry.oid).unwrap();
+    assert_eq!((kind_b, size_b), (kind_a, size_a));
+    let dh_b_after = store_b.disk_header_cache_stats();
+    assert_eq!(dh_b_after.hits, dh_b_initial.hits + 1);
+    assert_eq!(dh_b_after.misses, 0);
+}

@@ -238,6 +238,12 @@ paths leak into the guest; instead, the host CAS's `objects/pack/*` and
   and `<objects_dir>/info/{commit-graph,packs,commit-graphs/*}` directly into
   `.git/objects/` as `SyntheticEntry::HostFile` entries. Ideal for microVMs
   and containers that cannot resolve host filesystem paths.
+- `projgit mount … --writable-scratch <DIR>` (also supported on
+  `projgit mount-multi` and `projgit attach mount`) — mounts the read-only
+  FUSE projection at `<DIR>/lower` and stacks a Linux kernel `overlayfs`
+  (`upperdir=<DIR>/upper`, `workdir=<DIR>/work`) at the target mountpoint so
+  sandboxes get native copy-on-write mutations (`open(O_WRONLY)`, `unlink`,
+  `rename`, `mkdir`) while sharing the read-only lazy CAS underneath.
 - `--subtree <path>` mounts skip `.git/` synthesis automatically; a `HEAD`
   describing the full commit while the user browses only a subtree would
   create surprising `git log <path>` semantics.
@@ -261,21 +267,32 @@ Pieces worth pointing at if you're skimming the code:
   is `Send + Sync` (via `gix::ThreadSafeRepository` + per-call thread-local
   handles) so a single in-process store can back arbitrarily many concurrent
   mounts without copying blobs.
-- **Layered caches with explicit budgets + uncompressed L2 blob store.**
+- **Layered caches with explicit budgets + uncompressed L2 blob & header stores.**
   Hand-rolled bounded in-memory LRUs for parsed trees
   ([`tree_cache.rs`](crates/projgit-core/src/tree_cache.rs)), object headers
   ([`header_cache.rs`](crates/projgit-core/src/header_cache.rs)), and small
   blobs ([`blob_cache.rs`](crates/projgit-core/src/blob_cache.rs),
   byte-bounded with a 64 KiB per-entry cap so one big file can't evict the
-  working set), backed by an **L2 uncompressed on-disk blob cache**
+  working set), backed by an **L2 persistent header memo**
+  (`<git-dir>/blobs/headers.bin`) and an **L2 uncompressed on-disk blob cache**
   (`<git-dir>/blobs/<xx>/<oid>`, atomically written + renamed in
   [`object_store.rs`](crates/projgit-core/src/object_store.rs)). Range reads
   (`read_blob_range`) use `pread` (`FileExt::read_at` / `seek_read`) for true
   `O(range)` slices without re-inflating pack entries, and
   [`FsProvider::backing_file`](crates/projgit-core/src/fs_provider.rs) hands
-  open host file descriptors to `virtio-fs` `DAX` (`FUSE_SETUPMAPPING`) so
-  multiple microVMs map the same host Page Cache pages directly into guest RAM
-  ([docs/design/virtio-fs.md](docs/design/virtio-fs.md)).
+  open host file descriptors to both **Linux 6.9+ `FOPEN_PASSTHROUGH`** in
+  [`projgit-fuse`](crates/projgit-fuse/src/adapter.rs) and **`virtio-fs` `DAX`
+  (`FUSE_SETUPMAPPING` / `SHMEM_MAP`)** in
+  [`projgit-virtiofs`](crates/projgit-virtiofs) so containers and microVMs map
+  the same host Page Cache pages directly into their address spaces with zero
+  ongoing FUSE upcalls ([docs/design/virtio-fs.md](docs/design/virtio-fs.md)).
+- **`composefs`-style kernel caching & `FUSE_READDIRPLUS`.**
+  Both `projgit-fuse` and `projgit-virtiofs` enable `FOPEN_KEEP_CACHE` +
+  `FOPEN_CACHE_DIR` and implement `FUSE_READDIRPLUS`
+  ([`FsProvider::readdirplus`](crates/projgit-core/src/fs_provider.rs)),
+  returning directory entries and child `FileAttr`s in a single batched pass
+  while keeping directory listings and metadata cached in the kernel `dcache`
+  and Page Cache.
 - **`projgitd` multi-mount daemon & cross-namespace `/dev/fuse` fd passing.**
   [`projgit-daemon`](crates/projgit-daemon) owns the shared CAS, per-OID
   `Coalescer`, `k`-slot `git cat-file --batch-check` worker pool, and

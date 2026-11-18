@@ -28,15 +28,20 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod overlay_scratch;
+pub use overlay_scratch::{OverlayScratchConfig, OverlayScratchDirs};
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod adapter;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod mount;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use adapter::ProjgitFuse;
+pub use adapter::{PassthroughStats, ProjgitFuse};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use mount::{mount, mount_background, MountConfig};
+pub use mount::{
+    mount, mount_background, mount_managed_background, ManagedMountSession, MountConfig,
+};
 
 /// Re-export of [`fuser::BackgroundSession`] so callers don't need
 /// a direct dependency on `fuser` to keep a [`mount_background`]

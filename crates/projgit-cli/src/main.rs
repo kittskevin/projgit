@@ -180,6 +180,17 @@ struct MountArgs {
     #[arg(long)]
     allow_other: bool,
 
+    /// Stack a writable Linux `overlayfs` scratch layer on top of the
+    /// read-only projection (`upperdir=<DIR>/upper,workdir=<DIR>/work,metacopy=on`).
+    ///
+    /// When set, `projgit` mounts the read-only FUSE projection at
+    /// `<DIR>/lower` and stacks kernel `overlayfs` onto `mountpoint`.
+    /// Metadata mutations (`chmod`, `rename`) use `metacopy=on` and
+    /// data mutations copy-up into `<DIR>/upper` without touching the
+    /// shared CAS.
+    #[arg(long, value_name = "DIR")]
+    writable_scratch: Option<PathBuf>,
+
     /// Fetch backend for URL-backed mounts.
     #[arg(long, value_enum, default_value = "git")]
     fetcher: FetcherChoice,
@@ -355,6 +366,9 @@ enum AttachOp {
         /// Set `allow_other` on the FUSE mount.
         #[arg(long)]
         allow_other: bool,
+        /// Stack a writable Linux `overlayfs` scratch layer (`<DIR>/{lower,upper,work}`).
+        #[arg(long, value_name = "DIR")]
+        writable_scratch: Option<PathBuf>,
     },
     /// Ask the daemon to unmount a previously-mounted projection.
     Umount {
@@ -582,6 +596,7 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     if args.allow_other {
         cfg.acl = projgit_fuse::SessionACL::All;
     }
+    cfg.writable_scratch = args.writable_scratch.clone();
     let mp = args.mountpoint.clone();
     let print_stats = args.stats;
 
@@ -719,6 +734,7 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
     if args.allow_other {
         cfg.acl = projgit_fuse::SessionACL::All;
     }
+    cfg.writable_scratch = args.writable_scratch.clone();
     let mp = args.mountpoint.clone();
     let print_stats = args.stats;
 
@@ -953,6 +969,7 @@ where
         let s = store.as_ref();
         let t = s.tree_cache_stats();
         let h = s.header_cache_stats();
+        let dh = s.disk_header_cache_stats();
         let b = s.blob_cache_stats();
         let d = s.disk_blob_cache_stats();
         eprintln!(
@@ -962,6 +979,10 @@ where
         eprintln!(
             "projgit: header cache  hits={} misses={} inserts={} evictions={} len={}/{}",
             h.hits, h.misses, h.inserts, h.evictions, h.len, h.capacity,
+        );
+        eprintln!(
+            "projgit: disk headers  hits={} misses={} inserts={} entries={} write_errors={}",
+            dh.hits, dh.misses, dh.inserts, dh.entries, dh.write_errors,
         );
         eprintln!(
             "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
@@ -1039,11 +1060,11 @@ where
         "projgit: mounting at {} (Ctrl-C to unmount)",
         mountpoint.display()
     );
-    let session = projgit_fuse::mount_background(provider.clone(), mountpoint, config)
+    let session = projgit_fuse::mount_managed_background(provider.clone(), mountpoint, config)
         .with_context(|| format!("mounting at {}", mountpoint.display()))?;
 
     // Park the main thread on a Ctrl-C / SIGTERM. Dropping `session`
-    // synchronously unmounts via fuser's drop impl.
+    // synchronously unmounts any stacked overlayfs and the underlying FUSE session.
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     ctrlc::set_handler(move || {
         let _ = tx.send(());
@@ -1058,6 +1079,7 @@ where
         let store = provider.store().store();
         let t = store.tree_cache_stats();
         let h = store.header_cache_stats();
+        let dh = store.disk_header_cache_stats();
         let b = store.blob_cache_stats();
         let d = store.disk_blob_cache_stats();
         let p = provider.prefetch_stats();
@@ -1068,6 +1090,10 @@ where
         eprintln!(
             "projgit: header cache  hits={} misses={} inserts={} evictions={} len={}/{}",
             h.hits, h.misses, h.inserts, h.evictions, h.len, h.capacity,
+        );
+        eprintln!(
+            "projgit: disk headers  hits={} misses={} inserts={} entries={} write_errors={}",
+            dh.hits, dh.misses, dh.inserts, dh.entries, dh.write_errors,
         );
         eprintln!(
             "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
@@ -1261,6 +1287,7 @@ where
         let store = provider.store().store();
         let t = store.tree_cache_stats();
         let h = store.header_cache_stats();
+        let dh = store.disk_header_cache_stats();
         let b = store.blob_cache_stats();
         let d = store.disk_blob_cache_stats();
         let p = provider.prefetch_stats();
@@ -1271,6 +1298,10 @@ where
         eprintln!(
             "projgit: header cache  hits={} misses={} inserts={} evictions={} len={}/{}",
             h.hits, h.misses, h.inserts, h.evictions, h.len, h.capacity,
+        );
+        eprintln!(
+            "projgit: disk headers  hits={} misses={} inserts={} entries={} write_errors={}",
+            dh.hits, dh.misses, dh.inserts, dh.entries, dh.write_errors,
         );
         eprintln!(
             "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
@@ -1699,6 +1730,49 @@ mod tests {
         ])
         .is_err());
 
+        // `mount --writable-scratch`
+        let cli = Cli::try_parse_from([
+            "projgit",
+            "mount",
+            "/src",
+            "/mnt",
+            "--writable-scratch",
+            "/tmp/scratch",
+        ])
+        .expect("mount --writable-scratch should parse");
+        match cli.command {
+            Command::Mount(args) => {
+                assert_eq!(args.writable_scratch, Some(PathBuf::from("/tmp/scratch")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // `attach mount --writable-scratch`
+        let cli = Cli::try_parse_from([
+            "projgit",
+            "attach",
+            "mount",
+            "/src",
+            "--ref",
+            "main",
+            "--mountpoint",
+            "/mnt",
+            "--writable-scratch",
+            "/tmp/scratch-daemon",
+        ])
+        .expect("attach mount --writable-scratch should parse");
+        match cli.command {
+            Command::Attach(AttachArgs {
+                op: AttachOp::Mount {
+                    writable_scratch, ..
+                },
+                ..
+            }) => {
+                assert_eq!(writable_scratch, Some(PathBuf::from("/tmp/scratch-daemon")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
         #[cfg(target_os = "linux")]
         {
             let cli = Cli::try_parse_from([
@@ -1836,6 +1910,7 @@ fn cmd_attach(args: AttachArgs) -> Result<()> {
             no_dotgit,
             isolated_dotgit,
             allow_other,
+            writable_scratch,
         } => Request::Mount {
             source,
             ref_name,
@@ -1843,6 +1918,7 @@ fn cmd_attach(args: AttachArgs) -> Result<()> {
             no_dotgit,
             isolated_dotgit,
             allow_other,
+            writable_scratch,
         },
         AttachOp::Umount { mountpoint } => Request::Umount { mountpoint },
     };

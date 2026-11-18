@@ -263,7 +263,22 @@ containing the **host filesystem path** to `<cache-dir>/<repo>/.git/objects`.
      (combined with A2 branch ref visibility when the projection is a local
      branch) instead of `a1_plus_overlay`.
 
-## 6. Trade-offs & disk management
+## 6. `composefs`-Inspired Kernel Acceleration (Zero Warm Upcalls)
+
+Because every `projgit` projection is an **immutable snapshot of a single Git commit**, we combine the best properties of Linux `composefs` (EROFS + `overlayfs` + shared CAS) with `projgit`'s lazy on-demand partial-clone hydration:
+
+1. **Infinite Kernel `dcache` / `icache` / Page Cache Retention (`FOPEN_KEEP_CACHE` + `FOPEN_CACHE_DIR`):**
+   Both `projgit-fuse` and `projgit-virtiofs` return `entry_valid = 86_400s`, `attr_valid = 86_400s`, `FOPEN_KEEP_CACHE` on `FUSE_OPEN`, and `FOPEN_KEEP_CACHE | FOPEN_CACHE_DIR` on `FUSE_OPENDIR` (alongside `FUSE_CACHE_SYMLINKS` and `FUSE_EXPLICIT_INVAL_DATA`). Once a directory or file attribute is read once, subsequent `stat()`, `readdir()`, and path walks inside the sandbox are served 100% from kernel `dcache`/`icache`/Page Cache with **zero userspace FUSE upcalls**.
+2. **`FUSE_READDIRPLUS` (Single-Upcall Directory + Attribute Batching):**
+   `FsProvider::readdirplus` and `ProjectionFsProvider::readdirplus` batch-warm child blob headers in a single pass (`prefetch_headers`) and return `DirEntryPlus` (`inode + name + FileAttr`) for all children at once. Both `projgit-fuse` (`Filesystem::readdirplus`) and `projgit-virtiofs` (`FuseOpcode::Readdirplus = 44`, `FuseDirentplus`) negotiate `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS`, eliminating $N$ per-file `FUSE_LOOKUP` round-trips during `ls -l`, `find`, or `rg`.
+3. **Linux 6.9+ `FOPEN_PASSTHROUGH` (`projgit-fuse`):**
+   When the host kernel advertises `FUSE_PASSTHROUGH`, `projgit-fuse` negotiates `InitFlags::FUSE_PASSTHROUGH` (`max_stack_depth = 1`) and wires `FsProvider::backing_file(ino)` directly to `ReplyOpen::open_backing` + `ReplyOpen::opened_passthrough` (caching one `Arc<BackingId>` per inode). After `open()` hydrates `<git-dir>/blobs/<xx>/<oid>` (or opens a projected `.git/objects/pack/*.pack` `HostFile`), all subsequent `read()` and `mmap()` syscalls go straight to the host ext4/xfs backing file in the kernel with **zero FUSE daemon round-trips** and **cross-sandbox host Page Cache `folio` deduplication** — identical to `composefs` on the host, while `projgit-virtiofs` `DAX` (`FUSE_SETUPMAPPING` / `SHMEM_MAP`) provides the same page-cache sharing across a microVM boundary.
+4. **Writable `overlayfs` Scratch Layer (`--writable-scratch <DIR>`):**
+   `projgit mount --writable-scratch <DIR>`, `projgit mount-multi --writable-scratch <DIR>`, and `projgit attach mount --writable-scratch <DIR>` (via `OverlayScratchConfig` and `ManagedMountSession`) mount the read-only FUSE projection on `<scratch>/lower` and stack a kernel `mount -t overlay` (`lowerdir=<scratch>/lower,upperdir=<scratch>/upper,workdir=<scratch>/work`) at the target mountpoint. Sandboxes get full POSIX copy-on-write (`open(O_WRONLY)`, `unlink`, `rename`, `mkdir`, `cargo build`, `git commit`) in `upperdir` while unmodified files remain lazily hydrated and shared from the read-only CAS.
+5. **Persistent On-Disk Header Memo (`<git-dir>/blobs/headers.bin`):**
+   `ObjectStore` persists resolved `(ObjectId -> ObjectKind, u64 size)` records in an append-only binary memo (`<git-dir>/blobs/headers.bin`, magic `PGHD\x00\x00\x00\x01`, 29 bytes per record) behind the in-memory `HeaderCache`. Across daemon restarts or subsequent mounts of the same partial clone, `stat()` and `readdirplus()` resolve blob sizes in $O(1)$ from memory without touching packfiles or spawning `git cat-file --batch-check`.
+
+## 7. Trade-offs & disk management
 
 - **Disk amplification vs. packfiles:** Uncompressed blobs take ~2–4×
   more disk space than delta-compressed packfiles, *for the subset of

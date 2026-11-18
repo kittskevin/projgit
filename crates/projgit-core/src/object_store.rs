@@ -46,11 +46,124 @@ use crate::header_cache::{
 use crate::tree_cache::{TreeCache, TreeCacheStats, DEFAULT_CAPACITY};
 use bstr::BString;
 use gix::ObjectId;
-use std::fs::File;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+/// 8-byte magic + version header for `<git-dir>/blobs/headers.bin`.
+const HEADER_MEMO_MAGIC: &[u8; 8] = b"PGHD\x00\x00\x00\x01";
+/// Fixed 29-byte record length in `<git-dir>/blobs/headers.bin`:
+/// `[oid: 20 bytes][kind_tag: 1 byte][size_le: 8 bytes]`.
+const HEADER_MEMO_RECORD_LEN: usize = 29;
+
+/// Snapshot of on-disk persistent header memo ("Organ 1") counters.
+///
+/// Tracks the append-only `<git-dir>/blobs/headers.bin` table that maps
+/// `OID -> (ObjectKind, size)` across restarts and across mounts sharing
+/// the same `<git-dir>`. See `docs/design/cache-transform-tier.md` §9.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskHeaderCacheStats {
+    /// Number of cold L1 header lookups satisfied from `<git-dir>/blobs/headers.bin`
+    /// without touching `gix` pack indices or `stat()`ing blob files.
+    pub hits: u64,
+    /// Number of lookups that missed both L1 `HeaderCache` and the
+    /// persistent `headers.bin` memo.
+    pub misses: u64,
+    /// Number of newly discovered `(oid, kind, size)` records appended
+    /// to `<git-dir>/blobs/headers.bin`.
+    pub inserts: u64,
+    /// Number of best-effort `headers.bin` writes that failed (e.g. on a
+    /// read-only mount).
+    pub write_errors: u64,
+    /// Total number of unique OIDs currently loaded in the persistent
+    /// header memo for this store.
+    pub entries: usize,
+}
+
+#[derive(Debug, Default)]
+struct DiskHeaderCounters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    write_errors: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct DiskHeaderMemoState {
+    entries: HashMap<ObjectId, (ObjectKind, u64)>,
+    read_offset: u64,
+}
+
+impl DiskHeaderMemoState {
+    /// Read any newly appended 29-byte records from `path` starting at
+    /// `self.read_offset`. Best-effort: ignores missing or truncated
+    /// files so a read-only or concurrently-written `<git-dir>` never
+    /// causes an error.
+    fn sync_from_disk(&mut self, path: &Path) {
+        let Ok(mut file) = File::open(path) else {
+            return;
+        };
+        let Ok(meta) = file.metadata() else {
+            return;
+        };
+        let file_len = meta.len();
+        if file_len < HEADER_MEMO_MAGIC.len() as u64 {
+            return;
+        }
+        if self.read_offset == 0 {
+            let mut magic = [0u8; 8];
+            if file.read_exact(&mut magic).is_err() || &magic != HEADER_MEMO_MAGIC {
+                return;
+            }
+            self.read_offset = HEADER_MEMO_MAGIC.len() as u64;
+        }
+        if file_len < self.read_offset {
+            // File was truncated/replaced; re-read from start.
+            self.entries.clear();
+            self.read_offset = 0;
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                return;
+            }
+            let mut magic = [0u8; 8];
+            if file.read_exact(&mut magic).is_err() || &magic != HEADER_MEMO_MAGIC {
+                return;
+            }
+            self.read_offset = HEADER_MEMO_MAGIC.len() as u64;
+        }
+        let unread = file_len.saturating_sub(self.read_offset);
+        let full_records = (unread as usize) / HEADER_MEMO_RECORD_LEN;
+        if full_records == 0 {
+            return;
+        }
+        if file.seek(SeekFrom::Start(self.read_offset)).is_err() {
+            return;
+        }
+        let bytes_to_read = full_records * HEADER_MEMO_RECORD_LEN;
+        let mut buf = vec![0u8; bytes_to_read];
+        if file.read_exact(&mut buf).is_err() {
+            return;
+        }
+        for rec in buf.chunks_exact(HEADER_MEMO_RECORD_LEN) {
+            let Ok(oid_bytes): Result<[u8; 20], _> = rec[0..20].try_into() else {
+                continue;
+            };
+            let Some(kind) = ObjectKind::from_tag(rec[20]) else {
+                continue;
+            };
+            let Ok(size_bytes): Result<[u8; 8], _> = rec[21..29].try_into() else {
+                continue;
+            };
+            let oid = ObjectId::from_bytes_or_panic(&oid_bytes);
+            let size = u64::from_le_bytes(size_bytes);
+            self.entries.insert(oid, (kind, size));
+        }
+        self.read_offset += bytes_to_read as u64;
+    }
+}
 
 /// Snapshot of on-disk uncompressed blob cache ("Organ 2") counters.
 ///
@@ -113,6 +226,25 @@ impl ObjectKind {
             gix::object::Kind::Tag => Self::Tag,
         }
     }
+
+    const fn to_tag(self) -> u8 {
+        match self {
+            Self::Blob => 1,
+            Self::Tree => 2,
+            Self::Commit => 3,
+            Self::Tag => 4,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Blob),
+            2 => Some(Self::Tree),
+            3 => Some(Self::Commit),
+            4 => Some(Self::Tag),
+            _ => None,
+        }
+    }
 }
 
 /// Read-only handle to an on-disk git object store.
@@ -131,6 +263,8 @@ pub struct ObjectStore {
     blob_cache: BlobCache,
     header_cache: HeaderCache,
     disk_blob_stats: DiskBlobCounters,
+    disk_header_memo: Mutex<DiskHeaderMemoState>,
+    disk_header_stats: DiskHeaderCounters,
 }
 
 impl ObjectStore {
@@ -146,6 +280,8 @@ impl ObjectStore {
         })?;
         let git_dir = repo.git_dir().to_path_buf();
         let blobs_dir = git_dir.join("blobs");
+        let mut memo_state = DiskHeaderMemoState::default();
+        memo_state.sync_from_disk(&blobs_dir.join("headers.bin"));
         Ok(Self {
             repo: repo.into_sync(),
             git_dir,
@@ -154,6 +290,8 @@ impl ObjectStore {
             blob_cache: BlobCache::new(DEFAULT_CAPACITY_BYTES, DEFAULT_PER_ENTRY_MAX_BYTES),
             header_cache: HeaderCache::with_capacity(DEFAULT_HEADER_CAPACITY),
             disk_blob_stats: DiskBlobCounters::default(),
+            disk_header_memo: Mutex::new(memo_state),
+            disk_header_stats: DiskHeaderCounters::default(),
         })
     }
 
@@ -198,6 +336,81 @@ impl ObjectStore {
         &self.blobs_dir
     }
 
+    /// Path of the persistent on-disk `OID -> (ObjectKind, size)` header
+    /// memo file (`<git-dir>/blobs/headers.bin`, "Organ 1").
+    pub fn header_memo_path(&self) -> PathBuf {
+        self.blobs_dir.join("headers.bin")
+    }
+
+    /// Look up `oid` in the persistent on-disk header memo (`headers.bin`),
+    /// tail-syncing any newly appended records from disk on a miss.
+    fn lookup_disk_header_memo(&self, oid: ObjectId) -> Option<(ObjectKind, u64)> {
+        let mut state = self.disk_header_memo.lock().unwrap();
+        if let Some(&entry) = state.entries.get(&oid) {
+            return Some(entry);
+        }
+        state.sync_from_disk(&self.header_memo_path());
+        state.entries.get(&oid).copied()
+    }
+
+    /// Best-effort append of `(oid, kind, size)` to `<git-dir>/blobs/headers.bin`
+    /// if `oid` is not already present in the persistent memo.
+    fn persist_header_memo(&self, oid: ObjectId, kind: ObjectKind, size: u64) {
+        let oid_slice = oid.as_bytes();
+        if oid_slice.len() != 20 {
+            return;
+        }
+        let mut state = self.disk_header_memo.lock().unwrap();
+        if state.entries.contains_key(&oid) {
+            return;
+        }
+        let memo_path = self.header_memo_path();
+        state.sync_from_disk(&memo_path);
+        if state.entries.contains_key(&oid) {
+            return;
+        }
+        state.entries.insert(oid, (kind, size));
+
+        if let Err(_e) = std::fs::create_dir_all(&self.blobs_dir) {
+            self.disk_header_stats
+                .write_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut file = match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&memo_path)
+        {
+            Ok(f) => f,
+            Err(_e) => {
+                self.disk_header_stats
+                    .write_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut record = Vec::with_capacity(HEADER_MEMO_MAGIC.len() + HEADER_MEMO_RECORD_LEN);
+        if len == 0 {
+            record.extend_from_slice(HEADER_MEMO_MAGIC);
+        }
+        record.extend_from_slice(oid_slice);
+        record.push(kind.to_tag());
+        record.extend_from_slice(&size.to_le_bytes());
+        if file.write_all(&record).is_err() {
+            self.disk_header_stats
+                .write_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        state.read_offset = len + record.len() as u64;
+        self.disk_header_stats
+            .inserts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Path of the uncompressed on-disk blob file for `oid`
     /// (`<git-dir>/blobs/<oid[0..2]>/<oid>`).
     ///
@@ -228,22 +441,31 @@ impl ObjectStore {
     /// Return the object's kind and uncompressed size, or
     /// `MissingObject` if absent.
     ///
-    /// Backed by an internal LRU ([`crate::header_cache`]). Cold
-    /// reads consult the on-disk uncompressed blob cache first (a
-    /// single `stat` if the blob is already materialized) before
-    /// decoding the header via gix, and publish to the cache; warm
-    /// reads return the cached `(kind, size)` tuple without touching
-    /// disk or gix.
+    /// Backed by an internal LRU ([`crate::header_cache`]) and the
+    /// persistent on-disk header memo (`<git-dir>/blobs/headers.bin`).
+    /// Cold L1 reads consult `headers.bin` first, then the on-disk
+    /// uncompressed blob cache (`stat`), before decoding the header
+    /// via gix, and publish to both L1 and `headers.bin`.
     pub fn header(&self, oid: ObjectId) -> Result<(ObjectKind, u64), ObjectStoreError> {
         if let Some((kind, size)) = self.header_cache.get(&oid) {
             return Ok((kind, size));
         }
         self.header_cache.record_miss();
 
+        if let Some((kind, size)) = self.lookup_disk_header_memo(oid) {
+            self.disk_header_stats.hits.fetch_add(1, Ordering::Relaxed);
+            self.header_cache.put(oid, kind, size);
+            return Ok((kind, size));
+        }
+        self.disk_header_stats
+            .misses
+            .fetch_add(1, Ordering::Relaxed);
+
         if let Ok(meta) = std::fs::metadata(self.uncompressed_blob_path(oid)) {
             if meta.is_file() {
                 let size = meta.len();
                 self.header_cache.put(oid, ObjectKind::Blob, size);
+                self.persist_header_memo(oid, ObjectKind::Blob, size);
                 return Ok((ObjectKind::Blob, size));
             }
         }
@@ -256,6 +478,7 @@ impl ObjectStore {
         let kind = ObjectKind::from_gix(header.kind());
         let size = header.size();
         self.header_cache.put(oid, kind, size);
+        self.persist_header_memo(oid, kind, size);
         Ok((kind, size))
     }
 
@@ -264,11 +487,12 @@ impl ObjectStore {
     /// `git cat-file --batch-check` query returns the header for
     /// an OID in one round trip.
     ///
-    /// No-op effects on the underlying gix store; this only
-    /// touches the in-process cache. Safe to call concurrently
-    /// with reads.
+    /// Also persists the `(oid, kind, size)` tuple to
+    /// `<git-dir>/blobs/headers.bin` so subsequent mounts and sidecars
+    /// reuse the resolved header without re-querying.
     pub fn put_header_cache(&self, oid: ObjectId, kind: ObjectKind, size: u64) {
         self.header_cache.put(oid, kind, size);
+        self.persist_header_memo(oid, kind, size);
     }
 
     /// Ensure the blob `oid` is materialized as a flat, uncompressed
@@ -292,14 +516,16 @@ impl ObjectStore {
             self.disk_blob_stats.hits.fetch_add(1, Ordering::Relaxed);
             if let Ok(meta) = file.metadata() {
                 self.header_cache.put(oid, ObjectKind::Blob, meta.len());
+                self.persist_header_memo(oid, ObjectKind::Blob, meta.len());
             }
             return Ok(Arc::new(file));
         }
 
         self.disk_blob_stats.misses.fetch_add(1, Ordering::Relaxed);
         let bytes = self.decode_blob_from_odb(oid)?;
-        self.header_cache
-            .put(oid, ObjectKind::Blob, bytes.len() as u64);
+        let blob_len = bytes.len() as u64;
+        self.header_cache.put(oid, ObjectKind::Blob, blob_len);
+        self.persist_header_memo(oid, ObjectKind::Blob, blob_len);
         let path = self
             .materialize_uncompressed_blob(oid, &bytes)
             .map_err(|e| ObjectStoreError::Backend(format!("materializing blob {oid}: {e}")))?;
@@ -346,6 +572,7 @@ impl ObjectStore {
             if let Ok(meta) = file.metadata() {
                 let blob_len = meta.len();
                 self.header_cache.put(oid, ObjectKind::Blob, blob_len);
+                self.persist_header_memo(oid, ObjectKind::Blob, blob_len);
                 if offset >= blob_len || size == 0 {
                     return Ok(Vec::new());
                 }
@@ -362,8 +589,9 @@ impl ObjectStore {
 
         self.disk_blob_stats.misses.fetch_add(1, Ordering::Relaxed);
         let bytes = self.decode_blob_from_odb(oid)?;
-        self.header_cache
-            .put(oid, ObjectKind::Blob, bytes.len() as u64);
+        let blob_len = bytes.len() as u64;
+        self.header_cache.put(oid, ObjectKind::Blob, blob_len);
+        self.persist_header_memo(oid, ObjectKind::Blob, blob_len);
         let _ = self.materialize_uncompressed_blob(oid, &bytes);
         let slice = slice_range(&bytes, offset, size);
         self.blob_cache.put(oid, Arc::new(bytes));
@@ -386,16 +614,18 @@ impl ObjectStore {
         let blob_path = self.uncompressed_blob_path(oid);
         if let Ok(bytes) = std::fs::read(&blob_path) {
             self.disk_blob_stats.hits.fetch_add(1, Ordering::Relaxed);
-            self.header_cache
-                .put(oid, ObjectKind::Blob, bytes.len() as u64);
+            let blob_len = bytes.len() as u64;
+            self.header_cache.put(oid, ObjectKind::Blob, blob_len);
+            self.persist_header_memo(oid, ObjectKind::Blob, blob_len);
             self.blob_cache.put(oid, Arc::new(bytes.clone()));
             return Ok(bytes);
         }
 
         self.disk_blob_stats.misses.fetch_add(1, Ordering::Relaxed);
         let bytes = self.decode_blob_from_odb(oid)?;
-        self.header_cache
-            .put(oid, ObjectKind::Blob, bytes.len() as u64);
+        let blob_len = bytes.len() as u64;
+        self.header_cache.put(oid, ObjectKind::Blob, blob_len);
+        self.persist_header_memo(oid, ObjectKind::Blob, blob_len);
         let _ = self.materialize_uncompressed_blob(oid, &bytes);
         // Publish to the cache after a successful read. The cache
         // skips entries above its per-entry cap internally, so we
@@ -581,6 +811,19 @@ impl ObjectStore {
     /// counters. See [`Self::tree_cache_stats`] for caveats.
     pub fn disk_blob_cache_stats(&self) -> DiskBlobCacheStats {
         self.disk_blob_stats.snapshot()
+    }
+
+    /// Snapshot of the persistent on-disk header memo ("Organ 1",
+    /// `<git-dir>/blobs/headers.bin`) counters.
+    pub fn disk_header_cache_stats(&self) -> DiskHeaderCacheStats {
+        let entries = self.disk_header_memo.lock().unwrap().entries.len();
+        DiskHeaderCacheStats {
+            hits: self.disk_header_stats.hits.load(Ordering::Relaxed),
+            misses: self.disk_header_stats.misses.load(Ordering::Relaxed),
+            inserts: self.disk_header_stats.inserts.load(Ordering::Relaxed),
+            write_errors: self.disk_header_stats.write_errors.load(Ordering::Relaxed),
+            entries,
+        }
     }
 
     /// Return the committer timestamp of a commit as a [`SystemTime`].

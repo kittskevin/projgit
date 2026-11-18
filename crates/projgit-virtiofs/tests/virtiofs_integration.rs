@@ -562,3 +562,78 @@ fn unix_socket_server_client_roundtrip() {
     drop(client);
     server.shutdown().expect("graceful server shutdown");
 }
+
+#[test]
+fn fuse_readdirplus_and_opendir_cache_flags() {
+    use projgit_virtiofs::wire::{
+        FuseDirentplus, FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_DO_READDIRPLUS,
+        FUSE_EXPLICIT_INVAL_DATA, FUSE_PARALLEL_DIROPS, FUSE_READDIRPLUS_AUTO,
+    };
+
+    let repo = TestRepo::create();
+    let (fs, _) = repo.build_virtiofs();
+
+    // 1. Negotiate READDIRPLUS + parallel dirops + explicit inval data in FUSE_INIT.
+    let want_flags = FUSE_DO_READDIRPLUS
+        | FUSE_READDIRPLUS_AUTO
+        | FUSE_PARALLEL_DIROPS
+        | FUSE_EXPLICIT_INVAL_DATA;
+    let init_resp = fs.dispatch(&build_init_request(
+        1,
+        FUSE_KERNEL_VERSION,
+        FUSE_KERNEL_MINOR_VERSION,
+        want_flags,
+    ));
+    let init_hdr = FuseOutHeader::decode(&init_resp).unwrap();
+    assert_eq!(init_hdr.error, 0);
+    let init_out = FuseInitOut::decode(&init_resp[FUSE_OUT_HEADER_LEN..]).unwrap();
+    assert_eq!(init_out.flags & want_flags, want_flags);
+
+    // 2. FUSE_OPENDIR on ROOT_INODE sets both FOPEN_KEEP_CACHE and FOPEN_CACHE_DIR.
+    let opendir_req = build_request(2, FuseOpcode::Opendir, ROOT_INODE, &[0u8; 8]);
+    let opendir_resp = fs.dispatch(&opendir_req);
+    let opendir_hdr = FuseOutHeader::decode(&opendir_resp).unwrap();
+    assert_eq!(opendir_hdr.error, 0);
+    let open_flags = u32::from_le_bytes(
+        opendir_resp[FUSE_OUT_HEADER_LEN + 8..FUSE_OUT_HEADER_LEN + 12]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        open_flags & (FOPEN_KEEP_CACHE | FOPEN_CACHE_DIR),
+        FOPEN_KEEP_CACHE | FOPEN_CACHE_DIR
+    );
+
+    // 3. FUSE_READDIRPLUS on ROOT_INODE returns FuseDirentplus records with populated
+    //    FuseEntryOut + FuseAttr for every entry in a single round-trip.
+    let mut rdp_payload = Vec::with_capacity(24);
+    rdp_payload.extend_from_slice(&0u64.to_le_bytes()); // fh
+    rdp_payload.extend_from_slice(&0u64.to_le_bytes()); // offset
+    rdp_payload.extend_from_slice(&4096u32.to_le_bytes()); // size
+    rdp_payload.extend_from_slice(&0u32.to_le_bytes()); // padding
+    let rdp_req = build_request(3, FuseOpcode::Readdirplus, ROOT_INODE, &rdp_payload);
+    let rdp_resp = fs.dispatch(&rdp_req);
+    let rdp_hdr = FuseOutHeader::decode(&rdp_resp).unwrap();
+    assert_eq!(rdp_hdr.error, 0);
+
+    let entries = FuseDirentplus::decode_all(&rdp_resp[FUSE_OUT_HEADER_LEN..]).unwrap();
+    assert_eq!(
+        entries.len(),
+        3,
+        "expected .git, README.md, src in FUSE_READDIRPLUS; got {}",
+        entries.len()
+    );
+    let readme = entries
+        .iter()
+        .find(|e| e.dirent.name.as_slice() == b"README.md")
+        .expect("README.md in FUSE_READDIRPLUS");
+    assert_eq!(readme.dirent.ino, readme.entry_out.nodeid);
+    assert_eq!(readme.entry_out.attr.size, 58);
+
+    // And because readdirplus populated the inode table in one pass, FUSE_GETATTR
+    // works directly on `readme.entry_out.nodeid` without any prior FUSE_LOOKUP.
+    let getattr_req = build_request(4, FuseOpcode::Getattr, readme.entry_out.nodeid, &[0u8; 16]);
+    let getattr_resp = fs.dispatch(&getattr_req);
+    let getattr_hdr = FuseOutHeader::decode(&getattr_resp).unwrap();
+    assert_eq!(getattr_hdr.error, 0);
+}

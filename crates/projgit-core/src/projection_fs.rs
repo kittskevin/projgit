@@ -29,7 +29,7 @@
 use crate::error::ProjectionError;
 use crate::fetcher::{Fetcher, HydrateError, HydratingObjectStore};
 use crate::fs_provider::{
-    Attr, DirEntry, FileType, FsError, FsProvider, InodeAllocator, ROOT_INODE,
+    Attr, DirEntry, DirEntryPlus, FileType, FsError, FsProvider, InodeAllocator, ROOT_INODE,
 };
 use crate::overlay::{RootOverlay, SyntheticEntry};
 use crate::prefetch::{PrefetchHandle, PrefetchStats};
@@ -549,6 +549,113 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
             }
             _ => Err(FsError::NotADirectory),
         }
+    }
+
+    fn readdirplus(&self, inode: u64, offset: u64) -> Result<Vec<DirEntryPlus>, FsError> {
+        let items: Vec<(BString, ResolvedEntry, String)> = if inode == ROOT_INODE {
+            let pairs = self
+                .projection
+                .read_root(self.store.store(), &self.overlay)
+                .map_err(projection_to_fs)?;
+            pairs
+                .into_iter()
+                .map(|(name, resolved)| {
+                    let full = String::from_utf8_lossy(&name).into_owned();
+                    (name, resolved, full)
+                })
+                .collect()
+        } else {
+            let snap = {
+                let attrs = self.attrs.read().unwrap();
+                attrs.get(&inode).cloned().ok_or(FsError::NotFound)?
+            };
+            match snap {
+                AttrSnapshot::TreeDir { tree_oid, path } => {
+                    let raw = self.store.read_tree(tree_oid).map_err(hydrate_to_fs)?;
+                    let entries: Vec<TreeEntry> = raw.into_iter().map(TreeEntry::from).collect();
+                    entries
+                        .into_iter()
+                        .map(|entry| {
+                            let full = if path.is_empty() {
+                                String::from_utf8_lossy(&entry.name).into_owned()
+                            } else {
+                                format!(
+                                    "{}/{}",
+                                    String::from_utf8_lossy(&path),
+                                    String::from_utf8_lossy(&entry.name)
+                                )
+                            };
+                            let name = entry.name.clone();
+                            (name, ResolvedEntry::Tree(entry), full)
+                        })
+                        .collect()
+                }
+                AttrSnapshot::SyntheticDir { children, path } => children
+                    .iter()
+                    .map(|(name, entry)| {
+                        let full = if path.is_empty() {
+                            String::from_utf8_lossy(name).into_owned()
+                        } else {
+                            format!(
+                                "{}/{}",
+                                String::from_utf8_lossy(&path),
+                                String::from_utf8_lossy(name)
+                            )
+                        };
+                        (
+                            name.clone(),
+                            ResolvedEntry::Synthetic {
+                                name: name.clone(),
+                                entry: entry.clone(),
+                            },
+                            full,
+                        )
+                    })
+                    .collect(),
+                AttrSnapshot::Gitlink | AttrSnapshot::Root => Vec::new(),
+                _ => return Err(FsError::NotADirectory),
+            }
+        };
+
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start >= items.len() {
+            return Ok(Vec::new());
+        }
+
+        // Batch-warm headers for all blob/symlink children in one pass before
+        // building snapshots so partial-clone mounts resolve sizes in a single
+        // `git cat-file --batch-check` round trip rather than per-entry fetches.
+        let mut prefetch_oids = Vec::with_capacity(items.len() - start);
+        for (_, resolved, _) in &items[start..] {
+            if let Some(oid) = harvest_prefetch_oid(resolved) {
+                prefetch_oids.push(oid);
+            }
+        }
+        if !prefetch_oids.is_empty() {
+            let _ = self.store.prefetch_headers(&prefetch_oids);
+            if offset == 0 && crate::prefetch::blob_prefetch_enabled() {
+                self.prefetch.post_blobs(prefetch_oids);
+            }
+        }
+
+        let mut out = Vec::with_capacity(items.len() - start);
+        let mut new_snaps = Vec::with_capacity(items.len() - start);
+        for (name, resolved, full) in items.into_iter().skip(start) {
+            let (child_inode, snap, kind, size, mode) = self.snapshot_for(resolved, &full)?;
+            new_snaps.push((child_inode, snap));
+            out.push(DirEntryPlus {
+                inode: child_inode,
+                name,
+                attr: self.attr(child_inode, kind, size, mode),
+            });
+        }
+        if !new_snaps.is_empty() {
+            let mut attrs = self.attrs.write().unwrap();
+            for (child_inode, snap) in new_snaps {
+                attrs.entry(child_inode).or_insert(snap);
+            }
+        }
+        Ok(out)
     }
 
     fn read(&self, inode: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {

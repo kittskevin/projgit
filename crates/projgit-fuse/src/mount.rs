@@ -5,9 +5,11 @@
 //! mounts from one process.
 
 use crate::adapter::ProjgitFuse;
+use crate::overlay_scratch::OverlayScratchConfig;
 use fuser::{mount2, spawn_mount2, BackgroundSession, Config, MountOption, SessionACL};
 use projgit_core::FsProvider;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 /// Per-mount knobs the CLI exposes today.
@@ -22,6 +24,15 @@ pub struct MountConfig {
     pub acl: SessionACL,
     /// Number of FUSE event-loop threads. `None` => single-threaded.
     pub n_threads: Option<usize>,
+    /// Negotiate `FUSE_PASSTHROUGH` (Linux 6.9+) when available so `read()` / `mmap()`
+    /// bypass userspace and go directly to `<git-dir>/blobs/<xx>/<oid>` backing files.
+    pub passthrough: bool,
+    /// Optional writable scratch directory (`--writable-scratch <DIR>`).
+    ///
+    /// When set on Linux, the read-only FUSE projection is mounted at `<DIR>/lower`
+    /// and kernel `overlayfs` (`upperdir=<DIR>/upper,workdir=<DIR>/work,metacopy=on`)
+    /// is stacked onto the user-visible `mountpoint`.
+    pub writable_scratch: Option<PathBuf>,
 }
 
 impl Default for MountConfig {
@@ -31,6 +42,8 @@ impl Default for MountConfig {
             subtype: "projgit".to_owned(),
             acl: SessionACL::Owner,
             n_threads: None,
+            passthrough: true,
+            writable_scratch: None,
         }
     }
 }
@@ -69,8 +82,44 @@ pub fn mount<F: FsProvider + 'static>(
     mountpoint: impl AsRef<Path>,
     config: &MountConfig,
 ) -> std::io::Result<()> {
-    let fs = ProjgitFuse::new(provider);
+    let fs = ProjgitFuse::with_passthrough(provider, config.passthrough);
     mount2(fs, mountpoint, &config.to_fuser_config())
+}
+
+/// Active background mount session that optionally manages a stacked Linux
+/// `overlayfs` writable upper layer on top of the read-only FUSE projection.
+///
+/// On `Drop`, if an `overlayfs` upper mount was stacked onto `overlay_mountpoint`,
+/// it is unmounted first before the underlying FUSE `BackgroundSession` is dropped.
+pub struct ManagedMountSession {
+    fuse_session: Option<BackgroundSession>,
+    overlay_mountpoint: Option<PathBuf>,
+}
+
+impl ManagedMountSession {
+    /// Wrap a plain read-only [`BackgroundSession`].
+    pub fn from_fuse(session: BackgroundSession) -> Self {
+        Self {
+            fuse_session: Some(session),
+            overlay_mountpoint: None,
+        }
+    }
+
+    /// Return the stacked `overlayfs` mountpoint if this session was mounted
+    /// with [`MountConfig::writable_scratch`].
+    pub fn overlay_mountpoint(&self) -> Option<&Path> {
+        self.overlay_mountpoint.as_deref()
+    }
+}
+
+impl Drop for ManagedMountSession {
+    fn drop(&mut self) {
+        if let Some(ref mp) = self.overlay_mountpoint {
+            let _ = unmount_overlayfs(mp);
+        }
+        // Drop the underlying FUSE session after the overlay on top of it is unmounted.
+        let _ = self.fuse_session.take();
+    }
 }
 
 /// Mount `provider` at `mountpoint` and return immediately.
@@ -93,8 +142,102 @@ pub fn mount_background<F: FsProvider + 'static>(
     mountpoint: impl AsRef<Path>,
     config: &MountConfig,
 ) -> std::io::Result<BackgroundSession> {
-    let fs = ProjgitFuse::new(provider);
+    let fs = ProjgitFuse::with_passthrough(provider, config.passthrough);
     spawn_mount2(fs, mountpoint, &config.to_fuser_config())
+}
+
+/// Mount `provider` at `mountpoint` in the background, stacking a writable
+/// Linux `overlayfs` layer when [`MountConfig::writable_scratch`] is `Some`.
+///
+/// When `config.writable_scratch` is `None`, this behaves identically to
+/// [`mount_background`]. When `Some(scratch_dir)`:
+/// 1. Creates `<scratch_dir>/{lower,upper,work}`.
+/// 2. Mounts the read-only FUSE projection at `<scratch_dir>/lower`.
+/// 3. Mounts kernel `overlayfs` onto `mountpoint` using
+///    [`OverlayScratchConfig::fallback_mount_options_chain`].
+pub fn mount_managed_background<F: FsProvider + 'static>(
+    provider: Arc<F>,
+    mountpoint: impl AsRef<Path>,
+    config: &MountConfig,
+) -> std::io::Result<ManagedMountSession> {
+    let mountpoint = mountpoint.as_ref();
+    let Some(ref scratch_root) = config.writable_scratch else {
+        let session = mount_background(provider, mountpoint, config)?;
+        return Ok(ManagedMountSession::from_fuse(session));
+    };
+
+    if !mountpoint.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("mountpoint `{}` does not exist", mountpoint.display()),
+        ));
+    }
+
+    let scratch_cfg = OverlayScratchConfig::new(scratch_root);
+    let dirs = scratch_cfg.prepare_dirs()?;
+    let fuse_session = mount_background(provider, &dirs.lower_dir, config)?;
+
+    if let Err(e) = mount_overlayfs(&scratch_cfg, &dirs.lower_dir, mountpoint) {
+        drop(fuse_session);
+        return Err(e);
+    }
+
+    Ok(ManagedMountSession {
+        fuse_session: Some(fuse_session),
+        overlay_mountpoint: Some(mountpoint.to_path_buf()),
+    })
+}
+
+fn mount_overlayfs(
+    scratch_cfg: &OverlayScratchConfig,
+    lower_dir: &Path,
+    mountpoint: &Path,
+) -> std::io::Result<()> {
+    let mut last_err = String::new();
+    for opts in scratch_cfg.fallback_mount_options_chain(lower_dir) {
+        match Command::new("mount")
+            .arg("-t")
+            .arg("overlay")
+            .arg("overlay")
+            .arg("-o")
+            .arg(&opts)
+            .arg(mountpoint)
+            .output()
+        {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => {
+                last_err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            }
+            Err(e) => {
+                last_err = e.to_string();
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "failed to mount overlayfs at `{}` (lowerdir `{}`): {}",
+            mountpoint.display(),
+            lower_dir.display(),
+            last_err
+        ),
+    ))
+}
+
+fn unmount_overlayfs(mountpoint: &Path) -> std::io::Result<()> {
+    if let Ok(out) = Command::new("umount").arg(mountpoint).output() {
+        if out.status.success() {
+            return Ok(());
+        }
+    }
+    let out = Command::new("umount").arg("-l").arg(mountpoint).output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        ))
+    }
 }
 
 #[cfg(test)]

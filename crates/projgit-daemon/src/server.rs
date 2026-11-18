@@ -30,7 +30,7 @@ use projgit_core::{
     GitCliFetcher, HeaderProbe, HydratingObjectStore, NoopFetcher, ObjectKind, ObjectStore,
     Projection, ProjectionFsProvider, RootOverlay,
 };
-use projgit_fuse::{mount_background, BackgroundSession, MountConfig, SessionACL};
+use projgit_fuse::{mount_managed_background, ManagedMountSession, MountConfig, SessionACL};
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -253,9 +253,9 @@ impl ActiveBackend {
 struct MountEntry {
     ref_name: String,
     projection_id: u64,
-    #[allow(dead_code)] // held for its Drop side effect: unmounts via fuser.
-    /// Dropping this unmounts via fuser's Drop impl.
-    session: BackgroundSession,
+    #[allow(dead_code)] // held for its Drop side effect: unmounts overlayfs + FUSE.
+    /// Dropping this unmounts any stacked overlayfs and the underlying FUSE session.
+    session: ManagedMountSession,
 }
 
 impl DaemonState {
@@ -631,6 +631,7 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
             no_dotgit,
             isolated_dotgit,
             allow_other,
+            writable_scratch,
         } => handle_mount(
             state,
             source,
@@ -639,6 +640,7 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
             no_dotgit,
             isolated_dotgit,
             allow_other,
+            writable_scratch,
         ),
         Request::Umount { mountpoint } => handle_umount(state, mountpoint),
         Request::Attach { source } => handle_attach(state, source),
@@ -651,6 +653,7 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
 /// Mount handler. Acquires the state mutex once for the whole
 /// operation; not ideal for concurrency but trivially correct, and
 /// mount/umount are not hot paths.
+#[allow(clippy::too_many_arguments)]
 fn handle_mount(
     state: &Arc<DaemonState>,
     source: String,
@@ -659,6 +662,7 @@ fn handle_mount(
     no_dotgit: bool,
     isolated_dotgit: bool,
     allow_other: bool,
+    writable_scratch: Option<PathBuf>,
 ) -> Response {
     let mountpoint = match std::fs::canonicalize(&mountpoint) {
         Ok(p) => p,
@@ -725,20 +729,23 @@ fn handle_mount(
     if allow_other {
         cfg.acl = SessionACL::All;
     }
+    cfg.writable_scratch = writable_scratch;
 
     let session_result = match &repo.backend {
         ActiveBackend::Noop(h) => {
             ProjectionFsProvider::new(projection, h.clone(), overlay, projection_id)
                 .map_err(anyhow::Error::from)
                 .and_then(|p| {
-                    mount_background(Arc::new(p), &mountpoint, &cfg).map_err(anyhow::Error::from)
+                    mount_managed_background(Arc::new(p), &mountpoint, &cfg)
+                        .map_err(anyhow::Error::from)
                 })
         }
         ActiveBackend::GitCli(h) => {
             ProjectionFsProvider::new(projection, h.clone(), overlay, projection_id)
                 .map_err(anyhow::Error::from)
                 .and_then(|p| {
-                    mount_background(Arc::new(p), &mountpoint, &cfg).map_err(anyhow::Error::from)
+                    mount_managed_background(Arc::new(p), &mountpoint, &cfg)
+                        .map_err(anyhow::Error::from)
                 })
         }
     };

@@ -30,11 +30,12 @@ use projgit_core::{FileType, FsProvider};
 use crate::dax::{DaxMapper, MemoryDaxWindow};
 use crate::wire::{
     decode_remove_mappings, encode_readonly_statfs, errno, fs_error_to_errno, FuseAttrOut,
-    FuseDirent, FuseEntryOut, FuseInHeader, FuseInitIn, FuseInitOut, FuseOpcode, FuseOpenIn,
-    FuseOpenOut, FuseOutHeader, FuseReadIn, FuseSetupMappingIn, DEFAULT_DAX_MAP_ALIGNMENT,
-    FOPEN_KEEP_CACHE, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_IN_HEADER_LEN,
-    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_MAP_ALIGNMENT,
-    FUSE_SETUPMAPPING_FLAG_WRITE,
+    FuseDirent, FuseDirentplus, FuseEntryOut, FuseInHeader, FuseInitIn, FuseInitOut, FuseOpcode,
+    FuseOpenIn, FuseOpenOut, FuseOutHeader, FuseReadIn, FuseSetupMappingIn,
+    DEFAULT_DAX_MAP_ALIGNMENT, FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_ASYNC_READ,
+    FUSE_CACHE_SYMLINKS, FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_IN_HEADER_LEN,
+    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_MAP_ALIGNMENT, FUSE_PARALLEL_DIROPS,
+    FUSE_READDIRPLUS_AUTO, FUSE_SETUPMAPPING_FLAG_WRITE,
 };
 
 /// Whether the native Unix domain socket `vhost-user-fs` listener is supported on this target OS.
@@ -120,6 +121,7 @@ impl<F: FsProvider, M: DaxMapper> ProjgitVirtioFs<F, M> {
             FuseOpcode::Opendir => self.handle_open(hdr.unique, hdr.nodeid, payload, true),
             FuseOpcode::Read => self.handle_read(hdr.unique, hdr.nodeid, payload),
             FuseOpcode::Readdir => self.handle_readdir(hdr.unique, hdr.nodeid, payload),
+            FuseOpcode::Readdirplus => self.handle_readdirplus(hdr.unique, hdr.nodeid, payload),
             FuseOpcode::Statfs => FuseOutHeader::reply_ok(hdr.unique, &encode_readonly_statfs()),
             FuseOpcode::SetupMapping => self.handle_setup_mapping(hdr.unique, hdr.nodeid, payload),
             FuseOpcode::RemoveMapping => self.handle_remove_mapping(hdr.unique, payload),
@@ -135,7 +137,13 @@ impl<F: FsProvider, M: DaxMapper> ProjgitVirtioFs<F, M> {
         if init_in.major < FUSE_KERNEL_VERSION {
             return FuseOutHeader::reply_err(unique, errno::EINVAL);
         }
-        let supported_flags = FUSE_ASYNC_READ | FUSE_CACHE_SYMLINKS | FUSE_MAP_ALIGNMENT;
+        let supported_flags = FUSE_ASYNC_READ
+            | FUSE_DO_READDIRPLUS
+            | FUSE_READDIRPLUS_AUTO
+            | FUSE_PARALLEL_DIROPS
+            | FUSE_CACHE_SYMLINKS
+            | FUSE_EXPLICIT_INVAL_DATA
+            | FUSE_MAP_ALIGNMENT;
         let negotiated_flags = (init_in.flags & supported_flags) | FUSE_MAP_ALIGNMENT;
         let out = FuseInitOut {
             major: FUSE_KERNEL_VERSION,
@@ -199,9 +207,14 @@ impl<F: FsProvider, M: DaxMapper> ProjgitVirtioFs<F, M> {
                 if !is_dir && attr.kind == FileType::Directory {
                     return FuseOutHeader::reply_err(unique, errno::EISDIR);
                 }
+                let open_flags = if is_dir {
+                    FOPEN_KEEP_CACHE | FOPEN_CACHE_DIR
+                } else {
+                    FOPEN_KEEP_CACHE
+                };
                 let out = FuseOpenOut {
                     fh: 0,
-                    open_flags: FOPEN_KEEP_CACHE,
+                    open_flags,
                     padding: 0,
                 };
                 FuseOutHeader::reply_ok(unique, &out.encode())
@@ -244,6 +257,36 @@ impl<F: FsProvider, M: DaxMapper> ProjgitVirtioFs<F, M> {
                 break;
             }
             dirent.encode_into(&mut out);
+        }
+        FuseOutHeader::reply_ok(unique, &out)
+    }
+
+    fn handle_readdirplus(&self, unique: u64, nodeid: u64, payload: &[u8]) -> Vec<u8> {
+        let Some(read_in) = FuseReadIn::decode(payload) else {
+            return FuseOutHeader::reply_err(unique, errno::EINVAL);
+        };
+        let entries = match self.provider.readdirplus(nodeid, read_in.offset) {
+            Ok(list) => list,
+            Err(e) => return FuseOutHeader::reply_err(unique, fs_error_to_errno(&e)),
+        };
+
+        let max_bytes = read_in.size as usize;
+        let mut out = Vec::with_capacity(max_bytes.min(4096));
+        for (idx, entry) in entries.into_iter().enumerate() {
+            let next_off = read_in.offset + (idx as u64) + 1;
+            let entry_out = FuseEntryOut::from_file_attr(&entry.attr, self.uid, self.gid);
+            let dirent = FuseDirent {
+                ino: entry.inode,
+                off: next_off,
+                typ: FuseDirent::dirent_type(entry.attr.kind),
+                name: entry.name.into(),
+            };
+            let needed = FuseDirentplus::encoded_len(dirent.name.len());
+            if out.len() + needed > max_bytes {
+                break;
+            }
+            let direntplus = FuseDirentplus { entry_out, dirent };
+            direntplus.encode_into(&mut out);
         }
         FuseOutHeader::reply_ok(unique, &out)
     }
