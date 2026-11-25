@@ -276,8 +276,9 @@ Pieces worth pointing at if you're skimming the code:
   working set), backed by an **L2 persistent header memo**
   (`<git-dir>/blobs/headers.bin`) and an **L2 uncompressed on-disk blob cache**
   (`<git-dir>/blobs/<xx>/<oid>`, atomically written + renamed in
-  [`object_store.rs`](crates/projgit-core/src/object_store.rs)). Range reads
-  (`read_blob_range`) use `pread` (`FileExt::read_at` / `seek_read`) for true
+  [`object_store.rs`](crates/projgit-core/src/object_store.rs) and bounded under
+  a disk byte budget via [`prune_uncompressed_blobs`](crates/projgit-core/src/maintenance.rs)).
+  Range reads (`read_blob_range`) use `pread` (`FileExt::read_at` / `seek_read`) for true
   `O(range)` slices without re-inflating pack entries, and
   [`FsProvider::backing_file`](crates/projgit-core/src/fs_provider.rs) hands
   open host file descriptors to both **Linux 6.9+ `FOPEN_PASSTHROUGH`** in
@@ -296,7 +297,9 @@ Pieces worth pointing at if you're skimming the code:
 - **`projgitd` multi-mount daemon & cross-namespace `/dev/fuse` fd passing.**
   [`projgit-daemon`](crates/projgit-daemon) owns the shared CAS, per-OID
   `Coalescer`, `k`-slot `git cat-file --batch-check` worker pool, and
-  periodic `git maintenance run` loop over a Unix domain socket. Lightweight
+  periodic `git maintenance run` + bounded L2 blob eviction
+  (`--blob-cache-max-bytes` / `PROJGIT_BLOB_CACHE_MAX_BYTES`) loop over a
+  Unix domain socket. Lightweight
   sidecars (`projgit mount --daemon-socket …` or `projgit attach`) can open
   `/dev/fuse` inside an unprivileged container mount namespace and pass the
   file descriptor over `SCM_RIGHTS` ([docs/design/projgitd.md](docs/design/projgitd.md)).
@@ -410,7 +413,9 @@ What works today:
 - `projgitd` (`crates/projgit-daemon`) long-running daemon + `projgit attach` /
   `--daemon-socket` sidecar topology: Unix-socket control plane, `SCM_RIGHTS`
   `/dev/fuse` fd-passing, `k`-slot `cat-file` worker pool, prefetch batch
-  coalescing, PID file management, and background `git maintenance run`.
+  coalescing, PID file management, and background `git maintenance run` +
+  LRU eviction for `<git-dir>/blobs/<xx>/<oid>` (`--blob-cache-max-bytes` /
+  `PROJGIT_BLOB_CACHE_MAX_BYTES`).
 - Linux/macOS FUSE backend through `fuser`, with file ownership echoed
   per-request so `git`'s `safe.directory` check passes without setup.
 - `projgit-virtiofs` (`crates/projgit-virtiofs`) zero-`unsafe` FUSE 7.38 +

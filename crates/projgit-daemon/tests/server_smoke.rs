@@ -37,6 +37,7 @@ fn spawn_daemon(label: &str) -> (PathBuf, thread::JoinHandle<anyhow::Result<()>>
         pool_size: 1,
         pid_file: None,
         maintenance_interval_secs: None,
+        blob_cache_max_bytes: None,
     };
     let handle = thread::spawn(move || run(config));
 
@@ -147,4 +148,152 @@ fn shutdown_after_multiple_pings() {
     }
     let _ = rpc(&sock, &Request::Shutdown);
     handle.join().unwrap().unwrap();
+}
+
+#[test]
+fn background_maintenance_evicts_excess_l2_blobs_under_budget() {
+    use std::process::Command;
+    use std::time::SystemTime;
+
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+
+    let repo = std::env::temp_dir().join(format!(
+        "projgitd-test-l2-evict-repo-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let run_git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "projgit-test")
+            .env("GIT_AUTHOR_EMAIL", "test@projgit.invalid")
+            .env("GIT_COMMITTER_NAME", "projgit-test")
+            .env("GIT_COMMITTER_EMAIL", "test@projgit.invalid")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+
+    run_git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("old.bin"), vec![0x11u8; 4096]).unwrap();
+    std::fs::write(repo.join("new.bin"), vec![0x22u8; 4096]).unwrap();
+    run_git(&["add", "-A"]);
+    run_git(&["commit", "-q", "-m", "initial"]);
+    run_git(&["repack", "-a", "-d", "-q"]);
+
+    let old_oid = run_git(&["rev-parse", "HEAD:old.bin"]);
+    let new_oid = run_git(&["rev-parse", "HEAD:new.bin"]);
+
+    let socket_path = temp_socket("l2-evict");
+    let _ = std::fs::remove_file(&socket_path);
+    let config = DaemonConfig {
+        socket_path: socket_path.clone(),
+        socket_mode: 0o600,
+        cache_dir: None,
+        cache_depth: None,
+        trace: false,
+        pool_size: 1,
+        pid_file: None,
+        maintenance_interval_secs: Some(1),
+        blob_cache_max_bytes: Some(4096),
+    };
+    let handle = thread::spawn(move || run(config));
+
+    let start = Instant::now();
+    while !socket_path.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "daemon never created socket"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Attach to the local fixture repo and materialize both blobs via Fetch RPCs.
+    match rpc(
+        &socket_path,
+        &Request::Attach {
+            source: repo.to_string_lossy().into_owned(),
+        },
+    ) {
+        Response::Attached { .. } => {}
+        other => panic!("expected Attached, got {other:?}"),
+    }
+    assert!(matches!(
+        rpc(
+            &socket_path,
+            &Request::Fetch {
+                oid: old_oid.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        rpc(
+            &socket_path,
+            &Request::Fetch {
+                oid: new_oid.clone()
+            }
+        ),
+        Response::Ok
+    ));
+
+    let blobs_dir = repo.join(".git").join("blobs");
+    let old_blob_path = blobs_dir.join(&old_oid[..2]).join(&old_oid);
+    let new_blob_path = blobs_dir.join(&new_oid[..2]).join(&new_oid);
+    assert!(old_blob_path.is_file(), "old blob should be materialized");
+    assert!(new_blob_path.is_file(), "new blob should be materialized");
+
+    // Backdate old_blob_path so it is deterministically the LRU victim.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&old_blob_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&old_blob_path, perms).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old_blob_path)
+            .unwrap();
+        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(past)
+            .set_modified(past);
+        f.set_times(times).unwrap();
+        f.set_modified(past).unwrap();
+    }
+
+    // Wait for the 1-second background maintenance tick to evict old_blob_path.
+    let evict_deadline = Instant::now() + Duration::from_secs(5);
+    while old_blob_path.exists() {
+        assert!(
+            Instant::now() < evict_deadline,
+            "background maintenance did not evict oldest blob within deadline"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        new_blob_path.is_file(),
+        "newest blob within the 4096-byte budget must remain"
+    );
+    assert!(
+        blobs_dir.join("headers.bin").is_file(),
+        "headers.bin must remain intact"
+    );
+
+    let _ = rpc(&socket_path, &Request::Shutdown);
+    handle.join().unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&repo);
 }

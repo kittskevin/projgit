@@ -107,6 +107,12 @@ pub struct DaemonConfig {
     /// `Some(0)` disables it. Takes precedence over the
     /// `PROJGIT_MAINTENANCE_INTERVAL_SECS` env fallback.
     pub maintenance_interval_secs: Option<u64>,
+    /// Maximum disk budget in bytes for the uncompressed L2 blob cache
+    /// (`<git-dir>/blobs/<xx>/<oid>`). Enforced on each background
+    /// maintenance tick via LRU (`atime`/`mtime`) eviction. `None` /
+    /// `Some(0)` disables eviction. Takes precedence over the
+    /// `PROJGIT_BLOB_CACHE_MAX_BYTES` env fallback.
+    pub blob_cache_max_bytes: Option<u64>,
 }
 
 impl Default for DaemonConfig {
@@ -120,6 +126,7 @@ impl Default for DaemonConfig {
             pool_size: GitCliFetcher::default_pool_size(),
             pid_file: None,
             maintenance_interval_secs: None,
+            blob_cache_max_bytes: None,
         }
     }
 }
@@ -404,20 +411,26 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     ));
 
     // Background CAS maintenance (the Scalar object-store half: MIDX +
-    // incremental repack + commit-graph). Enabled via
-    // --maintenance-interval-secs (or PROJGIT_MAINTENANCE_INTERVAL_SECS);
+    // incremental repack + commit-graph) + bounded L2 blob cache eviction.
+    // Enabled via --maintenance-interval-secs (or PROJGIT_MAINTENANCE_INTERVAL_SECS);
     // runs off the serving path so it never blocks an RPC. See
     // docs/design/cache-transform-tier.md §14.
+    let effective_blob_cache_max_bytes = config
+        .blob_cache_max_bytes
+        .or_else(blob_cache_max_bytes)
+        .filter(|&n| n > 0);
     let maintenance = config
         .maintenance_interval_secs
         .or_else(maintenance_interval_secs)
         .filter(|&n| n > 0)
         .map(|secs| {
             let state = state.clone();
-            tracing::info!("background maintenance enabled (every {secs}s)");
+            tracing::info!(
+                "background maintenance enabled (every {secs}s, blob_cache_max_bytes={effective_blob_cache_max_bytes:?})"
+            );
             std::thread::Builder::new()
                 .name("projgit-maint".to_owned())
-                .spawn(move || maintenance_loop(state, secs))
+                .spawn(move || maintenance_loop(state, secs, effective_blob_cache_max_bytes))
                 .expect("spawn maintenance thread")
         });
 
@@ -477,12 +490,28 @@ fn maintenance_interval_secs() -> Option<u64> {
         .filter(|&n| n > 0)
 }
 
+/// Uncompressed L2 blob cache max budget from `PROJGIT_BLOB_CACHE_MAX_BYTES`.
+/// `None` (unset / unparsable / 0) disables L2 blob eviction.
+fn blob_cache_max_bytes() -> Option<u64> {
+    std::env::var("PROJGIT_BLOB_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
+
 /// Background CAS-maintenance loop: every `interval_secs`, if the
 /// daemon is attached to a source, run `projgit_core::run_maintenance`
-/// on the shared CAS. Sleeps in short slices so shutdown is prompt;
-/// returns when shutdown is requested. A maintenance failure is logged
-/// and the loop continues (best-effort upkeep).
-fn maintenance_loop(state: Arc<DaemonState>, interval_secs: u64) {
+/// on the shared CAS and (if `blob_cache_max_bytes` is configured)
+/// prune the uncompressed L2 blob cache via
+/// [`projgit_core::prune_uncompressed_blobs`]. Sleeps in short slices
+/// so shutdown is prompt; returns when shutdown is requested. A
+/// maintenance failure is logged and the loop continues (best-effort
+/// upkeep).
+fn maintenance_loop(
+    state: Arc<DaemonState>,
+    interval_secs: u64,
+    blob_cache_max_bytes: Option<u64>,
+) {
     let interval = std::time::Duration::from_secs(interval_secs);
     let slice = std::time::Duration::from_millis(250);
     loop {
@@ -505,6 +534,19 @@ fn maintenance_loop(state: Arc<DaemonState>, interval_secs: u64) {
             match projgit_core::run_maintenance(&git_dir) {
                 Ok(()) => tracing::debug!("maintenance ran on {}", git_dir.display()),
                 Err(e) => tracing::warn!("maintenance failed: {e}"),
+            }
+            if let Some(max_bytes) = blob_cache_max_bytes.filter(|&b| b > 0) {
+                match projgit_core::prune_uncompressed_blobs(&git_dir, max_bytes) {
+                    Ok(stats) => tracing::debug!(
+                        "pruned uncompressed blobs on {}: evicted_files={} evicted_bytes={} remaining_files={} remaining_bytes={}",
+                        git_dir.display(),
+                        stats.evicted_files,
+                        stats.evicted_bytes,
+                        stats.remaining_files,
+                        stats.remaining_bytes,
+                    ),
+                    Err(e) => tracing::warn!("blob cache pruning failed: {e}"),
+                }
             }
         }
     }

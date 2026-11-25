@@ -65,7 +65,9 @@ pub use fs_provider::{
     InodeAllocator, InodeKind, ROOT_INODE,
 };
 pub use header_cache::HeaderCacheStats;
-pub use maintenance::{run_maintenance, MaintenanceError};
+pub use maintenance::{
+    prune_uncompressed_blobs, run_maintenance, BlobEvictionStats, MaintenanceError,
+};
 pub use object_store::{DiskBlobCacheStats, DiskHeaderCacheStats, ObjectKind, ObjectStore};
 pub use overlay::{RootOverlay, SyntheticEntry};
 pub use prefetch::PrefetchStats;

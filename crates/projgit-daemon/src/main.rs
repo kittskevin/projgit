@@ -101,6 +101,13 @@ fn main() -> anyhow::Result<()> {
         /// PROJGIT_MAINTENANCE_INTERVAL_SECS env var.
         #[arg(long, value_name = "SECS")]
         maintenance_interval_secs: Option<u64>,
+
+        /// Maximum disk budget in bytes for the uncompressed L2 blob cache
+        /// (`<git-dir>/blobs/<xx>/<oid>`). Enforced on each background
+        /// maintenance tick via LRU (`atime`/`mtime`) eviction. Omitted / 0
+        /// disables eviction. Overrides `PROJGIT_BLOB_CACHE_MAX_BYTES`.
+        #[arg(long, value_name = "BYTES")]
+        blob_cache_max_bytes: Option<u64>,
     }
 
     let cli = Cli::parse();
@@ -138,6 +145,7 @@ fn main() -> anyhow::Result<()> {
         config.cache_dir = Some(dir);
     }
     config.maintenance_interval_secs = cli.maintenance_interval_secs;
+    config.blob_cache_max_bytes = cli.blob_cache_max_bytes;
 
     // Signal handling lives in the binary, not the library, because
     // `ctrlc::set_handler` is a process-wide resource (set-once) and

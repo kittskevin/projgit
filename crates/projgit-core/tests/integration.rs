@@ -925,3 +925,114 @@ fn persistent_header_memo_survives_across_object_store_instances() {
     assert_eq!(dh_b_after.hits, dh_b_initial.hits + 1);
     assert_eq!(dh_b_after.misses, 0);
 }
+
+#[test]
+fn prune_uncompressed_blobs_evicts_lru_and_transparently_rematerializes_from_pack() {
+    use std::time::{Duration, SystemTime};
+
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    let (repo, _head_hex) = build_fixture("os_prune_blobs");
+
+    // Add two large files (> 64 KiB L1 cap) so reads go through the L2 on-disk
+    // uncompressed blob cache and packfiles rather than the L1 small-blob LRU.
+    let old_payload: Vec<u8> = (0..(80 * 1024)).map(|i| ((i * 7) % 251) as u8).collect();
+    let new_payload: Vec<u8> = (0..(96 * 1024)).map(|i| ((i * 13) % 251) as u8).collect();
+    std::fs::write(repo.join("old_large.bin"), &old_payload).unwrap();
+    std::fs::write(repo.join("new_large.bin"), &new_payload).unwrap();
+    git(&repo, &["add", "old_large.bin", "new_large.bin"]);
+    git(&repo, &["commit", "-q", "-m", "add two large blobs"]);
+    git(&repo, &["repack", "-a", "-d", "-q"]);
+
+    let head = parse_oid(
+        String::from_utf8(git(&repo, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim(),
+    );
+
+    let store = ObjectStore::open(&repo).unwrap();
+    let tree = store.commit_tree(head).unwrap();
+    let entries = store.read_tree(tree).unwrap();
+    let old_oid = entries
+        .iter()
+        .find(|e| e.name == b"old_large.bin".as_bstr())
+        .expect("old_large.bin")
+        .oid;
+    let new_oid = entries
+        .iter()
+        .find(|e| e.name == b"new_large.bin".as_bstr())
+        .expect("new_large.bin")
+        .oid;
+
+    // Materialize both blobs in <git-dir>/blobs/<xx>/<oid>.
+    let _ = store.ensure_uncompressed_blob(old_oid).unwrap();
+    let _ = store.ensure_uncompressed_blob(new_oid).unwrap();
+
+    let old_path = store.uncompressed_blob_path(old_oid);
+    let new_path = store.uncompressed_blob_path(new_oid);
+    let headers_path = store.header_memo_path();
+    assert!(old_path.is_file());
+    assert!(new_path.is_file());
+    assert!(headers_path.is_file());
+
+    // Set deterministic past mtime/atime so old_path is strictly older than new_path.
+    let set_mtime = |path: &Path, time: SystemTime| {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o644);
+        }
+        #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            perms.set_readonly(false);
+        }
+        std::fs::set_permissions(path, perms).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_accessed(time)
+            .set_modified(time);
+        f.set_times(times).unwrap();
+        f.set_modified(time).unwrap();
+    };
+    let t_base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    set_mtime(&old_path, t_base);
+    set_mtime(&new_path, t_base + Duration::from_secs(300));
+
+    let total_bytes = (old_payload.len() + new_payload.len()) as u64;
+
+    // Budget >= total_bytes is a no-op.
+    let noop_stats = store.prune_uncompressed_blobs(total_bytes).unwrap();
+    assert_eq!(noop_stats.scanned_files, 2);
+    assert_eq!(noop_stats.scanned_bytes, total_bytes);
+    assert_eq!(noop_stats.evicted_files, 0);
+    assert_eq!(noop_stats.remaining_files, 2);
+
+    // Budget = new_payload.len(): evicts old_oid while keeping new_oid and headers.bin.
+    let evict_stats = store
+        .prune_uncompressed_blobs(new_payload.len() as u64)
+        .unwrap();
+    assert_eq!(evict_stats.scanned_files, 2);
+    assert_eq!(evict_stats.evicted_files, 1);
+    assert_eq!(evict_stats.evicted_bytes, old_payload.len() as u64);
+    assert_eq!(evict_stats.remaining_files, 1);
+    assert_eq!(evict_stats.remaining_bytes, new_payload.len() as u64);
+    assert_eq!(evict_stats.remove_errors, 0);
+    assert!(!old_path.exists(), "oldest blob should have been evicted");
+    assert!(new_path.is_file(), "newest blob should remain cached");
+    assert!(headers_path.is_file(), "headers.bin must remain intact");
+
+    // Subsequent read_blob_range and read_blob on the evicted blob succeed by
+    // transparently re-inflating from .git/objects/pack/ and re-populating L2.
+    let slice = store.read_blob_range(old_oid, 1024, 512).unwrap();
+    assert_eq!(&slice, &old_payload[1024..1536]);
+    assert!(
+        old_path.is_file(),
+        "evicted blob must be re-materialized in L2 on subsequent read_blob_range"
+    );
+    let full = store.read_blob(old_oid).unwrap();
+    assert_eq!(full, old_payload);
+}

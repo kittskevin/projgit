@@ -826,6 +826,19 @@ impl ObjectStore {
         }
     }
 
+    /// Prune the on-disk uncompressed blob cache (`<git-dir>/blobs/<xx>/<oid>`)
+    /// down to at most `max_bytes` using LRU (`atime`/`mtime`) eviction.
+    ///
+    /// Never touches `<git-dir>/blobs/headers.bin` or canonical packfiles under
+    /// `<git-dir>/objects/pack/`. Evicted blobs are transparently re-materialized
+    /// from the object database on subsequent reads.
+    pub fn prune_uncompressed_blobs(
+        &self,
+        max_bytes: u64,
+    ) -> std::io::Result<crate::maintenance::BlobEvictionStats> {
+        crate::maintenance::prune_uncompressed_blobs(&self.git_dir, max_bytes)
+    }
+
     /// Return the committer timestamp of a commit as a [`SystemTime`].
     ///
     /// Uses *committer* time (not author time) because that's what

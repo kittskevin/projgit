@@ -286,8 +286,19 @@ Because every `projgit` projection is an **immutable snapshot of a single Git co
   materializes `blobs/<xx>/<oid>` for blobs that are read/prefetched
   (Architecture A/B in [`cache-transform-tier.md`](cache-transform-tier.md)),
   untouched blobs in a 140 GB repo stay un-materialized.
-- **Eviction is trivial:** Because `.git/objects/pack/` remains the
-  canonical source of truth, `blobs/<xx>/<oid>` is a pure rebuildable
-  cache. `projgitd`'s background maintenance loop can LRU-evict old
-  files from `blobs/` by `atime`/`mtime` under a disk budget without
-  ever losing data or re-fetching from the network.
+- **Eviction is trivial (`prune_uncompressed_blobs` & `--blob-cache-max-bytes`):**
+  Because `.git/objects/pack/` remains the canonical source of truth,
+  `blobs/<xx>/<oid>` is a pure rebuildable L2 cache.
+  [`projgit_core::prune_uncompressed_blobs`](../../crates/projgit-core/src/maintenance.rs)
+  (and [`ObjectStore::prune_uncompressed_blobs`](../../crates/projgit-core/src/object_store.rs))
+  scans only the 2-hex-character fanout directories (`00`..`ff`) under
+  `<git-dir>/blobs/` — never touching `<git-dir>/blobs/headers.bin`,
+  `<git-dir>/blobs/tmp/`, or `.git/objects/pack/` — and unlinks the
+  oldest files by `atime`/`mtime` until the remaining bytes fit within
+  `max_bytes`. `projgitd` enforces this budget automatically on each
+  background maintenance tick when `--blob-cache-max-bytes <BYTES>` (or
+  `PROJGIT_BLOB_CACHE_MAX_BYTES`) is set alongside
+  `--maintenance-interval-secs`. Even if a blob is currently mapped via
+  `FOPEN_PASSTHROUGH` or `virtio-fs` `DAX`, POSIX `unlink` keeps the
+  open inode alive until the last file descriptor closes, and any future
+  read transparently re-inflates the blob from `.git/objects/pack/`.
