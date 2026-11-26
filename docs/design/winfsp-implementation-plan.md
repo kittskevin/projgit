@@ -1,244 +1,163 @@
-# Design: WinFsp Implementation Plan
+# Design: WinFsp Backend & Licensing (`projgit-winfsp`)
+
+> Status: **Shipped (`crates/projgit-winfsp`)**. Implements Windows filesystem
+> mounting for `projgit mount` and `projgit mount-multi` using self-contained,
+> `MIT OR Apache-2.0` WinFsp C ABI bindings dynamically loaded from
+> `winfsp-x64.dll` under the **WinFsp FLOSS Exception**.
+
+## 1. Licensing & The WinFsp FLOSS Exception
+
+Third-party Rust wrapper crates such as `winfsp` / `winfsp-sys` (`winfsp-rs`)
+are licensed under pure **GPL-3.0** with no linking exception, which would force
+any binary linking them to be distributed under GPL-3.0.
+
+By contrast, **WinFsp itself (`winfsp-x64.dll`)** is licensed by Bill
+Zissimopoulos under **GPLv3 with the WinFsp FLOSS Exception**
+([`License.txt`](https://github.com/winfsp/winfsp/blob/master/License.txt)):
+
+> As a special exception to the terms and conditions of version 3.0 of the GPL,
+> the Copyright Holder grants You the right to Distribute Covered Software work
+> tied to a Derivative Work that is distributed under an Open Source license,
+> without the Derivative Work becoming subject to the terms and conditions of
+> the GPL, provided that all of the following criteria are met:
+>
+> 1. You obey the GPL in all respects for the Covered Software and the custom
+>    portions you have written for the Covered Software, except for the
+>    identifiable sections of the Derivative Work which are independent and not
+>    derived from the Covered Software, and which can reasonably be considered
+>    independent and separate works in themselves,
+> 2. You distribute all identifiable sections of the Derivative Work under one or
+>    more FSF Free Software or OSI Open Source licenses,
+> 3. You display the following notice in the Derivative Work's user-interface and
+>    user-facing documentation:
+>    *"WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos"*,
+>    together with a URL/link to the Covered Software's distribution web site,
+>    and
+> 4. You do not link or distribute the Derivative Work with other software that
+>    is not distributed under an FSF Free Software or OSI Open Source license.
+
+Because `projgit-winfsp` uses its own clean-room FFI definitions (`src/ffi.rs`)
+for the WinFsp C ABI (`<winfsp/fsctl.h>` / `<winfsp/winfsp.h>`) and dynamically
+loads unmodified `winfsp-x64.dll` at runtime:
+
+1. **Workspace license remains `MIT OR Apache-2.0`** across every crate in the
+   repository (`Cargo.toml`, `LICENSE-MIT`, `LICENSE-APACHE`).
+2. **Attribution notice (`projgit_winfsp::WINFSP_FLOSS_NOTICE`)** is displayed in
+   the CLI (`projgit --help` and `projgit mount --help`) and in `README.md`:
+   > WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+   > (<https://github.com/winfsp/winfsp>)
+3. **Downstream note**: binaries linking `winfsp-x64.dll` under the WinFsp FLOSS
+   Exception must remain under an FSF/OSI license and may not be combined with
+   closed-source proprietary software without a commercial WinFsp license.
+
+## 2. Root Cause of the Historical Phase 3c Spike Failure
+
+In the earlier Phase 3c spike (`spikes/winfsp-helloworld`), `FspFileSystemCreate`,
+`FspFileSystemSetMountPoint`, and `FspFileSystemStartDispatcher` all returned
+`STATUS_SUCCESS`, yet `dir Z:\` immediately failed with `Incorrect function`
+(`STATUS_INVALID_DEVICE_REQUEST`) without invoking a single Rust callback.
+
+Inspecting WinFsp's `src/dll/fs.c` and `<winfsp/fsctl.h>` revealed two exact root
+causes (neither of which required `FspServiceLoop`):
+
+1. **`FspFileSystemCreate` gates `Operations[FspFsctlTransactCreateKind]` on
+   four callbacks simultaneously**:
+   In `src/dll/fs.c`, `FspFileSystemCreate` only wires up `FspFileSystemOpCreate`
+   (which services every `IRP_MJ_CREATE` / file or directory open) if
+   `GetSecurityByName`, `Create` (or `CreateEx`), `Open`, **and** `Overwrite`
+   (or `OverwriteEx`) are **all non-NULL** in `FSP_FILE_SYSTEM_INTERFACE`. Even
+   when `VolumeParams.ReadOnlyVolume = 1`, leaving `Create` and `Overwrite` as
+   `None` caused `FspFileSystemCreate` to leave
+   `FileSystem->Operations[FspFsctlTransactCreateKind] == NULL`, so the WinFsp
+   user-mode dispatcher rejected every `IRP_MJ_CREATE` with
+   `STATUS_INVALID_DEVICE_REQUEST` (`Incorrect function`) before calling into
+   Rust. Registering read-only `Create` and `Overwrite` callbacks that return
+   `STATUS_MEDIA_WRITE_PROTECTED` (`0xC00000A2`) satisfies `FspFileSystemCreate`
+   and routes all read opens to `Open`.
+2. **`STATUS_OBJECT_NAME_NOT_FOUND` constant value**:
+   The spike had defined `STATUS_OBJECT_NAME_NOT_FOUND` as `0xC000000F`
+   (`STATUS_NO_SUCH_FILE`) instead of `0xC0000034`
+   (`STATUS_OBJECT_NAME_NOT_FOUND`).
+
+## 3. Shipped `crates/projgit-winfsp` Architecture
+
+### 3.1 Audited C ABI & Dynamic Loader (`src/ffi.rs`)
+
+- **Zero build-time SDK / `libclang` requirement**: Instead of running `bindgen`
+  or linking against `winfsp-x64.lib` at compile time, `src/ffi.rs` defines the
+  exact `#[repr(C)]` WinFsp 2.x structs with compile-time size assertions
+  verified against `<winfsp/fsctl.h>` and `<winfsp/winfsp.h>`:
+  - `FspFsctlVolumeParams` (`504` bytes)
+  - `FspFsctlVolumeInfo` (`88` bytes)
+  - `FspFsctlFileInfo` (`72` bytes)
+  - `FspFsctlDirInfoHeader` (`104` bytes)
+  - `FspFileSystemInterface` (`512` bytes, 64 pointer slots)
+  - `FspFileSystem` (`792` bytes, `UserContext` at offset `280`)
+- **Runtime DLL discovery (`WinFspApi::load`)**: Resolves `winfsp-x64.dll` via
+  `LoadLibraryW` / `GetProcAddress`, checking `PATH`, the WinFsp registry key
+  `HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir`,
+  `%ProgramFiles(x86)%\WinFsp\bin\winfsp-x64.dll`, and
+  `%ProgramFiles%\WinFsp\bin\winfsp-x64.dll`.
+- **Per-user SDDL `SECURITY_DESCRIPTOR` (`CurrentUserSecurityDescriptor`)**:
+  Queries the current process token SID (`GetTokenInformation(..., TokenUser)`)
+  and builds a self-relative security descriptor via
+  `ConvertStringSecurityDescriptorToSecurityDescriptorW` with SDDL
+  `O:<sid>G:<sid>D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<sid>)(A;;FRFX;;;WD)`.
+  Because every projected file and directory reports the mounting user as owner,
+  Git for Windows's `safe.directory` ownership check passes out of the box.
+- **Existing empty directory mountpoint support (`RawWinFspMount::start`)**:
+  WinFsp's `FspFileSystemSetMountPoint` creates a directory reparse point and
+  requires the target directory path not to exist yet. To match Linux/macOS FUSE
+  ergonomics (where users pass an existing empty directory to `projgit mount`),
+  `RawWinFspMount::start` detects an existing empty directory, removes it just
+  before `FspFileSystemSetMountPoint`, and restores the empty directory when the
+  mount is dropped.
+
+### 3.2 Native Windows Symlink Reparse Points (`src/symlinks.rs`)
+
+- Implements `classify_symlink_target` over any `projgit_core::FsProvider` to
+  classify mode-`0120000` git symlink entries as `SymlinkKind::File`,
+  `SymlinkKind::Directory`, or `SymlinkKind::DanglingAssumeFile` (handling `..`,
+  root-escape bounds, chained symlinks, and symlink loops up to 16 hops).
+- Builds and parses standard Windows `IO_REPARSE_TAG_SYMLINK` (`0xA000000C`)
+  `REPARSE_DATA_BUFFER` payloads (`build_symlink_reparse_buffer` /
+  `parse_symlink_reparse_buffer`) with `SYMLINK_FLAG_RELATIVE` (`0x00000001`)
+  and `\`-normalized UTF-16LE `SubstituteName` / `PrintName`.
+- Supports both `SymlinkMode::NativeReparse` (default; sets
+  `FILE_ATTRIBUTE_DIRECTORY` on directory symlinks so Windows APIs and shells
+  traverse both file and directory symlinks without requiring
+  `SeCreateSymbolicLinkPrivilege`) and `SymlinkMode::PlainFile`.
+
+### 3.3 `FsProvider` Adapter & Direct L2 Host-File Reads (`src/adapter.rs`)
+
+- `ProjgitWinFsp<P>` implements `WinFspBackend` over any `P: FsProvider`.
+- **Direct host-file read fast path (`WinFspReadStats::host_file_reads`)**:
+  During `Open`, `ProjgitWinFsp` calls `FsProvider::backing_file(ino)`. When the
+  inode is backed by a host file on disk — either an uncompressed L2 cached blob
+  (`<git-dir>/blobs/<xx>/<oid>`) or an isolated `.git/objects/pack/*.pack`
+  `SyntheticEntry::HostFile` — the open handle stores `Arc<std::fs::File>` and
+  serves `Read` directly via `std::os::windows::fs::FileExt::seek_read`
+  (thread-safe positioned `ReadFile` with an `OVERLAPPED` offset), bypassing
+  `FsProvider::read` and buffer allocation on warm reads.
+
+## 4. Verification (`crates/projgit-winfsp/tests/winfsp_mount.rs`)
+
+Verified on Windows 11 with WinFsp 2.1 (`cargo test -p projgit-winfsp` and
+`cargo test -p projgit-cli`):
+
+- `winfsp_dll_loads_and_reports_version` — dynamically loads `winfsp-x64.dll`
+  and verifies `FspVersion`.
+- `in_memory_mount_serves_files_dirs_and_native_symlinks` — mounts an
+  `InMemoryFsProvider`, verifies root/nested file reads, directory listings,
+  read-only write rejection, `fs::symlink_metadata` / `fs::read_link`, and
+  transparent traversal of both file and directory symlinks.
+- `plain_file_symlink_mode_serves_symlink_as_regular_file` — verifies
+  `SymlinkMode::PlainFile` fallback.
+- `mount_onto_existing_empty_directory_succeeds_and_restores_dir_on_unmount` —
+  verifies Linux/macOS-style mounting onto a pre-existing empty directory.
+- `real_git_projection_mounts_serves_l2_host_files_and_passes_git_cli` — mounts
+  a real `ProjectionFsProvider` + `a1_plus_isolated_overlay`, verifies L2
+  uncompressed blob `host_file_reads >= 1`, and runs `git rev-parse HEAD`,
+  `git log -n 1 --oneline`, and `git --no-optional-locks status --short` inside
+  the mounted WinFsp projection without `safe.directory` overrides.
 
-> Status: **deferred implementation plan**. This document replaces the tracked
-> WinFsp spike crates. It preserves the useful findings from the Phase 0c and
-> Phase 3c Windows work without keeping unfinished prototype code in the public
-> repo surface.
-
-## 1. Current Decision
-
-Windows mounting is deferred. The working product surface is currently the
-Linux/macOS FUSE backend. The `projgit-winfsp` crate remains a documented stub
-so the workspace shape still reflects the intended backend split, but it should
-not be advertised as functional.
-
-When Windows work resumes, implement it in `crates/projgit-winfsp/`, not in a
-new spike crate.
-
-## 2. What The Removed Spikes Proved
-
-### 2.1 Reparse-Point Behavior Works
-
-The Phase 0c spike used WinFsp's bundled `memfs-x64.exe` sample to validate
-kernel and tool behavior for symlinks. It did not ship Rust code.
-
-Confirmed on Windows 11 with WinFsp 2.1.25156:
-
-- WinFsp-served `IO_REPARSE_TAG_SYMLINK` entries are traversed by `cmd.exe`,
-  PowerShell, Python, and MSVC without the reading user holding
-  `SeCreateSymbolicLinkPrivilege`.
-- File and directory symlink kind is honored end to end.
-- Relative target strings round-trip verbatim through `os.readlink`.
-- Git stores those links as mode `120000` with the target string as blob
-  content.
-
-Important follow-up:
-
-- Modern Git for Windows enforces `safe.directory`. A projgit WinFsp backend
-  must report the calling user as owner in `get_security_by_name` and
-  `get_security`, not `BUILTIN\\Administrators`.
-
-This confirms the default policy in [windows-symlinks.md](windows-symlinks.md):
-`Auto` should prefer native reparse points and fall back to text-marker mode only
-when native support is unavailable.
-
-### 2.2 Hand-Rolled FFI Is Viable But Dispatch Is Blocked
-
-The Phase 3c hello-world spike asked whether projgit could bind WinFsp directly
-with `bindgen` and avoid the GPL-3.0 `winfsp-rs` crate. The answer was partial.
-
-Worked:
-
-- `bindgen` against a narrow `wrapper.h` containing `<windows.h>` and
-  `<winfsp/winfsp.h>`.
-- Allowlisted WinFsp symbols via `allowlist_function("Fsp.*")` and
-  `allowlist_type("FSP_.*")`.
-- Manual `PNTSTATUS` typedef in `wrapper.h`.
-- Link and delay-load against `winfsp-x64.dll`.
-- Bindgen bitfield setters for `FSP_FSCTL_VOLUME_PARAMS`.
-- `FspFileSystemCreate`, `FspFileSystemSetMountPoint`, and
-  `FspFileSystemStartDispatcher` all returned success.
-- `fsptool-x64.exe lsvol` showed the drive mounted.
-
-Did not work:
-
-- `dir Z:\` returned `Incorrect function`.
-- File-based tracing showed no callbacks were invoked.
-- The IRP was rejected before reaching the user-mode dispatcher.
-
-Most likely blocker:
-
-- The production backend should use the `FspServiceCreate` /
-  `FspServiceLoop` / `FspServiceStop` lifecycle used by WinFsp's C samples
-  instead of the bare `FspFileSystemStartDispatcher` path.
-
-## 3. FFI Recipe To Recreate
-
-### 3.1 Tooling
-
-Windows host requirements:
-
-```powershell
-winget install WinFsp.WinFsp
-winget install LLVM.LLVM
-```
-
-Install WinFsp developer features with `ADDLOCAL=ALL` so headers, import libs,
-and samples are present.
-
-Runtime environment:
-
-```powershell
-$env:PATH = 'C:\Program Files (x86)\WinFsp\bin;' + $env:PATH
-$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
-```
-
-### 3.2 wrapper.h Shape
-
-```c
-#include <windows.h>
-
-typedef LONG NTSTATUS;
-typedef NTSTATUS *PNTSTATUS;
-
-#include <winfsp/winfsp.h>
-```
-
-### 3.3 build.rs Shape
-
-The production backend should generate bindings in `build.rs` with a narrow
-allowlist:
-
-```rust
-bindgen::Builder::default()
-    .header("wrapper.h")
-    .allowlist_function("Fsp.*")
-    .allowlist_type("FSP_.*")
-    .allowlist_var("FSP_.*")
-    .generate()?;
-```
-
-Linker configuration:
-
-```rust
-println!("cargo:rustc-link-search=native=C:\\Program Files (x86)\\WinFsp\\lib");
-println!("cargo:rustc-link-lib=dylib=winfsp-x64");
-println!("cargo:rustc-link-arg=/DELAYLOAD:winfsp-x64.dll");
-println!("cargo:rustc-link-arg=delayimp.lib");
-```
-
-Before debugging filesystem behavior, add startup assertions for struct sizes
-and bitfield positions. A tiny C helper that prints `sizeof` and byte offsets is
-worth the time.
-
-## 4. Implementation Track
-
-### 4.1 Unblock The Hello-World Mount
-
-Goal: `dir Z:\` invokes Rust callbacks and shows one read-only file.
-
-Tasks:
-
-1. Read WinFsp's C `memfs` and `passthrough` samples. Treat them as the source
-   of truth for service startup and callback registration.
-2. Port the `FspService*` lifecycle into `crates/projgit-winfsp`.
-3. Keep the filesystem trivial: root directory plus `hello.txt`.
-4. Add file-based tracing before every callback return.
-5. Validate with `fsptool-x64.exe lsvol`, `cmd /c dir Z:\`, and
-   `type Z:\hello.txt`.
-
-Exit criteria:
-
-- The drive mounts.
-- Directory enumeration reaches Rust callback code.
-- Reading one file works.
-- Dropping or stopping the service unmounts cleanly.
-
-### 4.2 Adapt `FsProvider`
-
-Once hello-world dispatch works, replace the hard-coded tree with an adapter
-over `projgit_core::FsProvider`.
-
-Operations to map first:
-
-- `GetVolumeInfo`
-- `GetSecurityByName`
-- `Open`
-- `GetFileInfo`
-- `ReadDirectory`
-- `Read`
-- `GetReparsePointByName` / readlink equivalent
-
-Error mapping should mirror `projgit-fuse`: `NotFound` to not-found status,
-`NotADirectory` to not-directory status, and unexpected I/O to a generic I/O
-failure.
-
-### 4.3 Implement Symlinks
-
-Use the classifier in [windows-symlinks.md](windows-symlinks.md):
-
-```rust
-enum SymlinkKind {
-    File,
-    Directory,
-    DanglingAssumeFile,
-}
-```
-
-Classifier inputs:
-
-- Commit OID.
-- Link path.
-- Raw target string from the mode-`120000` blob.
-
-Rules:
-
-- Relative in-tree target resolving to a tree -> directory symlink.
-- Relative in-tree target resolving to a blob -> file symlink.
-- Cycles, escapes, missing targets, or unsupported paths -> file symlink plus a
-  diagnostic.
-- Cache by `(commit_oid, link_path, target_string)`.
-
-### 4.4 Ownership And Git Compatibility
-
-Before calling Windows support usable, implement per-user security descriptors.
-Git for Windows should not report `fatal: detected dubious ownership in
-repository` when run inside a future synthesized `.git/` mount.
-
-Validation:
-
-```powershell
-git -C Z:\ rev-parse --show-toplevel
-git -C Z:\ status
-```
-
-The exact commands may evolve once `.git/` synthesis lands.
-
-## 5. Test Matrix
-
-Minimum manual matrix for Phase 3d:
-
-```text
-cmd.exe:      dir, type, cd into directory symlink
-PowerShell:  Get-Item .LinkType, Get-Content
-Python:      os.path.islink, os.readlink, open, os.listdir
-MSVC:        cl.exe compiling through a symlinked header
-Git:         safe.directory behavior once .git synthesis exists
-```
-
-Automated tests should start with pure Rust unit tests for path classification
-and callback error mapping. Full WinFsp integration tests can be Windows-only and
-ignored by default until CI has the required driver installed.
-
-## 6. Resume Checklist
-
-1. Recreate the FFI binding scaffold in `crates/projgit-winfsp`.
-2. Port WinFsp sample service lifecycle, not the bare dispatcher path.
-3. Prove hello-world callbacks receive IRPs.
-4. Add struct-layout assertions.
-5. Implement the `FsProvider` adapter.
-6. Implement symlink classifier and reparse-point output.
-7. Implement per-user ownership.
-8. Wire `projgit mount` on Windows.
-9. Update [../handoff.md](../implementation/handoff.md) and [../../README.md](../../README.md)
-   only after the backend works end to end.

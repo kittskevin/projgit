@@ -31,12 +31,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+/// Attribution notice required by the WinFsp FLOSS Exception in user-facing
+/// interfaces and documentation.
+const WINFSP_FLOSS_HELP: &str = "On Windows, filesystem mounting uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos (https://github.com/winfsp/winfsp) under the WinFsp FLOSS Exception.";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "projgit",
     version = projgit_core::VERSION,
     about = "Lazy-fetch git projections as read-only filesystem mounts.",
     long_about = None,
+    after_help = WINFSP_FLOSS_HELP,
 )]
 struct Cli {
     /// Increase log verbosity. Repeat for more (`-v` info, `-vv` debug).
@@ -66,6 +71,7 @@ enum Command {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(after_help = WINFSP_FLOSS_HELP)]
 struct MountArgs {
     /// Source repository: a URL (https://, git://, ssh://, git@...) or
     /// a path to a local checkout / bare repository.
@@ -483,7 +489,7 @@ fn init_logging(verbose: u8) {
 /// network-free without blocking the mount. Best-effort: anything not
 /// warmed self-heals on the on-demand path. Mirrors the daemon's
 /// `handle_mount` warm for the standalone and sidecar mount paths.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn spawn_tree_warm<F>(
     hydrating: &std::sync::Arc<projgit_core::HydratingObjectStore<F>>,
     projection: &projgit_core::Projection,
@@ -745,22 +751,436 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
     run_mount(provider, &mp, &cfg, print_stats)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn cmd_mount(_args: MountArgs) -> Result<()> {
-    bail!(
-        "`projgit mount` is not yet supported on this platform. \
-         Linux/macOS use FUSE (projgit-fuse); Windows support is \
-         deferred to the planned projgit-winfsp backend."
+#[cfg(target_os = "windows")]
+fn cmd_mount(args: MountArgs) -> Result<()> {
+    #[cfg(feature = "gvfs-fetcher")]
+    use projgit_core::GvfsFetcher;
+    use projgit_core::{
+        clone::{git_dir_for, partial_clone, CloneOptions},
+        GitCliFetcher, HydratingObjectStore, NoopFetcher, ObjectStore, ProjectionFsProvider,
+    };
+    use projgit_winfsp::MountConfig;
+    use std::sync::Arc;
+
+    if args.daemon_socket.is_some() {
+        bail!("--daemon-socket is only supported on Linux and macOS (`projgitd` Unix socket)");
+    }
+    if args.writable_scratch.is_some() {
+        bail!("--writable-scratch is only supported on Linux (`overlayfs`)");
+    }
+    if args.mountpoint.exists() && !args.mountpoint.is_dir() {
+        bail!(
+            "mountpoint {} exists and is not a directory",
+            args.mountpoint.display()
+        );
+    }
+
+    let (git_dir, source_is_url) = if looks_like_url(&args.source) {
+        let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+        let dest = cache_dir.join(cache_subdir_for_url(&args.source));
+        if !dest.exists() {
+            let depth_note = match args.depth {
+                Some(n) => format!(" (--depth={n})"),
+                None => String::new(),
+            };
+            eprintln!(
+                "projgit: partial-cloning {} into {}{}",
+                args.source,
+                dest.display(),
+                depth_note,
+            );
+            std::fs::create_dir_all(&cache_dir)
+                .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+            let mut opts = CloneOptions::new(args.source.clone(), dest.clone());
+            if let Some(n) = args.depth {
+                if n == 0 {
+                    bail!("--depth 0 is not supported; git rejects --depth=0");
+                }
+                opts = opts.with_depth(n);
+            }
+            partial_clone(&opts).with_context(|| format!("cloning {}", args.source))?;
+        } else {
+            eprintln!("projgit: reusing cached clone at {}", dest.display());
+        }
+        (git_dir_for(&dest), true)
+    } else {
+        let p = PathBuf::from(&args.source);
+        if !p.exists() {
+            bail!("source path {} does not exist", p.display());
+        }
+        (git_dir_for(&p), false)
+    };
+
+    let store = Arc::new(
+        ObjectStore::open(&git_dir)
+            .with_context(|| format!("opening object store at {}", git_dir.display()))?,
     );
+    let projection = build_projection(&args, &store)?;
+    let _remote_hint = &args.remote;
+    let overlay = build_root_overlay(&args, &projection, &store, &git_dir)?;
+    let cfg = MountConfig::default();
+    let mp = args.mountpoint.clone();
+    let print_stats = args.stats;
+
+    if args.offline || !source_is_url {
+        if args.fetcher != FetcherChoice::Git {
+            bail!("--fetcher gvfs requires a URL source and cannot be combined with --offline");
+        }
+        let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
+        spawn_tree_warm(&hydrating, &projection);
+        let provider = Arc::new(
+            ProjectionFsProvider::new(projection, hydrating, overlay, /* projection_id */ 1)
+                .context("building ProjectionFsProvider")?,
+        );
+        run_mount_windows(provider, &mp, &cfg, print_stats)
+    } else {
+        match args.fetcher {
+            FetcherChoice::Git => {
+                let fetcher = GitCliFetcher::open(store.clone())
+                    .context("opening GitCliFetcher (needs `git` on PATH)")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                spawn_tree_warm(&hydrating, &projection);
+                let provider = Arc::new(
+                    ProjectionFsProvider::new(
+                        projection, hydrating, overlay, /* projection_id */ 1,
+                    )
+                    .context("building ProjectionFsProvider")?,
+                );
+                run_mount_windows(provider, &mp, &cfg, print_stats)
+            }
+            #[cfg(feature = "gvfs-fetcher")]
+            FetcherChoice::Gvfs => {
+                let gvfs_url = args
+                    .gvfs_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--fetcher gvfs requires --gvfs-url <URL>"))?;
+                let fetcher = match std::env::var("PROJGIT_GVFS_TOKEN") {
+                    Ok(token) if !token.is_empty() => {
+                        GvfsFetcher::with_bearer_token(store.clone(), gvfs_url, token)
+                    }
+                    _ => GvfsFetcher::open(store.clone(), gvfs_url),
+                }
+                .context("opening GvfsFetcher")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store, fetcher));
+                spawn_tree_warm(&hydrating, &projection);
+                let provider = Arc::new(
+                    ProjectionFsProvider::new(
+                        projection, hydrating, overlay, /* projection_id */ 1,
+                    )
+                    .context("building ProjectionFsProvider")?,
+                );
+                run_mount_windows(provider, &mp, &cfg, print_stats)
+            }
+        }
+    }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn cmd_mount_multi(_args: MountMultiArgs) -> Result<()> {
-    bail!(
-        "`projgit mount-multi` is not yet supported on this platform. \
-         Linux/macOS use FUSE (projgit-fuse); Windows support is \
-         deferred to the planned projgit-winfsp backend."
+#[cfg(target_os = "windows")]
+fn run_mount_windows<F>(
+    provider: std::sync::Arc<projgit_core::ProjectionFsProvider<F>>,
+    mountpoint: &std::path::Path,
+    config: &projgit_winfsp::MountConfig,
+    print_stats: bool,
+) -> Result<()>
+where
+    F: projgit_core::Fetcher + 'static,
+{
+    eprintln!(
+        "projgit: mounting at {} via WinFsp (Ctrl-C to unmount)",
+        mountpoint.display()
     );
+    let session = projgit_winfsp::mount_background(provider.clone(), mountpoint, config)
+        .with_context(|| format!("mounting at {} via WinFsp", mountpoint.display()))?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .context("installing Ctrl-C handler")?;
+    rx.recv().ok();
+
+    let winfsp_stats = session.read_stats();
+    eprintln!("projgit: unmounting…");
+    session.unmount();
+
+    if print_stats {
+        let store = provider.store().store();
+        let t = store.tree_cache_stats();
+        let h = store.header_cache_stats();
+        let dh = store.disk_header_cache_stats();
+        let b = store.blob_cache_stats();
+        let d = store.disk_blob_cache_stats();
+        let p = provider.prefetch_stats();
+        eprintln!(
+            "projgit: tree cache    hits={} misses={} inserts={} evictions={} len={}/{}",
+            t.hits, t.misses, t.inserts, t.evictions, t.len, t.capacity,
+        );
+        eprintln!(
+            "projgit: header cache  hits={} misses={} inserts={} evictions={} len={}/{}",
+            h.hits, h.misses, h.inserts, h.evictions, h.len, h.capacity,
+        );
+        eprintln!(
+            "projgit: disk headers  hits={} misses={} inserts={} entries={} write_errors={}",
+            dh.hits, dh.misses, dh.inserts, dh.entries, dh.write_errors,
+        );
+        eprintln!(
+            "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
+            b.hits,
+            b.misses,
+            b.inserts,
+            b.evictions,
+            b.skipped_too_large,
+            b.bytes_used,
+            b.capacity_bytes,
+        );
+        eprintln!(
+            "projgit: disk blobs    hits={} misses={} inserts={} write_errors={}",
+            d.hits, d.misses, d.inserts, d.write_errors,
+        );
+        eprintln!(
+            "projgit: winfsp reads  host_file_reads={} provider_reads={}",
+            winfsp_stats.host_file_reads, winfsp_stats.provider_reads,
+        );
+        eprintln!(
+            "projgit: prefetch (T1) posted={} dropped={} batches={} resolved={} headers={} failed={} blobs_warmed={} blobs_skipped={}",
+            p.posted,
+            p.dropped,
+            p.batches_sent,
+            p.oids_resolved,
+            p.headers_published,
+            p.oids_failed,
+            p.blobs_warmed,
+            p.blobs_skipped,
+        );
+    }
+
+    eprintln!("projgit: unmounted.");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn cmd_mount_multi(args: MountMultiArgs) -> Result<()> {
+    #[cfg(feature = "gvfs-fetcher")]
+    use projgit_core::GvfsFetcher;
+    use projgit_core::{
+        clone::{git_dir_for, partial_clone, CloneOptions},
+        GitCliFetcher, HydratingObjectStore, NoopFetcher, ObjectStore,
+    };
+    use std::sync::Arc;
+
+    if args.mounts.is_empty() {
+        bail!("at least one --mount REF=PATH is required");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for spec in &args.mounts {
+        if spec.mountpoint.exists() && !spec.mountpoint.is_dir() {
+            bail!(
+                "mountpoint {} exists and is not a directory",
+                spec.mountpoint.display()
+            );
+        }
+        if !seen.insert(spec.mountpoint.clone()) {
+            bail!(
+                "mountpoint {} listed more than once",
+                spec.mountpoint.display()
+            );
+        }
+    }
+
+    let (git_dir, source_is_url) = if looks_like_url(&args.source) {
+        let cache_dir = resolve_cache_dir(args.cache_dir.as_deref())?;
+        let dest = cache_dir.join(cache_subdir_for_url(&args.source));
+        if !dest.exists() {
+            let depth_note = match args.depth {
+                Some(n) => format!(" (--depth={n})"),
+                None => String::new(),
+            };
+            eprintln!(
+                "projgit: partial-cloning {} into {}{}",
+                args.source,
+                dest.display(),
+                depth_note,
+            );
+            std::fs::create_dir_all(&cache_dir)
+                .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+            let mut opts = CloneOptions::new(args.source.clone(), dest.clone());
+            if let Some(n) = args.depth {
+                if n == 0 {
+                    bail!("--depth 0 is not supported; git rejects --depth=0");
+                }
+                opts = opts.with_depth(n);
+            }
+            partial_clone(&opts).with_context(|| format!("cloning {}", args.source))?;
+        } else {
+            eprintln!("projgit: reusing cached clone at {}", dest.display());
+        }
+        (git_dir_for(&dest), true)
+    } else {
+        let p = PathBuf::from(&args.source);
+        if !p.exists() {
+            bail!("source path {} does not exist", p.display());
+        }
+        (git_dir_for(&p), false)
+    };
+
+    let store = Arc::new(
+        ObjectStore::open(&git_dir)
+            .with_context(|| format!("opening object store at {}", git_dir.display()))?,
+    );
+
+    let _remote_hint = &args.remote;
+    if args.offline || !source_is_url {
+        if args.fetcher != FetcherChoice::Git {
+            bail!("--fetcher gvfs requires a URL source and cannot be combined with --offline");
+        }
+        let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), NoopFetcher));
+        run_mount_multi_windows(store, hydrating, &args, &git_dir)
+    } else {
+        match args.fetcher {
+            FetcherChoice::Git => {
+                let fetcher = GitCliFetcher::open(store.clone())
+                    .context("opening GitCliFetcher (needs `git` on PATH)")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
+                run_mount_multi_windows(store, hydrating, &args, &git_dir)
+            }
+            #[cfg(feature = "gvfs-fetcher")]
+            FetcherChoice::Gvfs => {
+                let gvfs_url = args
+                    .gvfs_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--fetcher gvfs requires --gvfs-url <URL>"))?;
+                let fetcher = match std::env::var("PROJGIT_GVFS_TOKEN") {
+                    Ok(token) if !token.is_empty() => {
+                        GvfsFetcher::with_bearer_token(store.clone(), gvfs_url, token)
+                    }
+                    _ => GvfsFetcher::open(store.clone(), gvfs_url),
+                }
+                .context("opening GvfsFetcher")?;
+                let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), fetcher));
+                run_mount_multi_windows(store, hydrating, &args, &git_dir)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_mount_multi_windows<F>(
+    store: std::sync::Arc<projgit_core::ObjectStore>,
+    hydrating: std::sync::Arc<projgit_core::HydratingObjectStore<F>>,
+    args: &MountMultiArgs,
+    git_dir: &Path,
+) -> Result<()>
+where
+    F: projgit_core::Fetcher + 'static,
+{
+    use projgit_core::{Projection, ProjectionFsProvider};
+    use projgit_winfsp::{MountConfig, WinFspMountSession};
+    use std::sync::Arc;
+
+    let cfg = MountConfig::default();
+    let mut sessions: Vec<WinFspMountSession<ProjectionFsProvider<F>>> =
+        Vec::with_capacity(args.mounts.len());
+    let mut providers: Vec<Arc<ProjectionFsProvider<F>>> = Vec::with_capacity(args.mounts.len());
+
+    for (idx, spec) in args.mounts.iter().enumerate() {
+        let projection_id = (idx + 1) as u64;
+        let projection = Projection::Ref(spec.ref_name.clone());
+        let overlay = build_overlay_no_subtree(
+            args.no_dotgit,
+            args.isolated_dotgit,
+            &projection,
+            &store,
+            git_dir,
+        )
+        .with_context(|| format!("building overlay for {}", spec.ref_name))?;
+        let provider = Arc::new(
+            ProjectionFsProvider::new(projection, hydrating.clone(), overlay, projection_id)
+                .with_context(|| {
+                    format!(
+                        "building ProjectionFsProvider for {} -> {}",
+                        spec.ref_name,
+                        spec.mountpoint.display()
+                    )
+                })?,
+        );
+        eprintln!(
+            "projgit: mounting {} at {} via WinFsp (projection_id={})",
+            spec.ref_name,
+            spec.mountpoint.display(),
+            projection_id
+        );
+        let session = projgit_winfsp::mount_background(provider.clone(), &spec.mountpoint, &cfg)
+            .with_context(|| format!("mounting at {} via WinFsp", spec.mountpoint.display()))?;
+        sessions.push(session);
+        providers.push(provider);
+    }
+
+    eprintln!(
+        "projgit: {} projection(s) mounted via WinFsp; Ctrl-C to unmount all",
+        sessions.len()
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .context("installing Ctrl-C handler")?;
+    rx.recv().ok();
+
+    eprintln!("projgit: unmounting {} session(s)…", sessions.len());
+    drop(sessions);
+
+    if args.stats {
+        let s = store.as_ref();
+        let t = s.tree_cache_stats();
+        let h = s.header_cache_stats();
+        let dh = s.disk_header_cache_stats();
+        let b = s.blob_cache_stats();
+        let d = s.disk_blob_cache_stats();
+        eprintln!(
+            "projgit: tree cache    hits={} misses={} inserts={} evictions={} len={}/{}",
+            t.hits, t.misses, t.inserts, t.evictions, t.len, t.capacity,
+        );
+        eprintln!(
+            "projgit: header cache  hits={} misses={} inserts={} evictions={} len={}/{}",
+            h.hits, h.misses, h.inserts, h.evictions, h.len, h.capacity,
+        );
+        eprintln!(
+            "projgit: disk headers  hits={} misses={} inserts={} entries={} write_errors={}",
+            dh.hits, dh.misses, dh.inserts, dh.entries, dh.write_errors,
+        );
+        eprintln!(
+            "projgit: blob cache    hits={} misses={} inserts={} evictions={} skipped_too_large={} bytes={}/{}",
+            b.hits, b.misses, b.inserts, b.evictions, b.skipped_too_large,
+            b.bytes_used, b.capacity_bytes,
+        );
+        eprintln!(
+            "projgit: disk blobs    hits={} misses={} inserts={} write_errors={}",
+            d.hits, d.misses, d.inserts, d.write_errors,
+        );
+        for (provider, spec) in providers.iter().zip(args.mounts.iter()) {
+            let p = provider.prefetch_stats();
+            eprintln!(
+                "projgit: prefetch ({:<20}) posted={} dropped={} batches={} resolved={} headers={} failed={} blobs_warmed={} blobs_skipped={}",
+                spec.ref_name,
+                p.posted, p.dropped, p.batches_sent, p.oids_resolved, p.headers_published, p.oids_failed,
+                p.blobs_warmed, p.blobs_skipped,
+            );
+        }
+    }
+
+    eprintln!("projgit: unmounted all.");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn cmd_mount(_args: MountArgs) -> Result<()> {
+    bail!("`projgit mount` is only supported on Linux, macOS, and Windows.");
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn cmd_mount_multi(_args: MountMultiArgs) -> Result<()> {
+    bail!("`projgit mount-multi` is only supported on Linux, macOS, and Windows.");
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,7 +1874,9 @@ fn resolve_cache_dir(explicit: Option<&std::path::Path>) -> Result<PathBuf> {
         return Ok(PathBuf::from(xdg).join("projgit"));
     }
     let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow!("HOME not set; pass --cache-dir explicitly"))?;
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .ok_or_else(|| anyhow!("HOME/USERPROFILE not set; pass --cache-dir explicitly"))?;
     Ok(PathBuf::from(home).join(".cache").join("projgit"))
 }
 
@@ -1886,6 +2308,37 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cli_help_includes_winfsp_floss_exception_notice() {
+        use clap::CommandFactory;
+
+        let mut root_cmd = Cli::command();
+        let root_help = root_cmd.render_long_help().to_string();
+        assert!(
+            root_help
+                .contains("WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos"),
+            "root --help must include WinFsp copyright notice, got:\n{root_help}"
+        );
+        assert!(
+            root_help.contains("https://github.com/winfsp/winfsp"),
+            "root --help must include WinFsp URL, got:\n{root_help}"
+        );
+
+        let mount_cmd = root_cmd
+            .find_subcommand_mut("mount")
+            .expect("mount subcommand");
+        let mount_help = mount_cmd.render_long_help().to_string();
+        assert!(
+            mount_help
+                .contains("WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos"),
+            "mount --help must include WinFsp copyright notice, got:\n{mount_help}"
+        );
+        assert!(
+            mount_help.contains("https://github.com/winfsp/winfsp"),
+            "mount --help must include WinFsp URL, got:\n{mount_help}"
+        );
     }
 }
 

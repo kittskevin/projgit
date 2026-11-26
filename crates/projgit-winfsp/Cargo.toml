@@ -6,8 +6,13 @@ authors.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Planned WinFsp filesystem backend for projgit (Windows). Implementation deferred."
+description = "WinFsp filesystem backend for projgit (Windows)."
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[dependencies]
 projgit-core = { path = "../projgit-core", default-features = false }
-# Phase 3 will add: winfsp.
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+gix = { workspace = true }
+

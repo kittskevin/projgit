@@ -2024,6 +2024,7 @@ dependencies = [
  "projgit-daemon",
  "projgit-fuse",
  "projgit-virtiofs",
+ "projgit-winfsp",
 ]
 
 [[package]]
@@ -2089,7 +2090,10 @@ dependencies = [
 name = "projgit-winfsp"
 version = "0.0.0"
 dependencies = [
+ "gix",
  "projgit-core",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

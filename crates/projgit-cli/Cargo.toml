@@ -41,6 +41,9 @@ nix = { version = "0.29", features = ["user"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 projgit-virtiofs = { path = "../projgit-virtiofs" }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+projgit-winfsp = { path = "../projgit-winfsp" }
+
 [features]
 default = []
 gvfs-fetcher = ["projgit-core/gvfs-fetcher"]

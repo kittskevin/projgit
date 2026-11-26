@@ -61,10 +61,11 @@ architecture is in [docs/design/virtio-fs.md](docs/design/virtio-fs.md).
 ```
 
 Everything below the kernel boundary is OS-agnostic Rust. The FUSE adapter
-(`projgit-fuse`) and the planned WinFsp adapter (`projgit-winfsp`) both
-target the same `FsProvider` trait, so the projection engine, caches, and
-fetchers are tested once and shared across platforms. The shared CAS is the
-architectural lever: N mounts of the same commit pay the network cost once.
+(`projgit-fuse`), the `virtio-fs` adapter (`projgit-virtiofs`), and the Windows
+WinFsp adapter (`projgit-winfsp`) all target the same `FsProvider` trait, so
+the projection engine, caches, and fetchers are tested once and shared across
+platforms. The shared CAS is the architectural lever: N mounts of the same
+commit pay the network cost once.
 
 ## Measured Behavior
 
@@ -126,9 +127,9 @@ cargo run -p projgit-cli --example bench_mount --release -- --scenario l2-range
 
 ## Quick Start
 
-Requirements: Rust 1.85+, the system `git` executable on `PATH`, and (on
-Linux/macOS) `/dev/fuse` available. The included VS Code devcontainer sets
-all of this up.
+Requirements: Rust 1.85+, the system `git` executable on `PATH`, and either
+`/dev/fuse` (Linux/macOS) or [WinFsp](https://github.com/winfsp/winfsp)
+(Windows). The included VS Code devcontainer sets up a Linux + FUSE environment.
 
 ```sh
 cargo build --workspace
@@ -281,12 +282,12 @@ Pieces worth pointing at if you're skimming the code:
   Range reads (`read_blob_range`) use `pread` (`FileExt::read_at` / `seek_read`) for true
   `O(range)` slices without re-inflating pack entries, and
   [`FsProvider::backing_file`](crates/projgit-core/src/fs_provider.rs) hands
-  open host file descriptors to both **Linux 6.9+ `FOPEN_PASSTHROUGH`** in
-  [`projgit-fuse`](crates/projgit-fuse/src/adapter.rs) and **`virtio-fs` `DAX`
+  open host file descriptors/handles to **Linux 6.9+ `FOPEN_PASSTHROUGH`** in
+  [`projgit-fuse`](crates/projgit-fuse/src/adapter.rs), **`virtio-fs` `DAX`
   (`FUSE_SETUPMAPPING` / `SHMEM_MAP`)** in
-  [`projgit-virtiofs`](crates/projgit-virtiofs) so containers and microVMs map
-  the same host Page Cache pages directly into their address spaces with zero
-  ongoing FUSE upcalls ([docs/design/virtio-fs.md](docs/design/virtio-fs.md)).
+  [`projgit-virtiofs`](crates/projgit-virtiofs), and **Windows `FileExt::seek_read`
+  direct host-file reads** in [`projgit-winfsp`](crates/projgit-winfsp/src/adapter.rs)
+  ([docs/design/virtio-fs.md](docs/design/virtio-fs.md)).
 - **`composefs`-style kernel caching & `FUSE_READDIRPLUS`.**
   Both `projgit-fuse` and `projgit-virtiofs` enable `FOPEN_KEEP_CACHE` +
   `FOPEN_CACHE_DIR` and implement `FUSE_READDIRPLUS`
@@ -330,9 +331,14 @@ Pieces worth pointing at if you're skimming the code:
   fresh `git clone --filter=blob:none` baseline. Results land in
   [docs/bench/baseline.md](docs/bench/baseline.md) and the table above; a
   regression in any cell is visible to the next contributor.
-- **`#![forbid(unsafe_code)]`** across every crate, including the WinFsp stub.
-  The handful of unsafe surface that the eventual WinFsp backend will need
-  is isolated to that crate by design.
+- **Strict `unsafe_code` isolation & permissive WinFsp FFI.**
+  `#![forbid(unsafe_code)]` across `projgit-core`, `projgit-fuse`,
+  `projgit-virtiofs`, `projgit-daemon`, and `projgit-cli`, with
+  `#![deny(unsafe_code)]` in `projgit-winfsp` restricting `unsafe` to the
+  single audited WinFsp C ABI module
+  ([`crates/projgit-winfsp/src/ffi.rs`](crates/projgit-winfsp/src/ffi.rs)),
+  keeping the entire workspace `MIT OR Apache-2.0` under the WinFsp FLOSS
+  Exception without pulling in GPL-3.0 wrapper crates.
 
 ## Designed For One Workload Shape
 
@@ -418,13 +424,19 @@ What works today:
   `PROJGIT_BLOB_CACHE_MAX_BYTES`).
 - Linux/macOS FUSE backend through `fuser`, with file ownership echoed
   per-request so `git`'s `safe.directory` check passes without setup.
+- Windows WinFsp backend (`crates/projgit-winfsp`) using custom `MIT OR Apache-2.0`
+  C ABI bindings (`winfsp-x64.dll` loaded dynamically at runtime under the
+  WinFsp FLOSS Exception), native `IO_REPARSE_TAG_SYMLINK` reparse points,
+  current-user SDDL security descriptors for `git` `safe.directory`
+  compatibility, and direct host-file reads (`FileExt::seek_read`) for L2
+  uncompressed blobs and isolated `.git/objects/pack/*.pack` files.
 - `projgit-virtiofs` (`crates/projgit-virtiofs`) zero-`unsafe` FUSE 7.38 +
   `virtio-fs` `DAX` (`FUSE_SETUPMAPPING` / `FUSE_REMOVEMAPPING`) wire protocol
   engine, `DaxMapper` (`MemoryDaxWindow`), framed / Unix socket server, and
   (on Linux) `rust-vmm` `vhost-user-fs` virtqueue + `SHMEM_MAP` (`SCM_RIGHTS`
   fd-passing) DAX backend (`VhostUserFsBackend` / `VhostShmemDaxMapper`).
-- `projgit mount`, `projgit mount-multi`, and (on Linux) `projgit virtiofs`
-  for refs, commits, and subtrees.
+- `projgit mount`, `projgit mount-multi` (Linux, macOS, and Windows), and
+  (on Linux) `projgit virtiofs` for refs, commits, and subtrees.
 - A1+ / A2-flavored `.git/` synthesized at the mount root by default
   for branch projections (symbolic HEAD pointing at the branch ref,
   a clean read-only `.git/index` matching HEAD, and
@@ -442,9 +454,8 @@ What works today:
 
 What is deliberately deferred:
 
-- Windows mounting. The `projgit-winfsp` crate is a stub; the implementation
-  plan lives in [docs/design/winfsp-implementation-plan.md](docs/design/winfsp-implementation-plan.md).
-- Writes. The MVP is read-only (copy-on-write overlay design in
+- Writes outside Linux `overlayfs` (`--writable-scratch`). The base projection
+  is read-only (copy-on-write overlay design in
   [docs/design/writable-worktrees.md](docs/design/writable-worktrees.md)).
 
 Each of these items maps to a criterion in
@@ -459,7 +470,7 @@ crates/projgit-cli/       `projgit mount`, `mount-multi`, `virtiofs`, `attach`, 
 crates/projgit-daemon/    `projgitd` shared-CAS daemon, RPC protocol, DaemonFetcher
 crates/projgit-fuse/      Linux/macOS FUSE adapter (`fuser` + external `/dev/fuse` fd)
 crates/projgit-virtiofs/  `vhost-user-fs` (`rust-vmm`) + FUSE 7.38 / `DAX` (`FUSE_SETUPMAPPING`) frontend
-crates/projgit-winfsp/    Windows backend stub; implementation deferred
+crates/projgit-winfsp/    Windows WinFsp adapter (custom C ABI FFI, native symlinks, L2 host-file reads)
 docs/                     problem statement, design docs, bench baseline, handoffs
 spikes/                   completed Phase 0 spikes (ondemand-fetch, fuse-fd-passing)
 .devcontainer/            Linux + FUSE development environment
@@ -515,7 +526,8 @@ mount permissions. The `mount_real_remote` test partial-clones
 - [docs/design/windows-symlinks.md](docs/design/windows-symlinks.md) covers the
   Windows symlink policy.
 - [docs/design/winfsp-implementation-plan.md](docs/design/winfsp-implementation-plan.md)
-  preserves the deferred Windows backend plan.
+  covers the Windows `projgit-winfsp` architecture, custom FFI bindings, and
+  WinFsp FLOSS Exception licensing.
 
 ## License
 
@@ -523,3 +535,12 @@ Dual licensed under either of:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+### WinFsp Attribution (Windows)
+
+On Windows, `projgit` dynamically loads `winfsp-x64.dll` at runtime under the
+**WinFsp FLOSS Exception** without linking any GPL-3.0 Rust wrapper crates:
+
+> WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+> (<https://github.com/winfsp/winfsp>)
+
