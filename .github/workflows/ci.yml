@@ -44,9 +44,9 @@ jobs:
 
       - name: FUSE and daemon mount smoke tests
         run: |
-          cargo test -p projgit-fuse --test mount_smoke --test mount_multi -- --ignored --test-threads=1
+          cargo test -p projgit-fuse --test mount_smoke --test mount_multi --test writable_mount -- --ignored --test-threads=1
           cargo test -p projgit-daemon --test mount_smoke --test sidecar_mount_smoke --test xprocess_mount_smoke --test xns_mount_smoke -- --ignored --test-threads=1
-          cargo test -p projgit-cli --test attach_smoke -- --ignored --test-threads=1
+          cargo test -p projgit-cli --test attach_smoke --test writable_mount_cli -- --ignored --test-threads=1
 
   windows:
     name: Rust (Windows + WinFsp)

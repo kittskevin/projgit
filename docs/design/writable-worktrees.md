@@ -352,3 +352,29 @@ correctly and fast **without** `core.virtualFilesystem`. If that spike
 fails, the writable story changes shape (thin patch, or accept a
 narrower scope); if it succeeds, it is the strongest "improve on GVFS"
 result projgit can claim.
+
+### Result — spike PASSED (2026-06-19)
+
+The spike is built and run:
+[`../../spikes/writable-nofork/`](../../spikes/writable-nofork/)
+(harness + driver + [`RESULTS.md`](../../spikes/writable-nofork/RESULTS.md)).
+**The no-fork thesis holds.** Stock git drove a virtual FUSE worktree
+end to end — `status`/`add`/`commit`, sparse-index, FSMonitor — with no
+`core.virtualFilesystem` and no fork. Measured: clean `status` reports
+clean with **zero content hydration** in steady state; sparse-index
+shrank the on-disk index **~53×** (1.7M → 32K at 20k files); a
+daemon-style FSMonitor hook cut the `status` scan **349 → 30 getattr**;
+an in-mount edit materialised and `add`/`commit` produced a verified
+commit, untouched files staying virtual.
+
+The spike converted §10's open questions into **four bounded build
+requirements, none a fork** (full detail in RESULTS.md): (1) eager index
+synthesis (size-from-header, stable mtime) to remove the one-time
+first-`status` hydration — projgit already has the `dotgit-index.md`
+machinery; (2) the projection must honor the sparse cone or git expands
+the sparse index back to full; (3) the daemon FSMonitor must mint
+**monotonic timestamp tokens** (git rejects small-integer tokens) and
+report precise modified-paths; (4) push a FUSE invalidation
+(`Notifier::inval_inode`) on write/checkout (§10.7) rather than rely on
+attr-cache TTL. The gate is **open**; the remaining work is a committed
+build, not a feasibility question.

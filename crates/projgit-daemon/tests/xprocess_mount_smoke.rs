@@ -401,3 +401,132 @@ fn xprocess_warm_reads_survive_daemon_kill() {
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_file(&socket);
 }
+
+/// Like [`git`] but returns `(success, stdout)` instead of asserting.
+fn git_out(cwd: &Path, args: &[&str]) -> (bool, String) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "projgit-test")
+        .env("GIT_AUTHOR_EMAIL", "test@projgit.invalid")
+        .env("GIT_COMMITTER_NAME", "projgit-test")
+        .env("GIT_COMMITTER_EMAIL", "test@projgit.invalid")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// Spawn `projgit mount --writable --daemon-socket SOCK --cache-dir CACHE
+/// SOURCE MOUNTPOINT` — a WRITABLE worktree that shares the daemon's CAS.
+#[allow(clippy::zombie_processes)]
+fn spawn_writable_sidecar_process(
+    socket: &Path,
+    source: &Path,
+    mountpoint: &Path,
+    cache: &Path,
+) -> Child {
+    Command::new(projgit_binary())
+        .arg("mount")
+        .arg("--writable")
+        .arg("--daemon-socket")
+        .arg(socket)
+        .arg("--cache-dir")
+        .arg(cache)
+        .arg(source)
+        .arg(mountpoint)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn projgit mount --writable --daemon-socket")
+}
+
+#[test]
+#[ignore = "requires FUSE + git CLI; runs the projgitd and projgit binaries as \
+            separate OS processes (run inside the devcontainer)"]
+fn xprocess_writable_sidecar_edit_commit() {
+    // Track 2: `--writable` + `--daemon-socket`. A writable worktree
+    // served by the sidecar (local FUSE fd) shares the daemon's CAS:
+    // reads hydrate through the daemon, and committed objects land in the
+    // shared store. Proves the full edit → status → commit loop works
+    // over the daemon topology.
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+    ensure_binaries_built();
+
+    let repo = build_fixture("wr");
+    let socket = temp_path("wr", ".sock");
+    let _ = std::fs::remove_file(&socket);
+    let mp = temp_path("wr-mp", "");
+    std::fs::create_dir_all(&mp).unwrap();
+    let cache = temp_path("wr-cache", "");
+    let _ = std::fs::remove_dir_all(&cache);
+
+    let mut daemon = spawn_daemon_process(&socket);
+    let mut sidecar = spawn_writable_sidecar_process(&socket, &repo, &mp, &cache);
+
+    assert!(
+        wait_for_mount(&mp, Duration::from_secs(10)),
+        "writable sidecar never mounted at {}",
+        mp.display(),
+    );
+
+    // Reads are served (through the daemon's shared CAS).
+    assert_eq!(
+        std::fs::read_to_string(mp.join("hello.txt")).expect("read hello.txt"),
+        "hello from xprocess\n"
+    );
+    let (ok, s0) = git_out(&mp, &["status", "--porcelain"]);
+    assert!(
+        ok && s0.trim().is_empty(),
+        "fresh writable sidecar must be clean:\n{s0}"
+    );
+
+    // Edit a tracked file + create a new one.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mp.join("hello.txt"))
+            .unwrap();
+        f.write_all(b"EDIT\n").unwrap();
+    }
+    std::fs::write(mp.join("new.txt"), b"wip\n").unwrap();
+    let (_, s1) = git_out(&mp, &["status", "--porcelain"]);
+    assert!(s1.contains("M hello.txt"), "edit must show:\n{s1}");
+    assert!(s1.contains("?? new.txt"), "new file must show:\n{s1}");
+
+    // Stage + commit through stock git; objects land in the shared CAS.
+    let (oka, _) = git_out(&mp, &["add", "-A"]);
+    assert!(oka, "git add");
+    let (okc, _) = git_out(&mp, &["commit", "-m", "edit via writable sidecar"]);
+    assert!(okc, "commit must succeed");
+    let (okcf, committed) = git_out(&mp, &["cat-file", "-p", "HEAD:hello.txt"]);
+    assert!(okcf, "cat-file HEAD:hello.txt");
+    assert_eq!(
+        committed, "hello from xprocess\nEDIT\n",
+        "committed content must carry the edit"
+    );
+    let (oknew, newc) = git_out(&mp, &["cat-file", "-p", "HEAD:new.txt"]);
+    assert!(oknew && newc == "wip\n", "new file must be committed");
+
+    // Teardown.
+    stop_gracefully(&mut sidecar, "sidecar");
+    assert!(
+        wait_for_unmount(&mp, Duration::from_secs(5)),
+        "mount at {} should be gone after sidecar exit",
+        mp.display(),
+    );
+    stop_gracefully(&mut daemon, "daemon");
+
+    let _ = std::fs::remove_dir_all(&mp);
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_file(&socket);
+}

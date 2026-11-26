@@ -1,0 +1,20 @@
+[package]
+name = "spike-writable-nofork"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Phase 2 spike: can stock git drive a virtual (FUSE) worktree — status/add/commit — WITHOUT a core.virtualFilesystem fork? See docs/design/writable-worktrees.md §10.1."
+
+# Throwaway spike. NOT a workspace member (see root Cargo.toml `exclude`).
+# Declare an empty workspace so this builds fully standalone into
+# spikes/writable-nofork/target/ instead of the parent workspace target.
+[workspace]
+
+[[bin]]
+name = "vworktree"
+path = "src/main.rs"
+
+[dependencies]
+fuser = "0.17"
+libc = "0.2"
+anyhow = "1"
