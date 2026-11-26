@@ -2753,7 +2753,22 @@ fn setup_writable_gitdir(
         projgit_core::dotgit::build_writable_index_bytes(store, commit_oid)
             .context("building writable index")?
     };
-    std::fs::write(gd.join("index"), index)?;
+    let index_path = gd.join("index");
+    std::fs::write(&index_path, index)?;
+    // Ensure the index file's on-disk `mtime` is strictly newer than the
+    // entries' `sd_mtime` (`commit_time`). When a commit is created and
+    // mounted within the same wall-clock second `T`, `istate->timestamp.sec`
+    // would otherwise equal `sd_mtime.sec`, causing Git's `is_racy_timestamp`
+    // check in `do_write_index` -> `ce_smudge_racily_clean_entry` to `lstat()`
+    // every entry (triggering `FUSE_LOOKUP` and hydrating partial-clone blobs)
+    // even when `CE_FSMONITOR_VALID` is set.
+    if let Ok(commit_time) = store.commit_time(commit_oid) {
+        let min_index_mtime = commit_time + std::time::Duration::from_secs(2);
+        let target_mtime = std::time::SystemTime::now().max(min_index_mtime);
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&index_path) {
+            let _ = f.set_modified(target_mtime);
+        }
+    }
     Ok(WritableGitDir {
         path: gd,
         commit: commit_oid,
