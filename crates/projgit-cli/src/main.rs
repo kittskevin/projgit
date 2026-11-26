@@ -2177,6 +2177,12 @@ fn install_fsmonitor_hook(scratch: &Path) -> Result<()> {
         std::process::Command::new("git")
             .arg("--git-dir")
             .arg(scratch)
+            .args(["config", "fsmonitor.allowRemote", "true"]),
+    )?;
+    git_run(
+        std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(scratch)
             .args(["config", "core.fsmonitorHookVersion", "2"]),
     )?;
     git_run(
@@ -2734,7 +2740,10 @@ fn setup_writable_gitdir(
     if fsmonitor {
         // The FSMN-seeded index is written with a null trailer; git reads
         // it under skipHash (2.40+), avoiding a raw index-hash recompute.
-        config.push_str("[index]\n\tskipHash = true\n");
+        // Git 2.45+ on Linux also classifies FUSE_SUPER_MAGIC (0x65735546,
+        // `fuse.projgit`) as a "remote" filesystem in fsm-path-utils-linux.c
+        // and disables core.fsmonitor unless `fsmonitor.allowRemote = true`.
+        config.push_str("[index]\n\tskipHash = true\n[fsmonitor]\n\tallowRemote = true\n");
     }
     if let Some(url) = remote_url {
         let _ = write!(
