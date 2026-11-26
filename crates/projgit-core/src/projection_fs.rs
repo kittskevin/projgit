@@ -96,6 +96,11 @@ pub struct ProjectionFsProvider<F: Fetcher + 'static> {
     /// Background T1 prefetch worker (see `crate::prefetch`).
     /// Spawned at construction; joined on drop.
     prefetch: PrefetchHandle,
+    /// Whether `readdir` posts child blob OIDs to `prefetch` (T1).
+    /// Enabled by default; disabled on writable worktree mounts so
+    /// untracked-file directory scans during `git status` do not
+    /// speculatively hydrate blobs on partial clones.
+    readdir_prefetch: std::sync::atomic::AtomicBool,
 }
 
 impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
@@ -137,7 +142,14 @@ impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
             commit_time,
             attrs: RwLock::new(attrs),
             prefetch,
+            readdir_prefetch: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// Enable or disable T1 background header prefetching from `readdir`.
+    pub fn set_readdir_prefetch(&self, enabled: bool) {
+        self.readdir_prefetch
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Access the underlying [`HydratingObjectStore`].
@@ -174,7 +186,11 @@ impl<F: Fetcher + 'static> ProjectionFsProvider<F> {
     /// Headers are posted first so the worker's size cap sees warm
     /// sizes (the worker is single-threaded + FIFO).
     fn post_prefetch(&self, oids: Vec<gix::ObjectId>) {
-        if oids.is_empty() {
+        if oids.is_empty()
+            || !self
+                .readdir_prefetch
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         if crate::prefetch::blob_prefetch_enabled() {

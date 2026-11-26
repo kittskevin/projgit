@@ -1607,6 +1607,7 @@ where
     let mut watcher: Option<std::thread::JoinHandle<()>> = None;
     let mut control: Option<std::thread::JoinHandle<()>> = None;
     let session = if writable {
+        provider.set_readdir_prefetch(false);
         let (session, handle) = projgit_fuse::mount_writable_background_with_handle(
             provider.clone(),
             mountpoint,
@@ -1771,6 +1772,7 @@ impl<F: projgit_core::Fetcher + 'static> Swapper<F> {
             id,
         )
         .with_context(|| format!("re-projecting worktree to {commit}"))?;
+        new_lower.set_readdir_prefetch(false);
         self.handle.swap_baseline(std::sync::Arc::new(new_lower));
         *cur = Some(commit);
         Ok(true)
@@ -2122,7 +2124,15 @@ fn fsmonitor_query() -> Option<()> {
     }
     let git_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let socket = git_dir.join(CONTROL_SOCKET_NAME);
-    let mut stream = UnixStream::connect(&socket).ok()?;
+    let mut stream = None;
+    for _ in 0..25 {
+        if let Ok(s) = UnixStream::connect(&socket) {
+            stream = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut stream = stream?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     stream.write_all(b"FSMONITOR\n").ok()?;
     let mut resp = Vec::new();
