@@ -212,7 +212,7 @@ struct MountArgs {
     /// edits are lost on unmount (commit or push to keep them);
     /// not combinable with `--subtree`, `--no-dotgit`, or
     /// `--daemon-socket`.
-    #[arg(long, conflicts_with = "isolated_dotgit")]
+    #[arg(long, conflicts_with_all = ["isolated_dotgit", "writable_scratch"])]
     writable: bool,
 
     /// Enable FSMonitor for a `--writable` mount: install a
@@ -1755,12 +1755,20 @@ impl<F: projgit_core::Fetcher + 'static> Swapper<F> {
     }
 
     /// Swap the LOWER baseline to `commit` unless it is already current.
+    /// When `reindex` is `true` (driven by `projgit checkout`), also
+    /// re-synthesizes `<scratch>/index` with real per-entry stat data and
+    /// the pre-populated `FSMN` extension (when `--fsmonitor` is active) so
+    /// the first `git status` after checkout does not full-scan or hydrate
+    /// partial clones.
     /// Returns `Ok(true)` if a swap happened. Serialized (and dedup'd)
     /// against concurrent callers — the watcher and the control socket.
-    fn swap_to(&self, commit: gix::ObjectId) -> Result<bool> {
+    fn swap_to(&self, commit: gix::ObjectId, reindex: bool) -> Result<bool> {
         use std::sync::atomic::Ordering;
         let mut cur = self.current.lock().unwrap();
         if *cur == Some(commit) {
+            if reindex {
+                self.resynthesize_index(commit)?;
+            }
             return Ok(false);
         }
         let overlay = build_writable_overlay(&self.scratch)?;
@@ -1774,8 +1782,38 @@ impl<F: projgit_core::Fetcher + 'static> Swapper<F> {
         .with_context(|| format!("re-projecting worktree to {commit}"))?;
         new_lower.set_readdir_prefetch(false);
         self.handle.swap_baseline(std::sync::Arc::new(new_lower));
+        if reindex {
+            self.resynthesize_index(commit)?;
+        }
         *cur = Some(commit);
         Ok(true)
+    }
+
+    /// Re-synthesize `<scratch>/index` for `commit`, preserving per-entry
+    /// `sd_size` + `sd_mtime` and the `FSMN` extension (when `core.fsmonitor`
+    /// is installed in `<scratch>`).
+    fn resynthesize_index(&self, commit: gix::ObjectId) -> Result<()> {
+        let store = self.provider.store().store();
+        let fsmonitor = self.scratch.join("hooks/projgit-fsmonitor").exists();
+        let index = if fsmonitor {
+            projgit_core::dotgit::build_writable_index_bytes_fsmonitor(store, commit)
+                .context("re-building writable fsmonitor index on checkout")?
+        } else {
+            projgit_core::dotgit::build_writable_index_bytes(store, commit)
+                .context("re-building writable index on checkout")?
+        };
+        let index_path = self.scratch.join("index");
+        let tmp_path = self.scratch.join("index.projgit-tmp");
+        std::fs::write(&tmp_path, index)?;
+        if let Ok(commit_time) = store.commit_time(commit) {
+            let min_index_mtime = commit_time + std::time::Duration::from_secs(2);
+            let target_mtime = std::time::SystemTime::now().max(min_index_mtime);
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
+                let _ = f.set_modified(target_mtime);
+            }
+        }
+        std::fs::rename(&tmp_path, &index_path)?;
+        Ok(())
     }
 
     /// Current FSMonitor (query protocol v2) response bytes for the mount.
@@ -1813,7 +1851,7 @@ where
                 let Some(head) = resolve_head_commit_fast(&scratch) else {
                     continue;
                 };
-                match swapper.swap_to(head) {
+                match swapper.swap_to(head, false) {
                     Ok(true) => {
                         eprintln!("projgit: checkout observed — re-projected worktree to {head}")
                     }
@@ -1884,13 +1922,19 @@ where
                             let _ = stream.write_all(&swapper.fsmonitor_response());
                         } else {
                             let reply = match line.strip_prefix("SWAP ") {
-                                Some(hex) => match gix::ObjectId::from_hex(hex.as_bytes()) {
-                                    Ok(oid) => match swapper.swap_to(oid) {
-                                        Ok(_) => "OK\n".to_string(),
-                                        Err(e) => format!("ERR {e:#}\n"),
-                                    },
-                                    Err(_) => "ERR bad oid\n".to_string(),
-                                },
+                                Some(rest) => {
+                                    let (hex, reindex) = match rest.split_once(' ') {
+                                        Some((h, flag)) => (h.trim(), flag.trim() == "reindex"),
+                                        None => (rest.trim(), false),
+                                    };
+                                    match gix::ObjectId::from_hex(hex.as_bytes()) {
+                                        Ok(oid) => match swapper.swap_to(oid, reindex) {
+                                            Ok(_) => "OK\n".to_string(),
+                                            Err(e) => format!("ERR {e:#}\n"),
+                                        },
+                                        Err(_) => "ERR bad oid\n".to_string(),
+                                    }
+                                }
                                 None => "ERR bad request\n".to_string(),
                             };
                             let _ = stream.write_all(reply.as_bytes());
@@ -1999,7 +2043,7 @@ fn cmd_checkout(args: CheckoutArgs) -> Result<()> {
     // Drive the swap synchronously over the mount's control socket so the
     // worktree reflects the new commit by the time we return. Falls back
     // to the mount's poll watcher if no socket is listening.
-    let synced = notify_mount_swap(&git_dir, &commit);
+    let synced = notify_mount_swap(&git_dir, &commit, true);
     let tail = if synced {
         "mount re-projected"
     } else {
@@ -2021,7 +2065,7 @@ fn cmd_checkout(args: CheckoutArgs) -> Result<()> {
 /// once the mount acknowledges. Returns `false` if no mount is listening
 /// (the caller then relies on the mount's poll watcher).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn notify_mount_swap(git_dir: &Path, commit: &str) -> bool {
+fn notify_mount_swap(git_dir: &Path, commit: &str, reindex: bool) -> bool {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -2032,10 +2076,12 @@ fn notify_mount_swap(git_dir: &Path, commit: &str) -> bool {
     // A cold re-projection may hydrate objects, so allow generous time.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
-    if stream
-        .write_all(format!("SWAP {commit}\n").as_bytes())
-        .is_err()
-    {
+    let msg = if reindex {
+        format!("SWAP {commit} reindex\n")
+    } else {
+        format!("SWAP {commit}\n")
+    };
+    if stream.write_all(msg.as_bytes()).is_err() {
         return false;
     }
     let mut reply = String::new();
@@ -2050,7 +2096,7 @@ fn notify_mount_swap(git_dir: &Path, commit: &str) -> bool {
 
 /// Non-unix stub: no control socket, always falls back to the poll watcher.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn notify_mount_swap(_git_dir: &Path, _commit: &str) -> bool {
+fn notify_mount_swap(_git_dir: &Path, _commit: &str, _reindex: bool) -> bool {
     false
 }
 
@@ -2082,7 +2128,7 @@ fn cmd_swap_notify() -> Result<()> {
         }
     };
     if let Some(oid) = resolve_head_commit_fast(&git_dir) {
-        let _ = notify_mount_swap(&git_dir, &oid.to_string());
+        let _ = notify_mount_swap(&git_dir, &oid.to_string(), false);
     }
     Ok(())
 }
@@ -2674,23 +2720,31 @@ fn setup_writable_gitdir(
 
     let mp_abs = std::fs::canonicalize(mountpoint)
         .with_context(|| format!("canonicalizing mountpoint {}", mountpoint.display()))?;
+    let clone_objects = std::fs::canonicalize(clone_git_dir.join("objects"))
+        .with_context(|| format!("canonicalizing {}/objects", clone_git_dir.display()))?;
     let mut hasher = DefaultHasher::new();
+    clone_objects.hash(&mut hasher);
     mp_abs.hash(&mut hasher);
     std::fs::create_dir_all(worktrees_root)
         .with_context(|| format!("creating worktrees root {}", worktrees_root.display()))?;
     let gd = worktrees_root.join(format!("projgit-wt-{:016x}.git", hasher.finish()));
 
-    // Reuse an existing, valid worktree so committed work survives an
-    // unmount / remount. Only recreate when it is absent or unreadable.
+    // Reuse an existing, valid worktree for the same source object store so
+    // committed work survives an unmount / remount. Only recreate when it
+    // is absent, points at a different object store, or has an unreadable HEAD.
     if gd.join("HEAD").exists() {
-        if let Some(head) = read_git_dir_head_commit(&gd) {
-            return Ok(WritableGitDir {
-                path: gd,
-                commit: head,
-                reused: true,
-            });
+        let same_objects =
+            std::fs::canonicalize(gd.join("objects")).ok().as_ref() == Some(&clone_objects);
+        if same_objects {
+            if let Some(head) = read_git_dir_head_commit(&gd) {
+                return Ok(WritableGitDir {
+                    path: gd,
+                    commit: head,
+                    reused: true,
+                });
+            }
         }
-        // Present but unreadable — start clean.
+        // Present but unreadable or from a different repo — start clean.
         let _ = std::fs::remove_dir_all(&gd);
     }
 
@@ -2699,8 +2753,6 @@ fn setup_writable_gitdir(
 
     // Objects: symlink to the shared clone CAS so commits land in the
     // durable, shared store (readable by the projection, pushable).
-    let clone_objects = std::fs::canonicalize(clone_git_dir.join("objects"))
-        .with_context(|| format!("canonicalizing {}/objects", clone_git_dir.display()))?;
     std::os::unix::fs::symlink(&clone_objects, gd.join("objects")).with_context(|| {
         format!(
             "linking shared object store {} into {}",
@@ -3200,6 +3252,27 @@ mod tests {
             "/mnt",
             "--isolated-dotgit",
             "--no-dotgit",
+        ])
+        .is_err());
+
+        // Conflict on `mount`: `--writable` vs `--isolated-dotgit` and `--writable-scratch`
+        assert!(Cli::try_parse_from([
+            "projgit",
+            "mount",
+            "/src",
+            "/mnt",
+            "--writable",
+            "--isolated-dotgit",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "projgit",
+            "mount",
+            "/src",
+            "/mnt",
+            "--writable",
+            "--writable-scratch",
+            "/tmp/scratch",
         ])
         .is_err());
 

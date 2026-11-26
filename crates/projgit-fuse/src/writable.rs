@@ -158,6 +158,7 @@ fn replay_into_upper<F: FsProvider>(
     lower: &Arc<F>,
     records: Vec<Record>,
 ) -> Vec<Record> {
+    let now = SystemTime::now();
     for r in records {
         match r {
             Record::Set {
@@ -173,6 +174,7 @@ fn replay_into_upper<F: FsProvider>(
                         kind,
                         mode,
                         content,
+                        mtime: now,
                         from_lower: false,
                     },
                 );
@@ -185,6 +187,7 @@ fn replay_into_upper<F: FsProvider>(
                         kind: FileType::Directory,
                         mode,
                         content: Vec::new(),
+                        mtime: now,
                         from_lower: false,
                     },
                 );
@@ -214,6 +217,10 @@ fn replay_into_upper<F: FsProvider>(
 /// eagerly materialize) and `projgit checkout` (which keeps files
 /// virtual) converge to the same lean upper.
 fn reconcile_upper<F: FsProvider>(up: &mut Upper, lower: &Arc<F>) -> Vec<Record> {
+    let min_edit_mtime = lower
+        .getattr(projgit_core::ROOT_INODE)
+        .map(|a| a.mtime + Duration::from_secs(1))
+        .unwrap_or_else(|_| SystemTime::now());
     let mut drop_edits = Vec::new();
     for (path, edit) in up.edits.iter_mut() {
         match lower_resolve_path(lower, path) {
@@ -227,9 +234,17 @@ fn reconcile_upper<F: FsProvider>(up: &mut Upper, lower: &Arc<F>) -> Vec<Record>
                     drop_edits.push(path.clone());
                 } else {
                     edit.from_lower = true;
+                    if edit.mtime < min_edit_mtime {
+                        edit.mtime = min_edit_mtime;
+                    }
                 }
             }
-            None => edit.from_lower = false,
+            None => {
+                edit.from_lower = false;
+                if edit.mtime < min_edit_mtime {
+                    edit.mtime = min_edit_mtime;
+                }
+            }
         }
     }
     for p in &drop_edits {
@@ -301,6 +316,8 @@ struct Edit {
     mode: u16,
     /// File/symlink bytes (empty for directories).
     content: Vec<u8>,
+    /// Modification timestamp set when the entry was created or mutated.
+    mtime: SystemTime,
     /// `true` if this is a *modified* lower file (the path also exists in
     /// the lower projection); `false` if created fresh in the mount.
     /// Drives readdir (created entries must be injected; modified-lower
@@ -559,41 +576,117 @@ impl<F: FsProvider> WritableFs<F> {
                     FileType::RegularFile => Attr::regular_file(ino, size, edit.mode),
                 };
                 a.mode = edit.mode;
-                a.mtime = SystemTime::now();
+                a.mtime = edit.mtime;
                 return Ok(a);
             }
         }
         self.lower().getattr(ino)
     }
 
-    /// Ensure a modified-lower file's bytes are materialized into `edits`.
+    /// Ensure a modified-lower entry's bytes/metadata are materialized into `edits`.
     fn materialize(&self, up: &mut Upper, ino: u64, path: &str) -> Result<(), FsError> {
         if up.edits.contains_key(path) {
             return Ok(());
         }
         let lower = self.lower();
         let attr = lower.getattr(ino)?;
-        let size = attr.size;
-        let mut content = Vec::with_capacity(size as usize);
-        let mut off = 0u64;
-        while off < size {
-            let chunk = lower.read(ino, off, 64 * 1024)?;
-            if chunk.is_empty() {
-                break;
-            }
-            off += chunk.len() as u64;
-            content.extend_from_slice(&chunk);
-        }
+        let content = match attr.kind {
+            FileType::RegularFile => lower_read_all(&lower, ino, attr.size),
+            FileType::Symlink => lower.readlink(ino)?.into(),
+            FileType::Directory => Vec::new(),
+        };
         up.edits.insert(
             path.to_string(),
             Edit {
-                kind: FileType::RegularFile,
+                kind: attr.kind,
                 mode: attr.mode & 0o777,
                 content,
+                mtime: SystemTime::now(),
                 from_lower: true,
             },
         );
         Ok(())
+    }
+
+    /// Recursively materialize a lower directory subtree rooted at `(dir_ino, dir_path)`
+    /// into `up.edits` (skipping paths already in `up.whiteouts` or `up.edits`) so a
+    /// directory `rename` preserves all lower descendants under the new destination prefix.
+    fn materialize_lower_subtree(&self, up: &mut Upper, dir_ino: u64, dir_path: &str) {
+        let lower = self.lower();
+        let mut stack = vec![(dir_ino, dir_path.to_string())];
+        let now = SystemTime::now();
+        while let Some((cur_ino, cur_path)) = stack.pop() {
+            if let Ok(attr) = lower.getattr(cur_ino) {
+                up.edits.entry(cur_path.clone()).or_insert(Edit {
+                    kind: FileType::Directory,
+                    mode: attr.mode & 0o777,
+                    content: Vec::new(),
+                    mtime: now,
+                    from_lower: true,
+                });
+            }
+            let Ok(children) = lower.readdir(cur_ino, 0) else {
+                continue;
+            };
+            for child in children {
+                let child_path = join_path(&cur_path, &child.name);
+                if up.whiteouts.contains(&child_path) {
+                    continue;
+                }
+                let Ok(attr) = lower.lookup(cur_ino, &child.name) else {
+                    continue;
+                };
+                if !up.edits.contains_key(&child_path) {
+                    let content = match attr.kind {
+                        FileType::RegularFile => lower_read_all(&lower, attr.inode, attr.size),
+                        FileType::Symlink => lower.readlink(attr.inode).unwrap_or_default().into(),
+                        FileType::Directory => Vec::new(),
+                    };
+                    up.edits.insert(
+                        child_path.clone(),
+                        Edit {
+                            kind: attr.kind,
+                            mode: attr.mode & 0o777,
+                            content,
+                            mtime: now,
+                            from_lower: true,
+                        },
+                    );
+                }
+                if matches!(attr.kind, FileType::Directory) {
+                    stack.push((attr.inode, child_path));
+                }
+            }
+        }
+    }
+
+    /// Check whether `dir_path` has any non-whiteouted child entries in either `up` or `lower`.
+    fn directory_has_children(
+        &self,
+        up: &Upper,
+        parent_ino: u64,
+        name: &[u8],
+        dir_path: &str,
+    ) -> bool {
+        let prefix = format!("{dir_path}/");
+        for path in up.edits.keys() {
+            if path.starts_with(&prefix) && !up.whiteouts.contains(path) {
+                return true;
+            }
+        }
+        if let Ok(dir_attr) = self.lower().lookup(parent_ino, name) {
+            if matches!(dir_attr.kind, FileType::Directory) {
+                if let Ok(lower_children) = self.lower().readdir(dir_attr.inode, 0) {
+                    for e in lower_children {
+                        let child_path = join_path(dir_path, &e.name);
+                        if !up.whiteouts.contains(&child_path) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -769,12 +862,12 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         &self,
         req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -785,24 +878,41 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
     ) {
         let mut up = self.up.lock().unwrap();
         let path = up.inode_paths.get(&ino.0).cloned();
-        if let (Some(newsize), Some(path)) = (size, path.clone()) {
+        let mutated = size.is_some() || mode.is_some() || mtime.is_some();
+        if let (true, Some(path)) = (mutated, path) {
             if let Err(e) = self.materialize(&mut up, ino.0, &path) {
                 reply.error(errno_for(&e));
                 return;
             }
             if let Some(edit) = up.edits.get_mut(&path) {
-                edit.content.resize(newsize as usize, 0);
+                if let Some(newsize) = size {
+                    edit.content.resize(newsize as usize, 0);
+                    edit.mtime = SystemTime::now();
+                }
+                if let Some(newmode) = mode {
+                    edit.mode = (newmode as u16) & 0o777;
+                }
+                if let Some(newmtime) = mtime {
+                    edit.mtime = match newmtime {
+                        TimeOrNow::SpecificTime(t) => t,
+                        TimeOrNow::Now => SystemTime::now(),
+                    };
+                }
             }
             if let Some(j) = &self.journal {
                 if let Some(e) = up.edits.get(&path) {
-                    j.record_set(&path, e.kind, e.mode, &e.content);
+                    if matches!(e.kind, FileType::Directory) {
+                        j.record_mkdir(&path, e.mode);
+                    } else {
+                        j.record_set(&path, e.kind, e.mode, &e.content);
+                    }
                 }
             }
             self.record_change(&mut up, path);
         }
         let attr = self.attr_for(&up, ino.0);
         drop(up);
-        if size.is_some() {
+        if mutated {
             self.invalidate_inode(ino.0);
         }
         match attr {
@@ -844,6 +954,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
                 edit.content.resize(end, 0);
             }
             edit.content[start..end].copy_from_slice(data);
+            edit.mtime = SystemTime::now();
         }
         if let Some(j) = &self.journal {
             let e = up.edits.get(&path).unwrap();
@@ -869,6 +980,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
         let mut up = self.up.lock().unwrap();
         let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
         let path = join_path(&parent_path, name);
+        let from_lower = lower_resolve_path(&self.lower(), &path).is_some();
         up.whiteouts.remove(&path);
         up.edits.insert(
             path.clone(),
@@ -876,10 +988,18 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
                 kind: FileType::RegularFile,
                 mode: (mode as u16) & 0o777,
                 content: Vec::new(),
-                from_lower: false,
+                mtime: SystemTime::now(),
+                from_lower,
             },
         );
-        let ino = self.created_inode(&mut up, &path);
+        let ino = if from_lower {
+            match self.lower().lookup(parent.0, name) {
+                Ok(a) => a.inode,
+                Err(_) => self.created_inode(&mut up, &path),
+            }
+        } else {
+            self.created_inode(&mut up, &path)
+        };
         up.inode_paths.insert(ino, path.clone());
         up.inode_parent_name.insert(ino, (parent.0, name.to_vec()));
         self.journal_set(&path, FileType::RegularFile, (mode as u16) & 0o777, &[]);
@@ -895,6 +1015,52 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
                 FileHandle(0),
                 FopenFlags::empty(),
             ),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let name = link_name.as_bytes();
+        let target_bytes = target.as_os_str().as_bytes().to_vec();
+        let mut up = self.up.lock().unwrap();
+        let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+        let path = join_path(&parent_path, name);
+        let from_lower = lower_resolve_path(&self.lower(), &path).is_some();
+        up.whiteouts.remove(&path);
+        up.edits.insert(
+            path.clone(),
+            Edit {
+                kind: FileType::Symlink,
+                mode: 0o777,
+                content: target_bytes.clone(),
+                mtime: SystemTime::now(),
+                from_lower,
+            },
+        );
+        let ino = if from_lower {
+            match self.lower().lookup(parent.0, name) {
+                Ok(a) => a.inode,
+                Err(_) => self.created_inode(&mut up, &path),
+            }
+        } else {
+            self.created_inode(&mut up, &path)
+        };
+        up.inode_paths.insert(ino, path.clone());
+        up.inode_parent_name.insert(ino, (parent.0, name.to_vec()));
+        self.journal_set(&path, FileType::Symlink, 0o777, &target_bytes);
+        self.record_change(&mut up, path);
+        let attr = self.attr_for(&up, ino);
+        drop(up);
+        self.invalidate_entry(parent.0, name);
+        match attr {
+            Ok(a) => reply.entry(&self.ttl, &to_fuser_attr(&a, req.uid(), req.gid()), GEN),
             Err(e) => reply.error(errno_for(&e)),
         }
     }
@@ -919,6 +1085,7 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
                 kind: FileType::Directory,
                 mode: (mode as u16) & 0o777,
                 content: Vec::new(),
+                mtime: SystemTime::now(),
                 from_lower: false,
             },
         );
@@ -951,6 +1118,16 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name_bytes = name.as_bytes();
+        {
+            let up = self.up.lock().unwrap();
+            let parent_path = up.inode_paths.get(&parent.0).cloned().unwrap_or_default();
+            let path = join_path(&parent_path, name_bytes);
+            if self.directory_has_children(&up, parent.0, name_bytes, &path) {
+                reply.error(fuser::Errno::ENOTEMPTY);
+                return;
+            }
+        }
         self.unlink(req, parent, name, reply);
     }
 
@@ -975,63 +1152,80 @@ impl<F: FsProvider + 'static> Filesystem for WritableFs<F> {
             .unwrap_or_default();
         let src_path = join_path(&src_parent_path, name);
         let dst_path = join_path(&dst_parent_path, newname);
+        if src_path == dst_path {
+            reply.ok();
+            return;
+        }
         if up.whiteouts.contains(&src_path) {
             reply.error(errno_for(&FsError::NotFound));
             return;
         }
 
-        // Ensure the source bytes are captured at the destination path.
-        if let Some(edit) = up.edits.remove(&src_path) {
-            up.path_inode.remove(&src_path);
+        // If the source exists in `lower`, materialize it (and its subtree if it
+        // is a directory) into `up.edits` before remapping paths.
+        if let Ok(a) = self.lower().lookup(parent.0, name) {
+            if matches!(a.kind, FileType::Directory) {
+                self.materialize_lower_subtree(&mut up, a.inode, &src_path);
+            } else {
+                let _ = self.materialize(&mut up, a.inode, &src_path);
+            }
+        }
+
+        let src_prefix = format!("{src_path}/");
+        let mut keys_to_move: Vec<String> = up
+            .edits
+            .keys()
+            .filter(|k| *k == &src_path || k.starts_with(&src_prefix))
+            .cloned()
+            .collect();
+        if keys_to_move.is_empty() {
+            reply.error(errno_for(&FsError::NotFound));
+            return;
+        }
+        keys_to_move.sort_by_key(|k| k.len());
+
+        let lower = self.lower();
+        let now = SystemTime::now();
+        for old_p in keys_to_move {
+            let Some(edit) = up.edits.remove(&old_p) else {
+                continue;
+            };
+            up.path_inode.remove(&old_p);
+            let new_p = if old_p == src_path {
+                dst_path.clone()
+            } else {
+                format!("{dst_path}/{}", &old_p[src_prefix.len()..])
+            };
+            let dst_in_lower = lower_resolve_path(&lower, &new_p).is_some();
+            up.whiteouts.remove(&new_p);
+            up.whiteouts.insert(old_p.clone());
+            if let Some(j) = &self.journal {
+                j.record_whiteout(&old_p);
+                if matches!(edit.kind, FileType::Directory) {
+                    j.record_mkdir(&new_p, edit.mode);
+                } else {
+                    j.record_set(&new_p, edit.kind, edit.mode, &edit.content);
+                }
+            }
             up.edits.insert(
-                dst_path.clone(),
+                new_p.clone(),
                 Edit {
-                    from_lower: false,
+                    mtime: now,
+                    from_lower: dst_in_lower,
                     ..edit
                 },
             );
-        } else {
-            // Plain lower file: materialize its bytes under the dst path.
-            if let Ok(a) = self.lower().lookup(parent.0, name) {
-                if let Ok(attr) = self.lower().getattr(a.inode) {
-                    let mut content = Vec::new();
-                    let mut off = 0u64;
-                    let lower = self.lower();
-                    while off < attr.size {
-                        match lower.read(a.inode, off, 64 * 1024) {
-                            Ok(chunk) if !chunk.is_empty() => {
-                                off += chunk.len() as u64;
-                                content.extend_from_slice(&chunk);
-                            }
-                            _ => break,
-                        }
-                    }
-                    up.edits.insert(
-                        dst_path.clone(),
-                        Edit {
-                            kind: attr.kind,
-                            mode: attr.mode & 0o777,
-                            content,
-                            from_lower: false,
-                        },
-                    );
-                }
-            }
+            self.record_change(&mut up, old_p);
+            self.record_change(&mut up, new_p);
         }
-        up.whiteouts.remove(&dst_path);
-        up.whiteouts.insert(src_path.clone());
-        if let Some(j) = &self.journal {
-            j.record_whiteout(&src_path);
-            if let Some(e) = up.edits.get(&dst_path) {
-                if matches!(e.kind, FileType::Directory) {
-                    j.record_mkdir(&dst_path, e.mode);
-                } else {
-                    j.record_set(&dst_path, e.kind, e.mode, &e.content);
-                }
-            }
-        }
-        self.record_change(&mut up, src_path);
-        self.record_change(&mut up, dst_path);
+
+        let dst_prefix = format!("{dst_path}/");
+        up.inode_paths.retain(|_, p| {
+            p != &src_path
+                && !p.starts_with(&src_prefix)
+                && p != &dst_path
+                && !p.starts_with(&dst_prefix)
+        });
         drop(up);
         self.invalidate_entry(parent.0, name);
         self.invalidate_entry(newparent.0, newname);

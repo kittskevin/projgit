@@ -1064,6 +1064,11 @@ fn cli_writable_fsmonitor_avoids_partial_clone_hydration() {
     std::fs::write(src.join("README.md"), b"readme\n").unwrap();
     git_ok(&src, &["add", "-A"]);
     git_ok(&src, &["commit", "-q", "-m", "init"]);
+    git_ok(&src, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(src.join("README.md"), b"readme on feature\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "feature commit"]);
+    git_ok(&src, &["checkout", "-q", "main"]);
 
     let src_abs = std::fs::canonicalize(&src).unwrap();
     let url = format!("file://{}", src_abs.display());
@@ -1109,6 +1114,31 @@ fn cli_writable_fsmonitor_avoids_partial_clone_hydration() {
         after, before,
         "the FSMN seed must let git trust unmodified entries — no hydration on \
          first status (before={before}, after={after})\ntrace:\n{trace_stderr}"
+    );
+
+    // Switching branches via `projgit checkout` re-synthesizes the FSMN-seeded
+    // index so the subsequent `git status` on `feature` also stays clean
+    // without hydrating the untouched `dir/f0..f7.txt` blobs.
+    let co = Command::new(PROJGIT_BIN)
+        .args(["checkout", "-C"])
+        .arg(&mnt)
+        .arg("feature")
+        .output()
+        .expect("spawn projgit checkout feature");
+    assert!(
+        co.status.success(),
+        "projgit checkout feature failed: {}",
+        String::from_utf8_lossy(&co.stderr)
+    );
+    let s_feat = git_ok(&mnt, &["status", "--porcelain"]);
+    assert!(
+        s_feat.trim().is_empty(),
+        "mount must be clean after projgit checkout feature:\n{s_feat}"
+    );
+    let after_co = count_missing_objects(&clone);
+    assert!(
+        after_co >= 8,
+        "unmodified dir/f0..f7.txt blobs must remain unhydrated after projgit checkout + status (after_co={after_co})"
     );
 
     // Tear down.

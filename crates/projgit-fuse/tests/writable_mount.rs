@@ -641,3 +641,117 @@ fn writable_mount_swap_baseline_serves_new_commit() {
         "local edit must survive the checkout and shadow the new baseline"
     );
 }
+
+#[test]
+#[ignore = "requires FUSE; run inside the devcontainer"]
+fn writable_mount_stable_mtime_chmod_symlink_rmdir_and_dir_rename() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !git_available() {
+        eprintln!("SKIP: git CLI not available");
+        return;
+    }
+
+    let base = std::env::temp_dir().join(format!("projgit-wr-ops-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    let served = base.join("served");
+    std::fs::create_dir_all(&src).unwrap();
+    let _guard = DirGuard(base.clone());
+
+    git_ok(&src, &["init", "-q", "-b", "main"]);
+    git_ok(&src, &["config", "user.email", "t@t.invalid"]);
+    git_ok(&src, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(src.join("dir")).unwrap();
+    std::fs::write(src.join("README.md"), b"A\n").unwrap();
+    std::fs::write(src.join("dir/x.txt"), b"one\n").unwrap();
+    git_ok(&src, &["add", "-A"]);
+    git_ok(&src, &["commit", "-q", "-m", "init"]);
+
+    let url = format!("file://{}", src.display());
+    git_ok(
+        &base,
+        &[
+            "clone",
+            "-q",
+            "--no-checkout",
+            &url,
+            served.to_str().unwrap(),
+        ],
+    );
+    let head =
+        gix::ObjectId::from_hex(git_ok(&served, &["rev-parse", "HEAD"]).trim().as_bytes()).unwrap();
+    let store = Arc::new(ObjectStore::open(&served).unwrap());
+    let hydrating = Arc::new(HydratingObjectStore::new(store, NoopFetcher));
+    let provider = Arc::new(
+        ProjectionFsProvider::new(Projection::Commit(head), hydrating, RootOverlay::new(), 1)
+            .expect("ProjectionFsProvider::new"),
+    );
+
+    let mnt = base.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let _session = mount_writable_background(provider, &mnt, &MountConfig::default())
+        .expect("mount_writable_background");
+    assert!(
+        wait_for_mount(&mnt, Duration::from_secs(5)),
+        "never mounted"
+    );
+
+    // 1. Stable mtime across WRITABLE_TTL (1s) expiry on an edited file.
+    let edited_path = mnt.join("README.md");
+    std::fs::write(&edited_path, b"A-edited\n").unwrap();
+    let mtime_1 = std::fs::metadata(&edited_path).unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+    let mtime_2 = std::fs::metadata(&edited_path).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime_1, mtime_2,
+        "edited file mtime must remain stable across WRITABLE_TTL expiry"
+    );
+
+    // 2. chmod (setattr mode) on a file.
+    std::fs::set_permissions(&edited_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mode = std::fs::metadata(&edited_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o755, "chmod 0755 must persist in upper Edit");
+
+    // 3. symlink creation + read_link + traversal.
+    let link_path = mnt.join("readme-link");
+    std::os::unix::fs::symlink("README.md", &link_path).unwrap();
+    assert_eq!(
+        std::fs::read_link(&link_path).unwrap(),
+        std::path::PathBuf::from("README.md")
+    );
+    assert_eq!(std::fs::read_to_string(&link_path).unwrap(), "A-edited\n");
+
+    // 4. Non-empty rmdir must fail with ENOTEMPTY; empty rmdir succeeds.
+    let err = std::fs::remove_dir(mnt.join("dir")).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::DirectoryNotEmpty,
+        "rmdir on non-empty lower directory must return ENOTEMPTY, got {err:?}"
+    );
+    let empty_dir = mnt.join("empty_sub");
+    std::fs::create_dir(&empty_dir).unwrap();
+    std::fs::remove_dir(&empty_dir).unwrap();
+    assert!(!empty_dir.exists());
+
+    // 5. Directory rename moves both lower files (`dir/x.txt`) and upper created
+    //    files (`dir/added.txt`) to `dir_moved/*` and whiteouts `dir`.
+    std::fs::write(mnt.join("dir/added.txt"), b"added\n").unwrap();
+    std::fs::rename(mnt.join("dir"), mnt.join("dir_moved")).unwrap();
+    assert!(
+        !mnt.join("dir").exists(),
+        "old directory must be whiteouted"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("dir_moved/x.txt")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mnt.join("dir_moved/added.txt")).unwrap(),
+        "added\n"
+    );
+}
