@@ -47,3 +47,37 @@ jobs:
           cargo test -p projgit-fuse --test mount_smoke --test mount_multi -- --ignored --test-threads=1
           cargo test -p projgit-daemon --test mount_smoke --test sidecar_mount_smoke --test xprocess_mount_smoke --test xns_mount_smoke -- --ignored --test-threads=1
           cargo test -p projgit-cli --test attach_smoke -- --ignored --test-threads=1
+
+  windows:
+    name: Rust (Windows + WinFsp)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install WinFsp
+        run: choco install winfsp -y --no-progress
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check core without native fetcher
+        run: cargo check -p projgit-core --no-default-features
+
+      - name: Build
+        run: cargo build --workspace --features gvfs-fetcher
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features gvfs-fetcher -- -D warnings
+
+      - name: Test (including live WinFsp mounts)
+        env:
+          PROJGIT_REQUIRE_WINFSP: "1"
+        run: cargo test --workspace --all-targets --features gvfs-fetcher
+

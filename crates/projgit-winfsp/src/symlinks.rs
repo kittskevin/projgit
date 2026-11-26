@@ -77,10 +77,7 @@ pub fn is_relative_symlink_target(target: &str) -> bool {
         return false;
     }
     let bytes = target.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return false;
-    }
-    true
+    !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 /// Classify a Git symlink (`raw_target`) located inside the directory chain
