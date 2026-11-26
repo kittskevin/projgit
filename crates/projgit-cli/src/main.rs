@@ -2112,17 +2112,21 @@ fn fsmonitor_query() -> Option<()> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
-    let cwd = std::env::current_dir().ok()?;
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&cwd)
-        .args(["rev-parse", "--absolute-git-dir"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let git_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let git_dir = if let Some(dir) = std::env::var_os("PROJGIT_SCRATCH_GIT_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let cwd = std::env::current_dir().ok()?;
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
     let socket = git_dir.join(CONTROL_SOCKET_NAME);
     let mut stream = None;
     for _ in 0..25 {
@@ -2155,12 +2159,17 @@ fn cmd_fsmonitor() -> Result<()> {
 fn install_fsmonitor_hook(scratch: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let exe = std::env::current_exe().context("resolving projgit binary path")?;
+    let scratch_abs = std::fs::canonicalize(scratch)?;
     let hooks = scratch.join("hooks");
     std::fs::create_dir_all(&hooks)?;
     let hook = hooks.join("projgit-fsmonitor");
     std::fs::write(
         &hook,
-        format!("#!/bin/sh\nexec \"{}\" __fsmonitor \"$@\"\n", exe.display()),
+        format!(
+            "#!/bin/sh\nPROJGIT_SCRATCH_GIT_DIR=\"{}\" exec \"{}\" __fsmonitor \"$@\"\n",
+            scratch_abs.display(),
+            exe.display()
+        ),
     )?;
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
     let hook_abs = std::fs::canonicalize(&hook)?;

@@ -22,6 +22,8 @@ fn git(cwd: &Path, args: &[&str]) -> (bool, String) {
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t.invalid")
         .env("GIT_COMMITTER_NAME", "t")
@@ -1087,13 +1089,26 @@ fn cli_writable_fsmonitor_avoids_partial_clone_hydration() {
     );
 
     // First status is clean AND does not hydrate any blob.
-    let s = git_ok(&mnt, &["status", "--porcelain"]);
+    let status_out = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&mnt)
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TRACE_FSMONITOR", "1")
+        .env("GIT_TRACE", "1")
+        .output()
+        .unwrap();
+    assert!(status_out.status.success(), "git status failed");
+    let s = String::from_utf8_lossy(&status_out.stdout);
+    let trace_stderr = String::from_utf8_lossy(&status_out.stderr);
     assert!(s.trim().is_empty(), "fresh mount must be clean:\n{s}");
     let after = count_missing_objects(&clone);
     assert_eq!(
         after, before,
         "the FSMN seed must let git trust unmodified entries — no hydration on \
-         first status (before={before}, after={after})"
+         first status (before={before}, after={after})\ntrace:\n{trace_stderr}"
     );
 
     // Tear down.
