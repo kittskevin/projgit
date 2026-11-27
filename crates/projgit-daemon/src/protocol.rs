@@ -19,6 +19,10 @@ use std::path::PathBuf;
 /// adversarial peer trying to make us allocate gigabytes.
 pub const MAX_MSG_LEN: usize = 1024 * 1024;
 
+fn default_true() -> bool {
+    true
+}
+
 /// Control-plane request from a client to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -53,6 +57,10 @@ pub enum Request {
         /// can read the mount. See `projgit mount --allow-other`.
         #[serde(default)]
         allow_other: bool,
+        /// Negotiate Linux 6.9+ `FUSE_PASSTHROUGH` when supported by the
+        /// kernel. Defaults to `true` for backward compatibility.
+        #[serde(default = "default_true")]
+        passthrough: bool,
         /// Optional writable scratch directory for stacking a Linux
         /// `overlayfs` upper layer (`upperdir=<DIR>/upper,workdir=<DIR>/work,metacopy=on`)
         /// over the read-only FUSE projection (`<DIR>/lower`).
@@ -192,6 +200,22 @@ pub struct StatusReport {
     pub cache: Option<CacheStats>,
 }
 
+/// Wire-friendly snapshot of a mount's FUSE passthrough (`FOPEN_PASSTHROUGH`)
+/// state. Mirrors `projgit_fuse::PassthroughStats` without pulling FUSE types
+/// into the platform-independent protocol module.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountPassthroughStats {
+    pub requested: bool,
+    pub negotiated: bool,
+    pub disabled_by_kernel: bool,
+    pub hits: u64,
+    pub fallbacks: u64,
+    pub skipped_too_large: u64,
+    pub active_inodes: usize,
+    pub idle_cached_inodes: usize,
+    pub idle_evictions: u64,
+}
+
 /// One row of [`StatusReport::mounts`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountInfo {
@@ -199,6 +223,8 @@ pub struct MountInfo {
     pub ref_name: String,
     pub mountpoint: PathBuf,
     pub projection_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<MountPassthroughStats>,
 }
 
 /// Subset of cache counters surfaced over the wire. Mirrors the
@@ -351,6 +377,7 @@ mod tests {
             no_dotgit: true,
             isolated_dotgit: false,
             allow_other: false,
+            passthrough: false,
             writable_scratch: None,
         };
         match roundtrip::<Request>(&original) {
@@ -361,6 +388,7 @@ mod tests {
                 no_dotgit,
                 isolated_dotgit,
                 allow_other,
+                passthrough,
                 writable_scratch,
             } => {
                 assert_eq!(source, "https://example/repo");
@@ -369,6 +397,7 @@ mod tests {
                 assert!(no_dotgit);
                 assert!(!isolated_dotgit);
                 assert!(!allow_other);
+                assert!(!passthrough);
                 assert!(writable_scratch.is_none());
             }
             other => panic!("got {other:?}"),
@@ -384,6 +413,7 @@ mod tests {
             no_dotgit: false,
             isolated_dotgit: true,
             allow_other: true,
+            passthrough: true,
             writable_scratch: Some(PathBuf::from("/tmp/scratch")),
         };
         match roundtrip::<Request>(&original) {
@@ -394,6 +424,7 @@ mod tests {
                 no_dotgit,
                 isolated_dotgit,
                 allow_other,
+                passthrough,
                 writable_scratch,
             } => {
                 assert_eq!(source, "/tmp/repo");
@@ -402,13 +433,15 @@ mod tests {
                 assert!(!no_dotgit);
                 assert!(isolated_dotgit);
                 assert!(allow_other);
+                assert!(passthrough);
                 assert_eq!(writable_scratch, Some(PathBuf::from("/tmp/scratch")));
             }
             other => panic!("got {other:?}"),
         }
 
-        // Backward compatibility: older clients omitting `isolated_dotgit` and `writable_scratch`
-        // deserialize with `isolated_dotgit == false` and `writable_scratch == None`.
+        // Backward compatibility: older clients omitting `isolated_dotgit`,
+        // `passthrough`, and `writable_scratch` deserialize with defaults
+        // (`isolated_dotgit == false`, `passthrough == true`, `writable_scratch == None`).
         let legacy_json =
             r#"{"op":"mount","source":"/tmp/repo","ref":"main","mountpoint":"/tmp/mp"}"#;
         let parsed: Request = serde_json::from_str(legacy_json).expect("deserialize legacy mount");
@@ -417,12 +450,14 @@ mod tests {
                 no_dotgit,
                 isolated_dotgit,
                 allow_other,
+                passthrough,
                 writable_scratch,
                 ..
             } => {
                 assert!(!no_dotgit);
                 assert!(!isolated_dotgit);
                 assert!(!allow_other);
+                assert!(passthrough);
                 assert!(writable_scratch.is_none());
             }
             other => panic!("got {other:?}"),
@@ -453,6 +488,17 @@ mod tests {
                 ref_name: "main".into(),
                 mountpoint: PathBuf::from("/tmp/a"),
                 projection_id: 1,
+                passthrough: Some(MountPassthroughStats {
+                    requested: true,
+                    negotiated: true,
+                    disabled_by_kernel: false,
+                    hits: 12,
+                    fallbacks: 0,
+                    skipped_too_large: 1,
+                    active_inodes: 2,
+                    idle_cached_inodes: 4,
+                    idle_evictions: 3,
+                }),
             }],
             cache: Some(CacheStats {
                 tree_hits: 10,

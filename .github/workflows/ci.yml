@@ -44,9 +44,21 @@ jobs:
 
       - name: FUSE and daemon mount smoke tests
         run: |
-          cargo test -p projgit-fuse --test mount_smoke --test mount_multi --test writable_mount -- --ignored --test-threads=1
+          cargo test -p projgit-fuse --test mount_smoke --test mount_multi --test writable_mount --test passthrough -- --ignored --test-threads=1
           cargo test -p projgit-daemon --test mount_smoke --test sidecar_mount_smoke --test xprocess_mount_smoke --test xns_mount_smoke -- --ignored --test-threads=1
           cargo test -p projgit-cli --test attach_smoke --test writable_mount_cli -- --ignored --test-threads=1
+
+      - name: Privileged FUSE passthrough tests (Linux 6.9+ with CAP_SYS_ADMIN)
+        run: |
+          kver="$(uname -r)"
+          echo "Runner kernel: ${kver}"
+          if grep -q '^CONFIG_FUSE_PASSTHROUGH=y' "/boot/config-${kver}" 2>/dev/null \
+             || zgrep -q '^CONFIG_FUSE_PASSTHROUGH=y' /proc/config.gz 2>/dev/null; then
+            sudo -E env "PATH=$PATH" PROJGIT_REQUIRE_PASSTHROUGH=1 \
+              cargo test -p projgit-fuse --test passthrough -- --ignored --nocapture --test-threads=1
+          else
+            echo "SKIP: runner kernel ${kver} does not enable CONFIG_FUSE_PASSTHROUGH=y"
+          fi
 
   windows:
     name: Rust (Windows + WinFsp)

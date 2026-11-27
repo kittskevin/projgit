@@ -41,10 +41,14 @@ mod upper_journal;
 mod writable;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use adapter::{PassthroughStats, ProjgitFuse};
+pub use adapter::{
+    PassthroughHandle, PassthroughStats, ProjgitFuse, DEFAULT_PASSTHROUGH_IDLE_CACHE_CAPACITY,
+    DEFAULT_PASSTHROUGH_MAX_BYTES,
+};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use mount::{
-    mount, mount_background, mount_managed_background, ManagedMountSession, MountConfig,
+    mount, mount_background, mount_background_with_passthrough, mount_managed_background,
+    ManagedMountSession, MountConfig,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use writable::{
