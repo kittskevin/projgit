@@ -91,6 +91,12 @@ enum Scenario {
     /// `ObjectStore` hitting warm L2 on disk, and (4) `git cat-file blob`
     /// full-blob inflation. Runs offline on all platforms.
     L2Range,
+    /// Offline A/B benchmark comparing Native host disk vs. FUSE
+    /// passthrough (`passthrough=true`, Linux 6.9+ with `CAP_SYS_ADMIN`)
+    /// vs. Classic FUSE (`passthrough=false`) across fresh-mount reads
+    /// (warm host CAS, cold FUSE page cache), repeated streaming reads,
+    /// and multi-file open+read bursts.
+    FusePassthrough,
 }
 
 /// Clone strategy for the `worktree-shared` scenario. `Full`
@@ -225,9 +231,10 @@ fn parse_args() -> Args {
                     "sparse-shared" => Scenario::SparseShared,
                     "worktree-shared" => Scenario::WorktreeShared,
                     "l2-range" => Scenario::L2Range,
+                    "fuse-passthrough" => Scenario::FusePassthrough,
                     other => {
                         eprintln!(
-                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single, sparse-shared, worktree-shared, l2-range)"
+                            "unknown scenario: {other} (expected: single, sequential, daemon-concurrent, naive-concurrent, sparse-single, sparse-shared, worktree-shared, l2-range, fuse-passthrough)"
                         );
                         std::process::exit(2);
                     }
@@ -299,7 +306,7 @@ fn parse_args() -> Args {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single|sparse-shared|worktree-shared] [--concurrency N] [--worktree-strategy full|depth1] [--worktree-mode pre-stage|on-demand] [--daemon-depth N] [--daemon-trace] [--daemon-pool-size N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent, sparse-shared, worktree-shared scenarios)\n  default --worktree-strategy: depth1\n  default --worktree-mode: pre-stage (both only used by worktree-shared)\n  --daemon-depth, --daemon-trace, --daemon-pool-size only used by daemon-concurrent / sparse-shared",
+                    "usage: bench_mount [--url <URL>] [--ref <NAME>] [--files a,b,c] [--iterations N] [--scenario single|sequential|daemon-concurrent|naive-concurrent|sparse-single|sparse-shared|worktree-shared|l2-range|fuse-passthrough] [--concurrency N] [--worktree-strategy full|depth1] [--worktree-mode pre-stage|on-demand] [--daemon-depth N] [--daemon-trace] [--daemon-pool-size N]\n  default URL: {DEFAULT_URL}\n  default ref: {DEFAULT_REF}\n  default files: {}\n  default iterations: {DEFAULT_ITERATIONS}\n  default scenario: single\n  default concurrency: {DEFAULT_CONCURRENCY} (only used by *-concurrent, sparse-shared, worktree-shared scenarios)\n  default --worktree-strategy: depth1\n  default --worktree-mode: pre-stage (both only used by worktree-shared)\n  --daemon-depth, --daemon-trace, --daemon-pool-size only used by daemon-concurrent / sparse-shared",
                     DEFAULT_FILES.join(","),
                 );
                 std::process::exit(0);
@@ -342,6 +349,9 @@ fn main() -> anyhow::Result<()> {
     let args = parse_args();
     if args.scenario == Scenario::L2Range {
         return run_l2_range_main(&args);
+    }
+    if args.scenario == Scenario::FusePassthrough {
+        return run_fuse_passthrough_main(&args);
     }
     if std::env::var("PROJGIT_NETWORK_TESTS").as_deref() != Ok("1") {
         eprintln!("SKIP: set PROJGIT_NETWORK_TESTS=1 to enable this bench");
@@ -417,7 +427,8 @@ fn run_concurrent_main(args: &Args) -> anyhow::Result<()> {
             | Scenario::SparseSingle
             | Scenario::SparseShared
             | Scenario::WorktreeShared
-            | Scenario::L2Range => unreachable!(),
+            | Scenario::L2Range
+            | Scenario::FusePassthrough => unreachable!(),
         };
         eprintln!(
             "ok (setup {} ms, wall {} ms, fail {})",
@@ -576,7 +587,8 @@ fn bench_projgit(args: &Args) -> anyhow::Result<ProjgitSample> {
         | Scenario::SparseSingle
         | Scenario::SparseShared
         | Scenario::WorktreeShared
-        | Scenario::L2Range => {
+        | Scenario::L2Range
+        | Scenario::FusePassthrough => {
             unreachable!("*-concurrent and sparse-* dispatch via their own run_*_main")
         }
     };
@@ -2447,6 +2459,314 @@ fn bench_l2_range_once() -> anyhow::Result<L2RangeSample> {
         mount2_l2_pread_4k,
         stream_32x128k_l2,
         git_cat_file_full,
+    })
+}
+
+// -----------------------------------------------------------------------------
+// Offline FUSE passthrough vs. classic FUSE vs. native disk bench
+// -----------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct FusePassthroughArmSample {
+    /// First full sequential read of an 8 MiB file on a fresh mount
+    /// (host L2 blob is already warm in OS page cache, FUSE inode page
+    /// cache is cold).
+    fresh_mount_8m_read: Duration,
+    /// 16 repeated sequential reads of the 8 MiB file (128 MiB total).
+    warm_128m_stream: Duration,
+    /// First open+read+close across 64 x 8 KiB source files on a fresh mount.
+    fresh_mount_64_files: Duration,
+    /// 10 repeated passes of open+read+close across 64 x 8 KiB files (640 opens).
+    warm_640_file_opens: Duration,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct FusePassthroughSample {
+    native: FusePassthroughArmSample,
+    passthrough: FusePassthroughArmSample,
+    classic: FusePassthroughArmSample,
+    pt_stats: projgit_fuse::PassthroughStats,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_fuse_passthrough_main(args: &Args) -> anyhow::Result<()> {
+    if !git_available() {
+        anyhow::bail!("git not available on PATH");
+    }
+    eprintln!(
+        "bench_mount: scenario=FusePassthrough ({} iterations, 8 MiB blob + 64x8 KiB files, offline)\n",
+        args.iterations,
+    );
+
+    let mut samples = Vec::with_capacity(args.iterations);
+    for i in 1..=args.iterations {
+        eprint!("== iteration {i}/{} == ", args.iterations);
+        // Alternate passthrough-first vs classic-first across iterations to reduce
+        // cache-warming / ordering bias between FUSE arms.
+        let passthrough_first = i % 2 == 1;
+        let s = bench_fuse_passthrough_once(passthrough_first)?;
+        eprintln!(
+            "fresh_8m: native={}ms pt={}ms classic={}ms | fresh_64f: native={}ms pt={}ms classic={}ms | pt(neg={} dis={} hits={} fb={})",
+            ms(s.native.fresh_mount_8m_read),
+            ms(s.passthrough.fresh_mount_8m_read),
+            ms(s.classic.fresh_mount_8m_read),
+            ms(s.native.fresh_mount_64_files),
+            ms(s.passthrough.fresh_mount_64_files),
+            ms(s.classic.fresh_mount_64_files),
+            s.pt_stats.negotiated,
+            s.pt_stats.disabled_by_kernel,
+            s.pt_stats.hits,
+            s.pt_stats.fallbacks,
+        );
+        samples.push(s);
+    }
+    eprintln!();
+
+    let last_pt = samples.last().map(|s| s.pt_stats).unwrap_or_default();
+    let active = !samples.is_empty()
+        && samples.iter().all(|s| {
+            s.pt_stats.negotiated
+                && !s.pt_stats.disabled_by_kernel
+                && s.pt_stats.hits > 0
+                && s.pt_stats.fallbacks == 0
+        });
+
+    let med = |f: fn(&FusePassthroughSample) -> Duration| -> Duration {
+        median(samples.iter().map(f).collect())
+    };
+
+    let n_f8 = med(|s| s.native.fresh_mount_8m_read);
+    let p_f8 = med(|s| s.passthrough.fresh_mount_8m_read);
+    let c_f8 = med(|s| s.classic.fresh_mount_8m_read);
+
+    let n_w128 = med(|s| s.native.warm_128m_stream);
+    let p_w128 = med(|s| s.passthrough.warm_128m_stream);
+    let c_w128 = med(|s| s.classic.warm_128m_stream);
+
+    let n_f64 = med(|s| s.native.fresh_mount_64_files);
+    let p_f64 = med(|s| s.passthrough.fresh_mount_64_files);
+    let c_f64 = med(|s| s.classic.fresh_mount_64_files);
+
+    let n_w640 = med(|s| s.native.warm_640_file_opens);
+    let p_w640 = med(|s| s.passthrough.warm_640_file_opens);
+    let c_w640 = med(|s| s.classic.warm_640_file_opens);
+
+    println!("# bench_mount: FUSE passthrough vs. classic FUSE (`--scenario fuse-passthrough`)\n");
+    println!(
+        "Median of {} iterations. Passthrough active: **{}** (`negotiated={}, disabled_by_kernel={}, hits={}, fallbacks={}`).\n",
+        args.iterations,
+        active,
+        last_pt.negotiated,
+        last_pt.disabled_by_kernel,
+        last_pt.hits,
+        last_pt.fallbacks,
+    );
+    if !active {
+        println!(
+            "> Note: `FOPEN_PASSTHROUGH` was not active in this environment (requires Linux 6.9+ with `CONFIG_FUSE_PASSTHROUGH=y` and `CAP_SYS_ADMIN`, e.g. `sudo -E`).\n"
+        );
+    }
+    println!("| Workload (warm host L2 CAS, fresh mount per arm) | Native (ms) | FUSE passthrough (ms) | Classic FUSE (ms) | Passthrough vs Classic |");
+    println!("|---|---:|---:|---:|---:|");
+    for (label, nat, pt, cl) in [
+        ("Fresh-mount 8 MiB sequential read", n_f8, p_f8, c_f8),
+        ("Warm 16 x 8 MiB stream (128 MiB)", n_w128, p_w128, c_w128),
+        ("Fresh-mount 64 x 8 KiB file reads", n_f64, p_f64, c_f64),
+        ("Warm 640 x 8 KiB open+read+close", n_w640, p_w640, c_w640),
+    ] {
+        println!(
+            "| {label} | {} | **{}** | {} | **{:.2}x** |",
+            ms(nat),
+            ms(pt),
+            ms(cl),
+            cl.as_secs_f64() / pt.as_secs_f64().max(1e-9),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bench_fuse_passthrough_once(passthrough_first: bool) -> anyhow::Result<FusePassthroughSample> {
+    use projgit_core::{
+        HydratingObjectStore, NoopFetcher, ObjectStore, Projection, ProjectionFsProvider,
+        RootOverlay,
+    };
+    use projgit_fuse::{mount_managed_background, MountConfig};
+    use std::sync::Arc;
+
+    const LARGE_BYTES: usize = 8 * 1024 * 1024;
+    const NUM_FILES: usize = 64;
+    const SMALL_BYTES: usize = 8 * 1024;
+
+    let repo = make_temp("projgit-bench-fuse-pt");
+    let _repo_guard = DirGuard(repo.clone());
+
+    run_git(Some(&repo), &["init", "-q", "-b", "main"])?;
+    run_git(Some(&repo), &["config", "user.name", "projgit-bench"])?;
+    run_git(
+        Some(&repo),
+        &["config", "user.email", "bench@projgit.invalid"],
+    )?;
+    run_git(Some(&repo), &["config", "core.autocrlf", "false"])?;
+
+    let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+    let large_payload: Vec<u8> = (0..LARGE_BYTES)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect();
+    std::fs::write(repo.join("large.bin"), &large_payload)?;
+
+    let src_dir = repo.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    for i in 0..NUM_FILES {
+        let mut buf = vec![b'a' + (i % 26) as u8; SMALL_BYTES];
+        buf[0] = (i & 0xFF) as u8;
+        std::fs::write(src_dir.join(format!("file_{i:02}.rs")), &buf)?;
+    }
+
+    run_git(Some(&repo), &["add", "-A"])?;
+    run_git(Some(&repo), &["commit", "-q", "-m", "bench fixture"])?;
+    run_git(Some(&repo), &["repack", "-a", "-d", "-q"])?;
+
+    // Pre-materialize all L2 blobs into `<git-dir>/blobs/<xx>/<oid>` so
+    // every arm measures steady-state warm-CAS I/O (not one-time pack inflate).
+    let store = Arc::new(ObjectStore::open(&repo)?);
+    let head = store.resolve_ref("HEAD")?;
+    let root_tree = store.commit_tree(head)?;
+    for entry in store.read_tree(root_tree)? {
+        if entry.name.as_slice() == b"large.bin" {
+            let _ = store.ensure_uncompressed_blob(entry.oid)?;
+        } else if entry.name.as_slice() == b"src" {
+            for child in store.read_tree(entry.oid)? {
+                let _ = store.ensure_uncompressed_blob(child.oid)?;
+            }
+        }
+    }
+
+    // 1. Native baseline directly on the host checkout.
+    let native = measure_fuse_pt_arm(&repo, NUM_FILES, LARGE_BYTES, SMALL_BYTES)?;
+
+    // Helper to mount a fresh FUSE projection (cold FUSE page cache, warm L2 CAS)
+    // and run the exact same workload.
+    let run_fuse_arm = |enable_passthrough: bool| -> anyhow::Result<(
+        FusePassthroughArmSample,
+        projgit_fuse::PassthroughStats,
+    )> {
+        let mp = make_temp(if enable_passthrough {
+            "projgit-bench-mp-pt"
+        } else {
+            "projgit-bench-mp-classic"
+        });
+        let _mp_guard = DirGuard(mp.clone());
+
+        let fresh_store = Arc::new(ObjectStore::open(&repo)?);
+        let hydrating = Arc::new(HydratingObjectStore::new(fresh_store, NoopFetcher));
+        let provider = Arc::new(ProjectionFsProvider::new(
+            Projection::Commit(head),
+            hydrating,
+            RootOverlay::new(),
+            1,
+        )?);
+        let cfg = MountConfig {
+            passthrough: enable_passthrough,
+            passthrough_max_bytes: 16 * 1024 * 1024,
+            n_threads: cfg!(target_os = "linux").then_some(4),
+            ..MountConfig::default()
+        };
+        let session = mount_managed_background(provider, &mp, &cfg)?;
+        wait_for_mount(&mp, Duration::from_secs(5))?;
+
+        let arm = measure_fuse_pt_arm(&mp, NUM_FILES, LARGE_BYTES, SMALL_BYTES)?;
+        let stats = session.passthrough_stats().unwrap_or_default();
+        drop(session);
+        Ok((arm, stats))
+    };
+
+    let (passthrough, pt_stats, classic) = if passthrough_first {
+        let (pt, st) = run_fuse_arm(true)?;
+        let (cl, _) = run_fuse_arm(false)?;
+        (pt, st, cl)
+    } else {
+        let (cl, _) = run_fuse_arm(false)?;
+        let (pt, st) = run_fuse_arm(true)?;
+        (pt, st, cl)
+    };
+
+    Ok(FusePassthroughSample {
+        native,
+        passthrough,
+        classic,
+        pt_stats,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn measure_fuse_pt_arm(
+    root: &Path,
+    num_files: usize,
+    expected_large_bytes: usize,
+    expected_small_bytes: usize,
+) -> anyhow::Result<FusePassthroughArmSample> {
+    use std::io::Read;
+
+    let large_path = root.join("large.bin");
+    let small_paths: Vec<PathBuf> = (0..num_files)
+        .map(|i| root.join("src").join(format!("file_{i:02}.rs")))
+        .collect();
+
+    let read_full_chunked = |path: &Path, expected: usize| -> anyhow::Result<()> {
+        let mut f = std::fs::File::open(path)?;
+        let mut buf = vec![0u8; 128 * 1024];
+        let mut total = 0usize;
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        anyhow::ensure!(total == expected, "short read: {total} != {expected}");
+        Ok(())
+    };
+
+    let fresh_mount_8m_read = time_it(|| read_full_chunked(&large_path, expected_large_bytes))?;
+
+    let warm_128m_stream = time_it(|| {
+        for _ in 0..16 {
+            read_full_chunked(&large_path, expected_large_bytes)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    let fresh_mount_64_files = time_it(|| {
+        for p in &small_paths {
+            let bytes = std::fs::read(p)?;
+            anyhow::ensure!(bytes.len() == expected_small_bytes);
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    let warm_640_file_opens = time_it(|| {
+        for _ in 0..10 {
+            for p in &small_paths {
+                let bytes = std::fs::read(p)?;
+                anyhow::ensure!(bytes.len() == expected_small_bytes);
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    Ok(FusePassthroughArmSample {
+        fresh_mount_8m_read,
+        warm_128m_stream,
+        fresh_mount_64_files,
+        warm_640_file_opens,
     })
 }
 
