@@ -119,6 +119,7 @@ fn mount_rejects_nonexistent_source() {
         no_dotgit: false,
         isolated_dotgit: false,
         allow_other: false,
+        passthrough: true,
         writable_scratch: None,
     };
     match rpc(&sock, &req) {

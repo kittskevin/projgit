@@ -21,7 +21,7 @@
 
 use crate::protocol::{
     codes, read_message, write_message, CacheStats, FrameError, HeaderProbeWire, MountInfo,
-    Request, Response, StatusReport,
+    MountPassthroughStats, Request, Response, StatusReport,
 };
 use anyhow::{anyhow, Context, Result};
 use gix::ObjectId;
@@ -312,15 +312,28 @@ impl DaemonState {
         let (source, mounts, cache) = match &*active {
             None => (None, Vec::new(), None),
             Some(repo) => {
-                let mut mounts: Vec<MountInfo> = repo
-                    .mounts
-                    .iter()
-                    .map(|(mp, m)| MountInfo {
-                        ref_name: m.ref_name.clone(),
-                        mountpoint: mp.clone(),
-                        projection_id: m.projection_id,
-                    })
-                    .collect();
+                let mut mounts: Vec<MountInfo> =
+                    repo.mounts
+                        .iter()
+                        .map(|(mp, m)| MountInfo {
+                            ref_name: m.ref_name.clone(),
+                            mountpoint: mp.clone(),
+                            projection_id: m.projection_id,
+                            passthrough: m.session.passthrough_stats().map(|p| {
+                                MountPassthroughStats {
+                                    requested: p.requested,
+                                    negotiated: p.negotiated,
+                                    disabled_by_kernel: p.disabled_by_kernel,
+                                    hits: p.hits,
+                                    fallbacks: p.fallbacks,
+                                    skipped_too_large: p.skipped_too_large,
+                                    active_inodes: p.active_inodes,
+                                    idle_cached_inodes: p.idle_cached_inodes,
+                                    idle_evictions: p.idle_evictions,
+                                }
+                            }),
+                        })
+                        .collect();
                 mounts.sort_by_key(|m| m.projection_id);
                 let t = repo.store.tree_cache_stats();
                 let h = repo.store.header_cache_stats();
@@ -526,9 +539,19 @@ fn maintenance_loop(
         if state.should_shut_down() {
             return;
         }
-        let git_dir = match state.active.lock() {
-            Ok(g) => g.as_ref().map(|r| r.git_dir.clone()),
-            Err(_) => None,
+        let (git_dir, passthrough_handles) = match state.active.lock() {
+            Ok(g) => match g.as_ref() {
+                Some(r) => {
+                    let handles: Vec<projgit_fuse::PassthroughHandle> = r
+                        .mounts
+                        .values()
+                        .filter_map(|m| m.session.passthrough_handle().cloned())
+                        .collect();
+                    (Some(r.git_dir.clone()), handles)
+                }
+                None => (None, Vec::new()),
+            },
+            Err(_) => (None, Vec::new()),
         };
         if let Some(git_dir) = git_dir {
             match projgit_core::run_maintenance(&git_dir) {
@@ -546,6 +569,17 @@ fn maintenance_loop(
                         stats.remaining_bytes,
                     ),
                     Err(e) => tracing::warn!("blob cache pruning failed: {e}"),
+                }
+                // Best-effort reclamation: release idle (`open_count == 0`) kernel
+                // BackingIds after unlinking evicted `<git-dir>/blobs/<xx>/<oid>`
+                // files so daemon-owned mounts do not keep unlinked inodes pinned.
+                // Active open handles and separate sidecars still keep their open
+                // inodes alive until closed.
+                let evicted_idle: usize = passthrough_handles.iter().map(|h| h.evict_idle()).sum();
+                if evicted_idle > 0 {
+                    tracing::debug!(
+                        "evicted {evicted_idle} idle FUSE passthrough backing handle(s) after blob prune"
+                    );
                 }
             }
         }
@@ -673,6 +707,7 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
             no_dotgit,
             isolated_dotgit,
             allow_other,
+            passthrough,
             writable_scratch,
         } => handle_mount(
             state,
@@ -682,6 +717,7 @@ fn dispatch(state: &Arc<DaemonState>, req: Request) -> Response {
             no_dotgit,
             isolated_dotgit,
             allow_other,
+            passthrough,
             writable_scratch,
         ),
         Request::Umount { mountpoint } => handle_umount(state, mountpoint),
@@ -704,6 +740,7 @@ fn handle_mount(
     no_dotgit: bool,
     isolated_dotgit: bool,
     allow_other: bool,
+    passthrough: bool,
     writable_scratch: Option<PathBuf>,
 ) -> Response {
     let mountpoint = match std::fs::canonicalize(&mountpoint) {
@@ -771,6 +808,7 @@ fn handle_mount(
     if allow_other {
         cfg.acl = SessionACL::All;
     }
+    cfg.passthrough = passthrough;
     cfg.writable_scratch = writable_scratch;
 
     let session_result = match &repo.backend {

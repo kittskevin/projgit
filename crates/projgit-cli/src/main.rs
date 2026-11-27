@@ -254,6 +254,20 @@ struct MountArgs {
     #[arg(long, value_name = "DIR")]
     writable_scratch: Option<PathBuf>,
 
+    /// Disable Linux 6.9+ `FUSE_PASSTHROUGH` (`FOPEN_PASSTHROUGH`) and serve
+    /// all file I/O through standard FUSE read callbacks.
+    ///
+    /// Useful for debugging or A/B benchmarking passthrough vs. classic FUSE.
+    /// Ignored on Windows.
+    #[arg(long)]
+    no_passthrough: bool,
+
+    /// Maximum blob size in bytes to hydrate synchronously on `open()` for
+    /// Linux 6.9+ `FUSE_PASSTHROUGH` (default: 16 MiB). Already-materialized
+    /// blobs and projected packfiles still use passthrough regardless of size.
+    #[arg(long, value_name = "BYTES")]
+    passthrough_max_bytes: Option<u64>,
+
     /// Fetch backend for URL-backed mounts.
     #[arg(long, value_enum, default_value = "git")]
     fetcher: FetcherChoice,
@@ -357,6 +371,15 @@ struct MountMultiArgs {
     #[arg(long)]
     allow_other: bool,
 
+    /// Apply to every projection: disable Linux 6.9+ `FUSE_PASSTHROUGH`.
+    #[arg(long)]
+    no_passthrough: bool,
+
+    /// Apply to every projection: maximum blob size in bytes to hydrate
+    /// synchronously on `open()` for `FUSE_PASSTHROUGH` (default: 16 MiB).
+    #[arg(long, value_name = "BYTES")]
+    passthrough_max_bytes: Option<u64>,
+
     /// Fetch backend for URL-backed mounts.
     #[arg(long, value_enum, default_value = "git")]
     fetcher: FetcherChoice,
@@ -429,6 +452,9 @@ enum AttachOp {
         /// Set `allow_other` on the FUSE mount.
         #[arg(long)]
         allow_other: bool,
+        /// Disable Linux 6.9+ `FUSE_PASSTHROUGH` on this daemon mount.
+        #[arg(long)]
+        no_passthrough: bool,
         /// Stack a writable Linux `overlayfs` scratch layer (`<DIR>/{lower,upper,work}`).
         #[arg(long, value_name = "DIR")]
         writable_scratch: Option<PathBuf>,
@@ -691,6 +717,10 @@ fn cmd_mount(args: MountArgs) -> Result<()> {
     if args.allow_other {
         cfg.acl = projgit_fuse::SessionACL::All;
     }
+    cfg.passthrough = !args.no_passthrough;
+    if let Some(max_bytes) = args.passthrough_max_bytes {
+        cfg.passthrough_max_bytes = max_bytes;
+    }
     cfg.writable_scratch = args.writable_scratch.clone();
     cfg.upper_dir = upper_dir;
     let mp = args.mountpoint.clone();
@@ -852,6 +882,10 @@ fn cmd_mount_via_daemon(args: MountArgs, socket: PathBuf) -> Result<()> {
     let mut cfg = MountConfig::default();
     if args.allow_other {
         cfg.acl = projgit_fuse::SessionACL::All;
+    }
+    cfg.passthrough = !args.no_passthrough;
+    if let Some(max_bytes) = args.passthrough_max_bytes {
+        cfg.passthrough_max_bytes = max_bytes;
     }
     cfg.writable_scratch = args.writable_scratch.clone();
     cfg.upper_dir = upper_dir;
@@ -1441,8 +1475,15 @@ where
     if args.allow_other {
         cfg.acl = projgit_fuse::SessionACL::All;
     }
+    cfg.passthrough = !args.no_passthrough;
+    if let Some(max_bytes) = args.passthrough_max_bytes {
+        cfg.passthrough_max_bytes = max_bytes;
+    }
 
-    let mut sessions: Vec<projgit_fuse::BackgroundSession> = Vec::with_capacity(args.mounts.len());
+    let mut sessions: Vec<(
+        projgit_fuse::BackgroundSession,
+        projgit_fuse::PassthroughHandle,
+    )> = Vec::with_capacity(args.mounts.len());
     let mut providers: Vec<Arc<ProjectionFsProvider<F>>> = Vec::with_capacity(args.mounts.len());
 
     for (idx, spec) in args.mounts.iter().enumerate() {
@@ -1475,9 +1516,13 @@ where
             spec.mountpoint.display(),
             projection_id
         );
-        let session = projgit_fuse::mount_background(provider.clone(), &spec.mountpoint, &cfg)
-            .with_context(|| format!("mounting at {}", spec.mountpoint.display()))?;
-        sessions.push(session);
+        let (session, pt_handle) = projgit_fuse::mount_background_with_passthrough(
+            provider.clone(),
+            &spec.mountpoint,
+            &cfg,
+        )
+        .with_context(|| format!("mounting at {}", spec.mountpoint.display()))?;
+        sessions.push((session, pt_handle));
         providers.push(provider);
     }
 
@@ -1496,6 +1541,8 @@ where
     rx.recv().ok();
 
     eprintln!("projgit: unmounting {} session(s)…", sessions.len());
+    let pt_snapshots: Vec<projgit_fuse::PassthroughStats> =
+        sessions.iter().map(|(_, h)| h.stats()).collect();
     drop(sessions);
 
     if args.stats {
@@ -1530,13 +1577,30 @@ where
             "projgit: disk blobs    hits={} misses={} inserts={} write_errors={}",
             d.hits, d.misses, d.inserts, d.write_errors,
         );
-        for (provider, spec) in providers.iter().zip(args.mounts.iter()) {
+        for ((provider, spec), pt) in providers
+            .iter()
+            .zip(args.mounts.iter())
+            .zip(pt_snapshots.iter())
+        {
             let p = provider.prefetch_stats();
             eprintln!(
                 "projgit: prefetch ({:<20}) posted={} dropped={} batches={} resolved={} headers={} failed={} blobs_warmed={} blobs_skipped={}",
                 spec.ref_name,
                 p.posted, p.dropped, p.batches_sent, p.oids_resolved, p.headers_published, p.oids_failed,
                 p.blobs_warmed, p.blobs_skipped,
+            );
+            eprintln!(
+                "projgit: passthrough ({:<17}) requested={} negotiated={} disabled={} hits={} fallbacks={} skipped_too_large={} active={} idle={} idle_evictions={}",
+                spec.ref_name,
+                pt.requested,
+                pt.negotiated,
+                pt.disabled_by_kernel,
+                pt.hits,
+                pt.fallbacks,
+                pt.skipped_too_large,
+                pt.active_inodes,
+                pt.idle_cached_inodes,
+                pt.idle_evictions,
             );
         }
     }
@@ -1654,6 +1718,7 @@ where
     rx.recv().ok();
 
     eprintln!("projgit: unmounting…");
+    let pt_stats = session.passthrough_stats();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(session);
     if let Some(w) = watcher {
@@ -1708,6 +1773,20 @@ where
             p.blobs_warmed,
             p.blobs_skipped,
         );
+        if let Some(pt) = pt_stats {
+            eprintln!(
+                "projgit: passthrough   requested={} negotiated={} disabled={} hits={} fallbacks={} skipped_too_large={} active={} idle={} idle_evictions={}",
+                pt.requested,
+                pt.negotiated,
+                pt.disabled_by_kernel,
+                pt.hits,
+                pt.fallbacks,
+                pt.skipped_too_large,
+                pt.active_inodes,
+                pt.idle_cached_inodes,
+                pt.idle_evictions,
+            );
+        }
     }
 
     eprintln!("projgit: unmounted.");
@@ -3263,16 +3342,40 @@ mod tests {
             "/mnt",
             "--writable-scratch",
             "/tmp/scratch-daemon",
+            "--no-passthrough",
         ])
-        .expect("attach mount --writable-scratch should parse");
+        .expect("attach mount --writable-scratch --no-passthrough should parse");
         match cli.command {
             Command::Attach(AttachArgs {
-                op: AttachOp::Mount {
-                    writable_scratch, ..
-                },
+                op:
+                    AttachOp::Mount {
+                        writable_scratch,
+                        no_passthrough,
+                        ..
+                    },
                 ..
             }) => {
                 assert_eq!(writable_scratch, Some(PathBuf::from("/tmp/scratch-daemon")));
+                assert!(no_passthrough);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // `mount --no-passthrough --passthrough-max-bytes`
+        let cli = Cli::try_parse_from([
+            "projgit",
+            "mount",
+            "/src",
+            "/mnt",
+            "--no-passthrough",
+            "--passthrough-max-bytes",
+            "4194304",
+        ])
+        .expect("mount --no-passthrough --passthrough-max-bytes should parse");
+        match cli.command {
+            Command::Mount(args) => {
+                assert!(args.no_passthrough);
+                assert_eq!(args.passthrough_max_bytes, Some(4 * 1024 * 1024));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -3445,6 +3548,7 @@ fn cmd_attach(args: AttachArgs) -> Result<()> {
             no_dotgit,
             isolated_dotgit,
             allow_other,
+            no_passthrough,
             writable_scratch,
         } => Request::Mount {
             source,
@@ -3453,6 +3557,7 @@ fn cmd_attach(args: AttachArgs) -> Result<()> {
             no_dotgit,
             isolated_dotgit,
             allow_other,
+            passthrough: !no_passthrough,
             writable_scratch,
         },
         AttachOp::Umount { mountpoint } => Request::Umount { mountpoint },
@@ -3503,6 +3608,19 @@ fn print_response(r: &projgit_daemon::protocol::Response) {
                     m.ref_name,
                     m.mountpoint.display()
                 );
+                if let Some(pt) = &m.passthrough {
+                    println!(
+                        "       passthrough requested={} negotiated={} disabled={} hits={} fallbacks={} skipped_too_large={} active={} idle={}",
+                        pt.requested,
+                        pt.negotiated,
+                        pt.disabled_by_kernel,
+                        pt.hits,
+                        pt.fallbacks,
+                        pt.skipped_too_large,
+                        pt.active_inodes,
+                        pt.idle_cached_inodes,
+                    );
+                }
             }
             if let Some(c) = &s.cache {
                 println!("tree cache  hits={} misses={}", c.tree_hits, c.tree_misses);
