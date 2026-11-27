@@ -293,6 +293,42 @@ pub trait FsProvider: Send + Sync {
         let _ = inode;
         Ok(None)
     }
+
+    /// Like [`Self::backing_file`], but **never** fetches missing objects
+    /// from a remote promisor.
+    ///
+    /// Returns `Ok(Some(file))` when the entry is backed by a projected
+    /// `SyntheticHostFile` or by a blob that is already resident locally
+    /// (in `<git-dir>/blobs/<xx>/<oid>` or in local `.git/objects/pack/`,
+    /// inflating it locally into L2 without network I/O). Returns `Ok(None)`
+    /// for synthetic in-memory files or remote-only blobs not yet fetched,
+    /// avoiding network stalls inside `FUSE_OPEN`.
+    fn local_backing_file(
+        &self,
+        inode: u64,
+    ) -> Result<Option<std::sync::Arc<std::fs::File>>, FsError> {
+        self.cached_backing_file(inode)
+    }
+
+    /// Like [`Self::backing_file`], but **never** fetches from a remote
+    /// or inflates from a packfile.
+    ///
+    /// Returns `Ok(Some(file))` only when a host backing file is already
+    /// resident on disk (for example an already-materialized
+    /// `<git-dir>/blobs/<xx>/<oid>` or a projected `SyntheticHostFile`
+    /// such as `.git/objects/pack/*.pack`), and `Ok(None)` otherwise.
+    ///
+    /// Used by FUSE passthrough when a blob exceeds the hydrate-on-`open()`
+    /// size cap so already-resident files and projected packfiles still
+    /// take the kernel passthrough fast path without stalling `open()` on
+    /// unmaterialized huge blobs.
+    fn cached_backing_file(
+        &self,
+        inode: u64,
+    ) -> Result<Option<std::sync::Arc<std::fs::File>>, FsError> {
+        let _ = inode;
+        Ok(None)
+    }
 }
 
 impl<T: FsProvider + ?Sized> FsProvider for std::sync::Arc<T> {
@@ -322,6 +358,20 @@ impl<T: FsProvider + ?Sized> FsProvider for std::sync::Arc<T> {
 
     fn backing_file(&self, inode: u64) -> Result<Option<std::sync::Arc<std::fs::File>>, FsError> {
         (**self).backing_file(inode)
+    }
+
+    fn local_backing_file(
+        &self,
+        inode: u64,
+    ) -> Result<Option<std::sync::Arc<std::fs::File>>, FsError> {
+        (**self).local_backing_file(inode)
+    }
+
+    fn cached_backing_file(
+        &self,
+        inode: u64,
+    ) -> Result<Option<std::sync::Arc<std::fs::File>>, FsError> {
+        (**self).cached_backing_file(inode)
     }
 }
 

@@ -244,6 +244,12 @@ impl<F: Fetcher> HydratingObjectStore<F> {
         }
     }
 
+    /// Open `<git-dir>/blobs/<xx>/<oid>` read-only if already materialized
+    /// on disk without fetching or decoding from the ODB.
+    pub fn open_uncompressed_blob(&self, oid: ObjectId) -> Option<Arc<std::fs::File>> {
+        self.store.open_uncompressed_blob(oid)
+    }
+
     /// Ensure `oid` is materialized as an uncompressed file in
     /// `<git-dir>/blobs/<xx>/<oid>` and return an open read-only
     /// [`std::fs::File`] handle to it. On `MissingObject`, call the

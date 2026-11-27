@@ -541,13 +541,18 @@ fn backing_file_returns_uncompressed_host_file_for_tree_files() {
     let hydrating = Arc::new(HydratingObjectStore::new(store.clone(), NoopFetcher));
     let p = ProjectionFsProvider::new(Projection::Commit(head), hydrating, overlay, 1).unwrap();
 
-    // 1. Projected regular file -> returns Some(Arc<File>) backed by
-    //    <git-dir>/blobs/<xx>/<oid> for virtio-fs DAX / passthrough.
+    // 1. Projected regular file -> cached_backing_file returns None before
+    //    materialization, then backing_file materializes <git-dir>/blobs/<xx>/<oid>,
+    //    and cached_backing_file returns Some afterwards without re-hydrating.
     let readme = lookup(&p, ROOT_INODE, b"README.md");
+    assert!(
+        p.cached_backing_file(readme.inode).unwrap().is_none(),
+        "unmaterialized tree file must not hydrate on cached_backing_file"
+    );
     let backing = p
-        .backing_file(readme.inode)
+        .local_backing_file(readme.inode)
         .unwrap()
-        .expect("tree file must return a host backing File");
+        .expect("locally packed tree file must return a host backing File via local_backing_file");
     let mut file_bytes = Vec::new();
     {
         use std::io::Read;
@@ -556,10 +561,16 @@ fn backing_file_returns_uncompressed_host_file_for_tree_files() {
     assert_eq!(&file_bytes, b"# fixture repo\n");
     assert!(store.disk_blob_cache_stats().inserts >= 1);
 
-    // Second backing_file call hits the already-materialized blob.
+    // Second backing_file / cached_backing_file call hits the already-materialized blob.
     let hits_before = store.disk_blob_cache_stats().hits;
     let _backing2 = p.backing_file(readme.inode).unwrap().unwrap();
     assert!(store.disk_blob_cache_stats().hits > hits_before);
+    let hits_before_cached = store.disk_blob_cache_stats().hits;
+    let _backing3 = p
+        .cached_backing_file(readme.inode)
+        .unwrap()
+        .expect("materialized tree file must hit cached_backing_file");
+    assert!(store.disk_blob_cache_stats().hits > hits_before_cached);
 
     // 2. Synthetic overlay file -> returns Ok(None) (in-memory buffer).
     let synth = lookup(&p, ROOT_INODE, b".synth-file");

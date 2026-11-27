@@ -728,6 +728,44 @@ impl<F: Fetcher + 'static> FsProvider for ProjectionFsProvider<F> {
             _ => Err(FsError::NotAFile),
         }
     }
+
+    fn local_backing_file(&self, inode: u64) -> Result<Option<Arc<std::fs::File>>, FsError> {
+        let snap = {
+            let attrs = self.attrs.read().unwrap();
+            attrs.get(&inode).cloned().ok_or(FsError::NotFound)?
+        };
+        match snap {
+            AttrSnapshot::TreeFile { oid, .. } => {
+                match self.store.store().ensure_uncompressed_blob(oid) {
+                    Ok(file) => Ok(Some(file)),
+                    Err(crate::ObjectStoreError::MissingObject(_)) => Ok(None),
+                    Err(e) => Err(FsError::Io(e.to_string())),
+                }
+            }
+            AttrSnapshot::SyntheticFile { .. } => Ok(None),
+            AttrSnapshot::SyntheticHostFile { path, .. } => {
+                let file = std::fs::File::open(&path).map_err(|e| FsError::Io(e.to_string()))?;
+                Ok(Some(Arc::new(file)))
+            }
+            _ => Err(FsError::NotAFile),
+        }
+    }
+
+    fn cached_backing_file(&self, inode: u64) -> Result<Option<Arc<std::fs::File>>, FsError> {
+        let snap = {
+            let attrs = self.attrs.read().unwrap();
+            attrs.get(&inode).cloned().ok_or(FsError::NotFound)?
+        };
+        match snap {
+            AttrSnapshot::TreeFile { oid, .. } => Ok(self.store.open_uncompressed_blob(oid)),
+            AttrSnapshot::SyntheticFile { .. } => Ok(None),
+            AttrSnapshot::SyntheticHostFile { path, .. } => {
+                let file = std::fs::File::open(&path).map_err(|e| FsError::Io(e.to_string()))?;
+                Ok(Some(Arc::new(file)))
+            }
+            _ => Err(FsError::NotAFile),
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------

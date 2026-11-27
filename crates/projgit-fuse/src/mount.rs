@@ -4,7 +4,10 @@
 //! add `BackgroundSession` support for letting the CLI manage many
 //! mounts from one process.
 
-use crate::adapter::ProjgitFuse;
+use crate::adapter::{
+    PassthroughHandle, PassthroughStats, ProjgitFuse, DEFAULT_PASSTHROUGH_IDLE_CACHE_CAPACITY,
+    DEFAULT_PASSTHROUGH_MAX_BYTES,
+};
 use crate::overlay_scratch::OverlayScratchConfig;
 use fuser::{mount2, spawn_mount2, BackgroundSession, Config, MountOption, SessionACL};
 use projgit_core::FsProvider;
@@ -27,6 +30,14 @@ pub struct MountConfig {
     /// Negotiate `FUSE_PASSTHROUGH` (Linux 6.9+) when available so `read()` / `mmap()`
     /// bypass userspace and go directly to `<git-dir>/blobs/<xx>/<oid>` backing files.
     pub passthrough: bool,
+    /// Maximum blob size (bytes) that `open()` will synchronously hydrate into
+    /// `<git-dir>/blobs/<xx>/<oid>` for `FOPEN_PASSTHROUGH`. Larger blobs still use
+    /// passthrough once already materialized on disk (or when projected as a
+    /// `SyntheticHostFile`), but unmaterialized large blobs stay on `read_blob_range()`.
+    pub passthrough_max_bytes: u64,
+    /// Maximum number of idle (`open_count == 0`) kernel `BackingId`s kept in the
+    /// bounded LRU cache (`0` closes `BackingId` immediately on final `release()`).
+    pub passthrough_idle_cache_capacity: usize,
     /// Optional writable scratch directory (`--writable-scratch <DIR>`).
     ///
     /// When set on Linux, the read-only FUSE projection is mounted at `<DIR>/lower`
@@ -63,6 +74,8 @@ impl Default for MountConfig {
             acl: SessionACL::Owner,
             n_threads: None,
             passthrough: true,
+            passthrough_max_bytes: DEFAULT_PASSTHROUGH_MAX_BYTES,
+            passthrough_idle_cache_capacity: DEFAULT_PASSTHROUGH_IDLE_CACHE_CAPACITY,
             writable_scratch: None,
             fsmonitor_file: None,
             sparse_cone: Vec::new(),
@@ -105,7 +118,12 @@ pub fn mount<F: FsProvider + 'static>(
     mountpoint: impl AsRef<Path>,
     config: &MountConfig,
 ) -> std::io::Result<()> {
-    let fs = ProjgitFuse::with_passthrough(provider, config.passthrough);
+    let fs = ProjgitFuse::with_passthrough_config(
+        provider,
+        config.passthrough,
+        config.passthrough_max_bytes,
+        config.passthrough_idle_cache_capacity,
+    );
     mount2(fs, mountpoint, &config.to_fuser_config())
 }
 
@@ -117,6 +135,7 @@ pub fn mount<F: FsProvider + 'static>(
 pub struct ManagedMountSession {
     fuse_session: Option<BackgroundSession>,
     overlay_mountpoint: Option<PathBuf>,
+    passthrough_handle: Option<PassthroughHandle>,
 }
 
 impl ManagedMountSession {
@@ -125,6 +144,19 @@ impl ManagedMountSession {
         Self {
             fuse_session: Some(session),
             overlay_mountpoint: None,
+            passthrough_handle: None,
+        }
+    }
+
+    /// Wrap a read-only [`BackgroundSession`] along with its [`PassthroughHandle`].
+    pub fn from_fuse_with_passthrough(
+        session: BackgroundSession,
+        passthrough_handle: PassthroughHandle,
+    ) -> Self {
+        Self {
+            fuse_session: Some(session),
+            overlay_mountpoint: None,
+            passthrough_handle: Some(passthrough_handle),
         }
     }
 
@@ -132,6 +164,25 @@ impl ManagedMountSession {
     /// with [`MountConfig::writable_scratch`].
     pub fn overlay_mountpoint(&self) -> Option<&Path> {
         self.overlay_mountpoint.as_deref()
+    }
+
+    /// Return the [`PassthroughHandle`] associated with this mount, if any.
+    pub fn passthrough_handle(&self) -> Option<&PassthroughHandle> {
+        self.passthrough_handle.as_ref()
+    }
+
+    /// Return a snapshot of FUSE passthrough counters for this mount, if available.
+    pub fn passthrough_stats(&self) -> Option<PassthroughStats> {
+        self.passthrough_handle.as_ref().map(|h| h.stats())
+    }
+
+    /// Release all idle (`open_count == 0`) kernel `BackingId`s for this mount so
+    /// unlinked L2 blob cache files can be reclaimed immediately on disk.
+    pub fn evict_idle_backing_files(&self) -> usize {
+        self.passthrough_handle
+            .as_ref()
+            .map(|h| h.evict_idle())
+            .unwrap_or(0)
     }
 }
 
@@ -165,8 +216,26 @@ pub fn mount_background<F: FsProvider + 'static>(
     mountpoint: impl AsRef<Path>,
     config: &MountConfig,
 ) -> std::io::Result<BackgroundSession> {
-    let fs = ProjgitFuse::with_passthrough(provider, config.passthrough);
-    spawn_mount2(fs, mountpoint, &config.to_fuser_config())
+    let (session, _handle) = mount_background_with_passthrough(provider, mountpoint, config)?;
+    Ok(session)
+}
+
+/// Like [`mount_background`], but also returns a [`PassthroughHandle`] for
+/// inspecting [`PassthroughStats`] and evicting idle kernel `BackingId`s.
+pub fn mount_background_with_passthrough<F: FsProvider + 'static>(
+    provider: Arc<F>,
+    mountpoint: impl AsRef<Path>,
+    config: &MountConfig,
+) -> std::io::Result<(BackgroundSession, PassthroughHandle)> {
+    let fs = ProjgitFuse::with_passthrough_config(
+        provider,
+        config.passthrough,
+        config.passthrough_max_bytes,
+        config.passthrough_idle_cache_capacity,
+    );
+    let handle = fs.passthrough_handle();
+    let session = spawn_mount2(fs, mountpoint, &config.to_fuser_config())?;
+    Ok((session, handle))
 }
 
 /// Mount `provider` at `mountpoint` in the background, stacking a writable
@@ -185,8 +254,10 @@ pub fn mount_managed_background<F: FsProvider + 'static>(
 ) -> std::io::Result<ManagedMountSession> {
     let mountpoint = mountpoint.as_ref();
     let Some(ref scratch_root) = config.writable_scratch else {
-        let session = mount_background(provider, mountpoint, config)?;
-        return Ok(ManagedMountSession::from_fuse(session));
+        let (session, handle) = mount_background_with_passthrough(provider, mountpoint, config)?;
+        return Ok(ManagedMountSession::from_fuse_with_passthrough(
+            session, handle,
+        ));
     };
 
     if !mountpoint.exists() {
@@ -198,7 +269,8 @@ pub fn mount_managed_background<F: FsProvider + 'static>(
 
     let scratch_cfg = OverlayScratchConfig::new(scratch_root);
     let dirs = scratch_cfg.prepare_dirs()?;
-    let fuse_session = mount_background(provider, &dirs.lower_dir, config)?;
+    let (fuse_session, handle) =
+        mount_background_with_passthrough(provider, &dirs.lower_dir, config)?;
 
     if let Err(e) = mount_overlayfs(&scratch_cfg, &dirs.lower_dir, mountpoint) {
         drop(fuse_session);
@@ -208,6 +280,7 @@ pub fn mount_managed_background<F: FsProvider + 'static>(
     Ok(ManagedMountSession {
         fuse_session: Some(fuse_session),
         overlay_mountpoint: Some(mountpoint.to_path_buf()),
+        passthrough_handle: Some(handle),
     })
 }
 

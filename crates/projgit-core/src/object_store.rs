@@ -495,6 +495,21 @@ impl ObjectStore {
         self.persist_header_memo(oid, kind, size);
     }
 
+    /// Open `<git-dir>/blobs/<xx>/<oid>` read-only if it is already
+    /// materialized on disk, without decoding from the ODB or writing
+    /// anything. Returns `None` if the blob is not present in the L2
+    /// cache.
+    pub fn open_uncompressed_blob(&self, oid: ObjectId) -> Option<Arc<File>> {
+        let blob_path = self.uncompressed_blob_path(oid);
+        let file = File::open(&blob_path).ok()?;
+        self.disk_blob_stats.hits.fetch_add(1, Ordering::Relaxed);
+        if let Ok(meta) = file.metadata() {
+            self.header_cache.put(oid, ObjectKind::Blob, meta.len());
+            self.persist_header_memo(oid, ObjectKind::Blob, meta.len());
+        }
+        Some(Arc::new(file))
+    }
+
     /// Ensure the blob `oid` is materialized as a flat, uncompressed
     /// file at `<git-dir>/blobs/<xx>/<oid>` and return an open
     /// read-only [`std::fs::File`] handle to it.
@@ -511,14 +526,8 @@ impl ObjectStore {
     /// Used by `virtio-fs` (`vhost-user-fs` + `DAX` `FUSE_SETUPMAPPING`),
     /// `FUSE_PASSTHROUGH`, and background blob warming.
     pub fn ensure_uncompressed_blob(&self, oid: ObjectId) -> Result<Arc<File>, ObjectStoreError> {
-        let blob_path = self.uncompressed_blob_path(oid);
-        if let Ok(file) = File::open(&blob_path) {
-            self.disk_blob_stats.hits.fetch_add(1, Ordering::Relaxed);
-            if let Ok(meta) = file.metadata() {
-                self.header_cache.put(oid, ObjectKind::Blob, meta.len());
-                self.persist_header_memo(oid, ObjectKind::Blob, meta.len());
-            }
-            return Ok(Arc::new(file));
+        if let Some(file) = self.open_uncompressed_blob(oid) {
+            return Ok(file);
         }
 
         self.disk_blob_stats.misses.fetch_add(1, Ordering::Relaxed);
